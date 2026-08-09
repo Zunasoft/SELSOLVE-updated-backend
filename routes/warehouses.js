@@ -1,0 +1,188 @@
+/**
+ * Multi-warehouse management & stock transfer logic — Selsolve POS.
+ * Enables stock tracking per warehouse and shop location, transfer between locations,
+ * and accurate calculation of inventory availability.
+ */
+
+const express = require('express');
+const { logStockMovement } = require('../store');
+
+const router = express.Router();
+
+const actor = (req) => req.headers['x-user-name'] || 'Owner';
+
+function ensureWarehouses(store) {
+  if (!Array.isArray(store.warehouses) || store.warehouses.length === 0) {
+    store.warehouses = [
+      { id: 'wh_main', name: 'Main Warehouse (Godown)', code: 'WH-MAIN', location: 'Main Storage', isDefault: true, createdAt: new Date().toISOString() },
+      { id: 'wh_shop', name: 'Shop Floor Stock', code: 'WH-SHOP', location: 'Retail Counter', isDefault: false, createdAt: new Date().toISOString() }
+    ];
+  }
+  return store.warehouses;
+}
+
+/* -------------------------------- warehouses CRUD -------------------------------- */
+
+router.get('/warehouses', (req, res) => {
+  const store = req.tenantStore;
+  const warehouses = ensureWarehouses(store);
+
+  const data = warehouses.map((wh) => {
+    let itemCounts = 0;
+    let totalStock = 0;
+
+    (store.products || []).forEach((p) => {
+      const whStock = p.warehouses && p.warehouses[wh.id] !== undefined
+        ? Number(p.warehouses[wh.id])
+        : wh.id === 'wh_shop' || (wh.isDefault && !p.warehouses)
+        ? Number(p.stock || 0)
+        : 0;
+
+      if (whStock > 0) {
+        itemCounts += 1;
+        totalStock += whStock;
+      }
+    });
+
+    return { ...wh, itemCounts, totalStock };
+  });
+
+  res.json({ success: true, data });
+});
+
+router.post('/warehouses', (req, res) => {
+  const store = req.tenantStore;
+  const warehouses = ensureWarehouses(store);
+  const { name, code, location } = req.body;
+
+  if (!name) return res.status(400).json({ success: false, message: 'Warehouse name is required.' });
+
+  const warehouse = {
+    id: `wh_${Date.now()}`,
+    name,
+    code: code || `WH-${Date.now().toString().slice(-4)}`,
+    location: location || '',
+    isDefault: false,
+    createdAt: new Date().toISOString()
+  };
+
+  warehouses.push(warehouse);
+  res.status(201).json({ success: true, message: 'Warehouse created.', data: warehouse });
+});
+
+router.put('/warehouses/:id', (req, res) => {
+  const store = req.tenantStore;
+  const warehouses = ensureWarehouses(store);
+  const wh = warehouses.find((w) => w.id === req.params.id);
+
+  if (!wh) return res.status(404).json({ success: false, message: 'Warehouse not found.' });
+
+  const { name, code, location } = req.body;
+  if (name) wh.name = name;
+  if (code) wh.code = code;
+  if (location !== undefined) wh.location = location;
+
+  res.json({ success: true, message: 'Warehouse updated.', data: wh });
+});
+
+router.delete('/warehouses/:id', (req, res) => {
+  const store = req.tenantStore;
+  const warehouses = ensureWarehouses(store);
+
+  if (warehouses.length <= 1) {
+    return res.status(400).json({ success: false, message: 'At least one warehouse must remain.' });
+  }
+
+  const index = warehouses.findIndex((w) => w.id === req.params.id);
+  if (index < 0) return res.status(404).json({ success: false, message: 'Warehouse not found.' });
+
+  const wh = warehouses[index];
+  if (wh.isDefault) {
+    return res.status(400).json({ success: false, message: 'Cannot delete the default warehouse.' });
+  }
+
+  store.warehouses.splice(index, 1);
+  res.json({ success: true, message: 'Warehouse deleted.' });
+});
+
+/* --------------------------- stock transfer between locations --------------------------- */
+
+router.post('/inventory/transfer', (req, res) => {
+  const store = req.tenantStore;
+  ensureWarehouses(store);
+
+  const { productId, sourceWarehouseId, targetWarehouseId, quantity, reason } = req.body;
+
+  if (!productId || !sourceWarehouseId || !targetWarehouseId) {
+    return res.status(400).json({ success: false, message: 'Product ID, source, and target warehouse are required.' });
+  }
+
+  if (sourceWarehouseId === targetWarehouseId) {
+    return res.status(400).json({ success: false, message: 'Source and target warehouse must be different.' });
+  }
+
+  const qty = Number(quantity);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    return res.status(400).json({ success: false, message: 'Quantity must be a positive number.' });
+  }
+
+  const product = (store.products || []).find((p) => p.id === productId);
+  if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+
+  const sourceWh = store.warehouses.find((w) => w.id === sourceWarehouseId);
+  const targetWh = store.warehouses.find((w) => w.id === targetWarehouseId);
+
+  if (!sourceWh || !targetWh) {
+    return res.status(404).json({ success: false, message: 'Source or target warehouse not found.' });
+  }
+
+  if (!product.warehouses) {
+    product.warehouses = {
+      wh_main: Math.max(0, product.stock - 10),
+      wh_shop: Math.min(product.stock, 10)
+    };
+  }
+
+  const sourceCurrent = Number(product.warehouses[sourceWarehouseId] || 0);
+  if (sourceCurrent < qty) {
+    return res.status(400).json({
+      success: false,
+      message: `Insufficient stock in ${sourceWh.name}. Available: ${sourceCurrent} ${product.unit || 'pcs'}, Requested: ${qty}.`
+    });
+  }
+
+  // Stock Transfer Calculation
+  product.warehouses[sourceWarehouseId] = sourceCurrent - qty;
+  product.warehouses[targetWarehouseId] = Number(product.warehouses[targetWarehouseId] || 0) + qty;
+
+  // Recalculate total product stock across all locations
+  product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
+
+  // Log stock movement for audit history
+  const movement = logStockMovement(store, {
+    product,
+    type: 'TRANSFER',
+    qtyChange: qty,
+    reason: reason ? `Transfer: ${sourceWh.name} -> ${targetWh.name} (${reason})` : `Transfer from ${sourceWh.name} to ${targetWh.name}`,
+    refId: `tr_${Date.now()}`,
+    user: actor(req)
+  });
+
+  res.json({
+    success: true,
+    message: `Successfully transferred ${qty} ${product.unit || 'pcs'} of "${product.name}" from ${sourceWh.name} to ${targetWh.name}.`,
+    data: {
+      productId: product.id,
+      productName: product.name,
+      sourceWarehouse: sourceWh.name,
+      targetWarehouse: targetWh.name,
+      transferredQty: qty,
+      sourceNewStock: product.warehouses[sourceWarehouseId],
+      targetNewStock: product.warehouses[targetWarehouseId],
+      totalStock: product.stock,
+      movement
+    }
+  });
+});
+
+module.exports = router;
