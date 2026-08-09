@@ -1,0 +1,13 @@
+@echo off
+echo Starting Selsolve Applications...
+
+echo Starting Backend...
+start cmd /k "cd selsolve-backend && npm run dev"
+
+echo Starting Admin Frontend...
+start cmd /k "cd selsolve-admin && npm run dev"
+
+echo Starting POS Frontend...
+start cmd /k "cd selsolve-pos && npm run dev"
+
+echo All applications started successfully!
