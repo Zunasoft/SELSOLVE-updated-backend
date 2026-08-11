@@ -1,0 +1,147 @@
+{
+  "products": [
+    {
+      "_id": "6a79bc241feb3cd9057cd119",
+      "id": "p_1786362915190_602",
+      "__v": 0,
+      "barcode": "1895666418",
+      "barcodes": [
+        "1895666418"
+      ],
+      "categoryId": "gen_1",
+      "comboItems": [],
+      "createdAt": "2026-08-10T11:55:15.274Z",
+      "defaultBarcode": "1895666418",
+      "description": "",
+      "hsn": "",
+      "imageUrl": "/uploads/products/prod_1786362786952_images__1_.jpg",
+      "isActive": true,
+      "isComposite": false,
+      "minStock": 5,
+      "mrp": 290,
+      "name": "Apple",
+      "price": 300,
+      "pricingHistory": [],
+      "printName": "ஆப்பிள்",
+      "productType": "standard",
+      "purchasePrice": 500,
+      "recipeItems": [],
+      "regionalName": "ஆப்பிள்",
+      "requiresWeight": false,
+      "specialPrice": 300,
+      "stock": 130,
+      "taxRate": 5,
+      "unit": "kg",
+      "updatedAt": "2026-08-10T11:55:15.274Z",
+      "warehouses": {
+        "wh_main": 100,
+        "wh_shop": 30
+      },
+      "wholesalePrice": 250
+    },
+    {
+      "_id": "6a7a06261feb3cd9057ce21c",
+      "id": "p_1786381860009_771",
+      "__v": 0,
+      "barcode": "9905401190",
+      "barcodes": [
+        "9905401190"
+      ],
+      "categoryId": "gen_1",
+      "comboItems": [],
+      "createdAt": "2026-08-10T17:11:00.064Z",
+      "defaultBarcode": "9905401190",
+      "description": "",
+      "hsn": "",
+      "imageUrl": "",
+      "isActive": true,
+      "isComposite": false,
+      "minStock": 10,
+      "mrp": 160,
+      "name": "Apple",
+      "price": 150,
+      "pricingHistory": [],
+      "printName": "ஆப்பிள்",
+      "productType": "standard",
+      "purchasePrice": 200,
+      "recipeItems": [],
+      "regionalName": "ஆப்பிள்",
+      "requiresWeight": false,
+      "specialPrice": 150,
+      "stock": 150,
+      "taxRate": 5,
+      "unit": "kg",
+      "updatedAt": "2026-08-10T17:11:00.064Z",
+      "warehouses": {
+        "wh_main": 100,
+        "wh_shop": 50
+      },
+      "wholesalePrice": 120
+    },
+    {
+      "_id": "6a7a09ec1feb3cd9057ce2c1",
+      "id": "p_1786382828147_814",
+      "__v": 0,
+      "barcode": "4732217889",
+      "barcodes": [
+        "4732217889"
+      ],
+      "categoryId": "gen_1",
+      "comboItems": [],
+      "createdAt": "2026-08-10T17:27:08.157Z",
+      "defaultBarcode": "4732217889",
+      "description": "",
+      "hsn": "",
+      "imageUrl": "",
+      "isActive": true,
+      "isComposite": false,
+      "minStock": 5,
+      "mrp": 135,
+      "name": "Apple",
+      "price": 130,
+      "pricingHistory": [],
+      "printName": "ஆப்பிள்",
+      "productType": "standard",
+      "purchasePrice": 100,
+      "recipeItems": [],
+      "regionalName": "ஆப்பிள்",
+      "requiresWeight": false,
+      "specialPrice": 130,
+      "stock": 130,
+      "taxRate": 5,
+      "unit": "kg",
+      "updatedAt": "2026-08-10T17:27:08.157Z",
+      "warehouses": {
+        "wh_main": 100,
+        "wh_shop": 30
+      },
+      "wholesalePrice": 120
+    }
+  ],
+  "categories": [
+    {
+      "_id": "6a78a19d1feb3cd9057ca4a6",
+      "id": "cat_1786290532050",
+      "__v": 0,
+      "createdAt": "2026-08-09T15:48:52.099Z",
+      "description": "",
+      "icon": "🌀",
+      "kotPrinter": "",
+      "name": "SERVICE",
+      "updatedAt": "2026-08-09T15:48:52.099Z"
+    }
+  ],
+  "warehouses": [
+    {
+      "_id": "6a7730da1feb3cd9057c5521",
+      "id": "wh_1786196132172",
+      "__v": 0,
+      "code": "c cv ",
+      "createdAt": "2026-08-08T13:35:32.207Z",
+      "isDefault": false,
+      "location": "v c c",
+      "name": "dfvv",
+      "updatedAt": "2026-08-08T13:35:32.207Z"
+    }
+  ]
+}

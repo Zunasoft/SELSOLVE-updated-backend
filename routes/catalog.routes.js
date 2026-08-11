@@ -25,6 +25,10 @@ router.post('/products', catalog.createProduct);
 router.put('/products/:id', catalog.updateProduct);
 router.delete('/products/:id', catalog.deleteProduct);
 
+// Composite items are edited on the product form, so the recipe hangs off the
+// product rather than living on its own screen.
+router.get('/products/:id/recipe', catalog.getProductRecipe);
+
 // Price Sheets
 router.get('/price-sheets', catalog.getPriceSheets);
 router.post('/price-sheets', catalog.createPriceSheet);

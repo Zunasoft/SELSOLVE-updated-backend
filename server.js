@@ -14,6 +14,13 @@ const { connectMasterDB, memoryDb, addAuditLog, SEED_SUPER_ADMIN_EMAIL, getIsMon
 const { authRouter, requireSuperAdmin } = require('./auth');
 const { sendOtpEmail, verifyMailer, isSmtpConfigured } = require('./mailer');
 const licensingModule = require('./modules/licensing');
+const {
+  featuresForPlan,
+  enforcePlanFeatures,
+  FEATURE_CATALOG,
+  normaliseFeatures,
+  resolveTenantFeatures
+} = require('./modules/features');
 const { resolveTenantDb } = require('./middlewares/tenant.middleware');
 const { notFoundHandler, errorHandler } = require('./middlewares/error.middleware');
 const apiRoutes = require('./routes');
@@ -89,12 +96,38 @@ app.get('/api/admin/stats', (req, res) => {
 });
 
 // Get Tenants List
-app.get('/api/admin/tenants', (req, res) => {
+app.get('/api/admin/tenants', async (req, res) => {
+  if (getIsMongoConnected()) {
+    try {
+      const TenantModel = require('./models/Tenant.model');
+      const dbTenants = await TenantModel.find().lean();
+      if (dbTenants && dbTenants.length > 0) {
+        memoryDb.tenants = dbTenants;
+      }
+    } catch (err) {
+      console.error('[Tenant DB Fetch Error]:', err.message);
+    }
+  }
   res.json({
     success: true,
     data: memoryDb.tenants
   });
 });
+
+/**
+ * Derive a database name that no existing shop is already using.
+ * Two shops with similar names ("SB Enterprises" / "S.B. Enterprises") would
+ * otherwise slug to the same value and end up sharing one database.
+ */
+const uniqueSlugFor = (name) => {
+  const base = name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'shop';
+  const taken = new Set(memoryDb.tenants.flatMap(t => [t.slug, t.tenantId].filter(Boolean)));
+  if (!taken.has(base)) return base;
+
+  let n = 2;
+  while (taken.has(`${base}${n}`)) n += 1;
+  return `${base}${n}`;
+};
 
 // Create New Tenant Shop (Provisions unique DB)
 app.post('/api/admin/tenants', async (req, res) => {
@@ -104,14 +137,14 @@ app.post('/api/admin/tenants', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Shop name and email are required' });
   }
 
-  const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '');
-  const tenantId = slug;
-  const dbName = `tenant_db_${slug}`;
-
-  const existing = memoryDb.tenants.find(t => t.email.toLowerCase() === email.toLowerCase());
+  const existing = memoryDb.tenants.find(t => String(t.email).toLowerCase() === email.toLowerCase());
   if (existing) {
     return res.status(400).json({ success: false, message: 'A shop with this email already exists.' });
   }
+
+  const slug = uniqueSlugFor(name);
+  const tenantId = slug;
+  const dbName = `tenant_db_${slug}`;
 
   const newTenant = {
     id: `t_${Date.now()}`,
@@ -125,25 +158,37 @@ app.post('/api/admin/tenants', async (req, res) => {
     plan: plan || 'starter',
     expiryDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
     maxDevices: maxDevices || 2,
-    features: {
-      billing: true,
-      inventory: true,
-      purchases: true,
-      reports: true,
-      compositeItems: plan === 'pro' || plan === 'enterprise',
-      tableMgmt: plan === 'pro' || plan === 'enterprise'
-    },
+    // The tier the shop was sold decides which modules it can open. Stamped at
+    // provisioning time so a later edit to the plan never silently revokes a
+    // capability the shop is already using — that takes an explicit plan change.
+    features: featuresForPlan(
+      memoryDb.plans.find((p) => p.id === (plan || 'starter')),
+      plan || 'starter'
+    ),
     createdAt: new Date().toISOString()
   };
 
   memoryDb.tenants.push(newTenant);
 
+  let provisioned = false;
   if (getIsMongoConnected()) {
     try {
+      // Master DB records who the tenant is...
       const TenantModel = require('./models/Tenant.model');
       await TenantModel.findOneAndUpdate({ id: newTenant.id }, newTenant, { upsert: true, new: true });
+
+      // ...and the tenant's own database is created and seeded here.
+      const { provisionTenantDB } = require('./tenantProvisioner');
+      const result = await provisionTenantDB(dbName, newTenant);
+      provisioned = Boolean(result);
     } catch (dbErr) {
-      console.error('[Tenant DB Sync Error]:', dbErr.message);
+      console.error('[Tenant provisioning error]:', dbErr.message);
+      memoryDb.tenants = memoryDb.tenants.filter(t => t.id !== newTenant.id);
+      addAuditLog('TENANT_PROVISION_FAILED', actorOf(req), `Failed to provision "${name}": ${dbErr.message}`, 'FAILED');
+      return res.status(500).json({
+        success: false,
+        message: `Could not provision the isolated database for "${name}". ${dbErr.message}`
+      });
     }
   }
 
@@ -152,7 +197,9 @@ app.post('/api/admin/tenants', async (req, res) => {
 
   res.status(201).json({
     success: true,
-    message: `Shop created and isolated database (${dbName}) provisioned successfully.`,
+    message: provisioned
+      ? `Shop created and isolated database (${dbName}) provisioned successfully.`
+      : `Shop created. Database (${dbName}) will be provisioned once MongoDB is reachable.`,
     data: newTenant
   });
 });
@@ -190,7 +237,7 @@ app.patch('/api/admin/tenants/:id/status', async (req, res) => {
 // Update Tenant Profile Details
 app.put('/api/admin/tenants/:id', async (req, res) => {
   const { id } = req.params;
-  const { name, phone, plan, maxDevices, expiryDate } = req.body;
+  const { name, phone, email, plan, maxDevices, expiryDate, features } = req.body;
 
   const tenant = memoryDb.tenants.find(t => t.id === id || t.tenantId === id);
   if (!tenant) {
@@ -199,14 +246,18 @@ app.put('/api/admin/tenants/:id', async (req, res) => {
 
   if (name) tenant.name = name;
   if (phone) tenant.phone = phone;
-  if (plan) {
+  if (email) tenant.email = String(email).toLowerCase();
+
+  // Moving to a different tier re-derives the feature set from that tier.
+  if (plan && plan !== tenant.plan) {
     tenant.plan = plan;
-    tenant.features = {
-      ...tenant.features,
-      compositeItems: plan === 'pro' || plan === 'enterprise',
-      tableMgmt: plan === 'pro' || plan === 'enterprise'
-    };
+    tenant.features = featuresForPlan(memoryDb.plans.find((p) => p.id === plan), plan);
   }
+
+  // A per-shop override always wins over the tier default — this is how a
+  // Super Admin grants one shop a capability its plan does not normally carry.
+  if (features) tenant.features = normaliseFeatures(features, tenant.plan);
+
   if (maxDevices) tenant.maxDevices = parseInt(maxDevices) || tenant.maxDevices;
   if (expiryDate) tenant.expiryDate = expiryDate;
 
@@ -228,8 +279,81 @@ app.put('/api/admin/tenants/:id', async (req, res) => {
   });
 });
 
+/**
+ * View Shop Details — everything the Super Admin console shows in the tenant
+ * drawer, gathered in one call: profile, plan, licence usage, subscription
+ * state, live database statistics and the shop's recent audit trail.
+ */
+app.get('/api/admin/tenants/:id/details', async (req, res) => {
+  const { id } = req.params;
+  const tenant = memoryDb.tenants.find(t => t.id === id || t.tenantId === id);
+  if (!tenant) {
+    return res.status(404).json({ success: false, message: 'Tenant not found' });
+  }
+
+  const plan = memoryDb.plans.find(p => p.id === tenant.plan) || null;
+  const devices = (memoryDb.devices || []).filter(d => d.tenantId === tenant.tenantId || d.tenantId === tenant.id);
+  const subscription = (memoryDb.subscriptions || []).find(
+    s => s.tenantId === tenant.tenantId || s.tenantId === tenant.id
+  ) || null;
+  const payments = (memoryDb.payments || []).filter(
+    p => p.tenantId === tenant.tenantId || p.tenantId === tenant.id
+  );
+
+  let database = null;
+  try {
+    const { getTenantDbStats } = require('./tenantDb');
+    database = await getTenantDbStats(tenant.dbName);
+  } catch (err) {
+    console.error('[Tenant Stats Error]:', err.message);
+  }
+
+  const expiry = tenant.expiryDate ? new Date(tenant.expiryDate) : null;
+  const daysRemaining = expiry ? Math.ceil((expiry - Date.now()) / 86400000) : null;
+
+  res.json({
+    success: true,
+    data: {
+      tenant: { ...tenant, features: resolveTenantFeatures(tenant) },
+      plan,
+      featureCatalog: FEATURE_CATALOG,
+      subscription,
+      daysRemaining,
+      isExpired: daysRemaining !== null && daysRemaining < 0,
+      licence: {
+        maxDevices: tenant.maxDevices || plan?.maxDevices || 0,
+        activeDevices: devices.filter(d => d.status === 'active').length,
+        totalDevices: devices.length,
+        devices
+      },
+      payments: payments.slice(0, 20),
+      revenue: payments
+        .filter(p => p.status === 'PAID' || p.status === 'SUCCESS')
+        .reduce((sum, p) => sum + Number(p.amount || 0), 0),
+      database,
+      auditLogs: (memoryDb.auditLogs || [])
+        .filter(l => (l.description || '').includes(tenant.name) || l.actor === tenant.email)
+        .slice(0, 25)
+    }
+  });
+});
+
+/** The feature catalogue the plan editor and shop drawer render their toggles from. */
+app.get('/api/admin/features', (req, res) => {
+  res.json({ success: true, data: FEATURE_CATALOG });
+});
+
 // Get Subscription Plans
-app.get('/api/admin/plans', (req, res) => {
+app.get('/api/admin/plans', async (req, res) => {
+  if (getIsMongoConnected()) {
+    try {
+      const PlanModel = require('./models/Plan.model');
+      const dbPlans = await PlanModel.find().lean();
+      if (dbPlans && dbPlans.length > 0) memoryDb.plans = dbPlans;
+    } catch (err) {
+      console.error('[Plan DB Fetch Error]:', err.message);
+    }
+  }
   res.json({
     success: true,
     data: memoryDb.plans
@@ -237,7 +361,7 @@ app.get('/api/admin/plans', (req, res) => {
 });
 
 // Update Subscription Plan Details
-app.put('/api/admin/plans/:id', (req, res) => {
+app.put('/api/admin/plans/:id', async (req, res) => {
   const { id } = req.params;
   const { price, maxDevices, features } = req.body;
 
@@ -250,6 +374,15 @@ app.put('/api/admin/plans/:id', (req, res) => {
   if (maxDevices !== undefined) plan.maxDevices = Number(maxDevices);
   if (features) plan.features = features;
 
+  if (getIsMongoConnected()) {
+    try {
+      const PlanModel = require('./models/Plan.model');
+      await PlanModel.findOneAndUpdate({ id: plan.id }, plan, { upsert: true, new: true });
+    } catch (dbErr) {
+      console.error('[Plan DB Sync Error]:', dbErr.message);
+    }
+  }
+
   addAuditLog('PLAN_UPDATE', actorOf(req), `Updated pricing and options for tier [${plan.name}]`);
 
   res.json({
@@ -259,32 +392,50 @@ app.put('/api/admin/plans/:id', (req, res) => {
   });
 });
 
-// Database Health & Pool Diagnostics
-app.get('/api/admin/database/health', (req, res) => {
-  const pools = memoryDb.tenants.map(t => ({
-    tenantId: t.tenantId,
-    name: t.name,
-    dbName: t.dbName,
-    status: t.status === 'active' ? 'HEALTHY' : 'STANDBY',
-    collectionsCount: 8,
-    estimatedSizeMB: Math.floor(Math.random() * 40) + 12,
-    activeConnections: t.status === 'active' ? Math.floor(Math.random() * 4) + 1 : 0,
-    latencyMs: Math.floor(Math.random() * 8) + 2
-  }));
+// Database Health & Pool Diagnostics — read from the tenant databases themselves.
+app.get('/api/admin/database/health', async (req, res) => {
+  const { getTenantDbStats } = require('./tenantProvisioner');
+
+  const pools = await Promise.all(
+    memoryDb.tenants.map(async (t) => {
+      const started = Date.now();
+      const stats = await getTenantDbStats(t.dbName);
+      return {
+        tenantId: t.tenantId,
+        name: t.name,
+        dbName: t.dbName,
+        status: !stats ? 'UNREACHABLE' : t.status === 'active' ? 'HEALTHY' : 'STANDBY',
+        provisioned: Boolean(stats),
+        collectionsCount: stats?.collections ?? 0,
+        sizeMB: stats?.sizeMB ?? 0,
+        records: stats?.counts ?? {},
+        latencyMs: Date.now() - started
+      };
+    })
+  );
 
   res.json({
     success: true,
     isMongoMasterConnected: getIsMongoConnected(),
-    masterDatabase: 'pos_master_db',
+    masterDatabase: 'selsolve',
     totalIsolatedPools: pools.length,
-    activeConnectionsTotal: pools.reduce((acc, p) => acc + p.activeConnections, 0),
-    totalStorageMB: pools.reduce((acc, p) => acc + p.estimatedSizeMB, 0),
+    healthyPools: pools.filter(p => p.status === 'HEALTHY').length,
+    totalStorageMB: Math.round(pools.reduce((acc, p) => acc + p.sizeMB, 0) * 100) / 100,
     pools
   });
 });
 
 // Audit Logs Endpoint
-app.get('/api/admin/audit-logs', (req, res) => {
+app.get('/api/admin/audit-logs', async (req, res) => {
+  if (getIsMongoConnected()) {
+    try {
+      const AuditLogModel = require('./models/AuditLog.model');
+      const dbLogs = await AuditLogModel.find().sort({ createdAt: -1 }).limit(100).lean();
+      if (dbLogs && dbLogs.length > 0) memoryDb.auditLogs = dbLogs;
+    } catch (err) {
+      console.error('[AuditLog DB Fetch Error]:', err.message);
+    }
+  }
   res.json({
     success: true,
     data: memoryDb.auditLogs || []
@@ -292,20 +443,46 @@ app.get('/api/admin/audit-logs', (req, res) => {
 });
 
 // Platform Settings Endpoints
-app.get('/api/admin/settings', (req, res) => {
+app.get('/api/admin/settings', async (req, res) => {
+  if (getIsMongoConnected()) {
+    try {
+      const SettingModel = require('./models/Setting.model');
+      const dbSetting = await SettingModel.findOne({ key: 'master_settings' }).lean();
+      if (dbSetting) {
+        memoryDb.settings = {
+          maintenanceMode: dbSetting.maintenanceMode,
+          systemNotification: dbSetting.systemNotification,
+          otpExpiryMinutes: dbSetting.otpExpiryMinutes,
+          allowRegistration: dbSetting.allowRegistration,
+          platformVersion: dbSetting.platformVersion
+        };
+      }
+    } catch (err) {
+      console.error('[Setting DB Fetch Error]:', err.message);
+    }
+  }
   res.json({
     success: true,
     data: memoryDb.settings || {}
   });
 });
 
-app.put('/api/admin/settings', (req, res) => {
+app.put('/api/admin/settings', async (req, res) => {
   const { maintenanceMode, systemNotification, otpExpiryMinutes } = req.body;
   
   if (memoryDb.settings) {
     if (maintenanceMode !== undefined) memoryDb.settings.maintenanceMode = maintenanceMode;
     if (systemNotification !== undefined) memoryDb.settings.systemNotification = systemNotification;
     if (otpExpiryMinutes !== undefined) memoryDb.settings.otpExpiryMinutes = Number(otpExpiryMinutes);
+  }
+
+  if (getIsMongoConnected()) {
+    try {
+      const SettingModel = require('./models/Setting.model');
+      await SettingModel.findOneAndUpdate({ key: 'master_settings' }, memoryDb.settings, { upsert: true, new: true });
+    } catch (dbErr) {
+      console.error('[Setting DB Sync Error]:', dbErr.message);
+    }
   }
 
   addAuditLog('SETTINGS_UPDATE', actorOf(req), 'Updated platform configuration settings');
@@ -479,7 +656,9 @@ app.post('/api/auth/verify-otp', (req, res) => {
       phone: tenant.phone,
       dbName: tenant.dbName,
       plan: tenant.plan,
-      features: tenant.features
+      // Resolved, not raw — a shop still holding a pre-catalogue map would
+      // otherwise report modules as off that it can in fact use.
+      features: resolveTenantFeatures(tenant)
     }
   });
 });
@@ -488,6 +667,9 @@ app.post('/api/auth/verify-otp', (req, res) => {
 
 // Tenant Resolution Middleware for POS routes
 app.use('/api/pos', resolveTenantDb);
+
+// A shop may only reach the modules its subscription tier includes.
+app.use('/api/pos', enforcePlanFeatures);
 
 // API Routes
 app.use('/api/pos', apiRoutes);

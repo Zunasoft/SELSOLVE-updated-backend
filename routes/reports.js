@@ -277,6 +277,176 @@ router.get('/reports/purchases', (req, res) => {
   });
 });
 
+/* -------------------------- receivables & payables -------------------------- */
+
+/**
+ * Customer Outstanding Report — Module 10.
+ *
+ * Balances come from the party sub-ledgers, never from a stored field, so this
+ * can never drift away from what the Accounts module shows.
+ */
+router.get('/reports/customers/outstanding', (req, res) => {
+  const store = req.tenantStore;
+  const opts = { from: req.query.from || null, to: req.query.to || null };
+
+  const rows = engine
+    .partyOutstanding(store, 'CUSTOMER', opts)
+    .map((row) => {
+      const customer = (store.customers || []).find((c) => c.id === row.partyId) || {};
+      const bills = liveOrders(store).filter((o) => o.customerId === row.partyId);
+      const lastBill = bills[0];
+
+      return {
+        id: row.partyId,
+        name: row.name || customer.name,
+        phone: customer.phone || '',
+        group: customer.group || 'Retail',
+        creditLimit: r2(customer.creditLimit),
+        outstanding: r2(Math.max(0, row.balance)),
+        advance: r2(Math.max(0, -row.balance)),
+        loyaltyPoints: customer.loyaltyPoints || 0,
+        billCount: bills.length,
+        lastBillDate: lastBill ? lastBill.date : null,
+        lastBillAmount: lastBill ? r2(lastBill.total) : 0,
+        // A shop wants to know who is past the limit it granted them, not just
+        // who owes something.
+        overLimit: Number(customer.creditLimit) > 0 && row.balance > Number(customer.creditLimit)
+      };
+    })
+    .filter((row) => row.outstanding > 0 || row.advance > 0)
+    .sort((a, b) => b.outstanding - a.outstanding);
+
+  res.json({
+    success: true,
+    data: {
+      rows,
+      ageing: engine.ageing(store, 'CUSTOMER', { asOf: req.query.to }),
+      totalOutstanding: r2(rows.reduce((s, r) => s + r.outstanding, 0)),
+      totalAdvance: r2(rows.reduce((s, r) => s + r.advance, 0)),
+      overLimitCount: rows.filter((r) => r.overLimit).length
+    }
+  });
+});
+
+/** Vendor Payables Report — Module 10. */
+router.get('/reports/vendors/payables', (req, res) => {
+  const store = req.tenantStore;
+  const opts = { from: req.query.from || null, to: req.query.to || null };
+
+  const rows = engine
+    .partyOutstanding(store, 'VENDOR', opts)
+    .map((row) => {
+      const vendor = (store.vendors || []).find((v) => v.id === row.partyId) || {};
+      const invoices = (store.purchases || []).filter((p) => p.vendorId === row.partyId);
+      const lastInvoice = invoices[0];
+
+      return {
+        id: row.partyId,
+        name: row.name || vendor.name,
+        phone: vendor.phone || '',
+        gstin: vendor.gstin || '',
+        payable: r2(Math.max(0, row.balance)),
+        advancePaid: r2(Math.max(0, -row.balance)),
+        invoiceCount: invoices.length,
+        totalPurchased: r2(invoices.reduce((s, p) => s + p.totalAmount, 0)),
+        lastInvoiceDate: lastInvoice ? lastInvoice.date : null,
+        lastInvoiceNo: lastInvoice ? lastInvoice.invoiceNo : null
+      };
+    })
+    .filter((row) => row.payable > 0 || row.advancePaid > 0)
+    .sort((a, b) => b.payable - a.payable);
+
+  res.json({
+    success: true,
+    data: {
+      rows,
+      ageing: engine.ageing(store, 'VENDOR', { asOf: req.query.to }),
+      totalPayable: r2(rows.reduce((s, r) => s + r.payable, 0)),
+      totalAdvance: r2(rows.reduce((s, r) => s + r.advancePaid, 0))
+    }
+  });
+});
+
+/* ------------------------------ expense report ------------------------------ */
+
+/**
+ * Expense Report — Module 9/10. Grouped by expense head, with the individual
+ * entries underneath so a total can always be drilled into.
+ */
+router.get('/reports/expenses', (req, res) => {
+  const store = req.tenantStore;
+  const opts = { from: req.query.from || null, to: req.query.to || null };
+
+  const entries = (store.expenses || []).filter((e) => inWindow(e.date, opts.from, opts.to));
+
+  const byCategory = {};
+  entries.forEach((e) => {
+    const key = e.category || 'General';
+    if (!byCategory[key]) byCategory[key] = { category: key, accountId: e.accountId, count: 0, amount: 0, tax: 0 };
+    byCategory[key].count += 1;
+    byCategory[key].amount = r2(byCategory[key].amount + Number(e.amount || 0));
+    byCategory[key].tax = r2(byCategory[key].tax + Number(e.tax || 0));
+  });
+
+  const byMode = {};
+  entries.forEach((e) => {
+    const key = e.unpaid ? 'Unpaid (Credit)' : e.paymentMode || 'Cash';
+    byMode[key] = r2((byMode[key] || 0) + Number(e.amount || 0));
+  });
+
+  const categories = Object.values(byCategory).sort((a, b) => b.amount - a.amount);
+  const total = r2(categories.reduce((s, c) => s + c.amount, 0));
+
+  res.json({
+    success: true,
+    data: {
+      rows: categories.map((c) => ({ ...c, share: total ? r2((c.amount / total) * 100) : 0 })),
+      entries: entries.sort((a, b) => new Date(b.date) - new Date(a.date)),
+      byMode: Object.entries(byMode).map(([mode, amount]) => ({ mode, amount })),
+      total,
+      totalTax: r2(entries.reduce((s, e) => s + Number(e.tax || 0), 0)),
+      unpaid: r2(entries.filter((e) => e.unpaid).reduce((s, e) => s + Number(e.amount || 0), 0)),
+      count: entries.length
+    }
+  });
+});
+
+/* --------------------------- cash flow / day summary --------------------------- */
+
+/**
+ * Daily Cash Summary — Module 16. Opening, in, out and closing for every day in
+ * the window, taken from the cash account's own day book.
+ */
+router.get('/reports/cash-summary', (req, res) => {
+  const store = req.tenantStore;
+  const opts = { from: req.query.from || null, to: req.query.to || null };
+
+  const cashAccounts = (store.accounts || []).filter((a) => a.systemKey === 'CASH');
+  const bankAccounts = (store.accounts || []).filter((a) => a.systemKey === 'BANK');
+  const primaryCash = cashAccounts[0];
+
+  const book = primaryCash ? engine.dayBook(store, primaryCash.id, opts) : null;
+  const days = book ? [...book.days].reverse() : [];
+
+  res.json({
+    success: true,
+    data: {
+      days,
+      cashBalance: r2(cashAccounts.reduce((s, a) => s + engine.accountBalance(store, a.id), 0)),
+      bankBalance: r2(bankAccounts.reduce((s, a) => s + engine.accountBalance(store, a.id), 0)),
+      accounts: [...cashAccounts, ...bankAccounts].map((a) => ({
+        id: a.id,
+        name: a.name,
+        kind: a.systemKey,
+        balance: r2(engine.accountBalance(store, a.id))
+      })),
+      totalInflow: r2(days.reduce((s, d) => s + d.inflow, 0)),
+      totalOutflow: r2(days.reduce((s, d) => s + d.outflow, 0)),
+      session: store.session
+    }
+  });
+});
+
 /* ----------------------------- session reports ----------------------------- */
 
 router.get('/reports/sessions', (req, res) => {
@@ -302,7 +472,11 @@ const EXPORTABLE = {
   'sales-products': { title: 'Product Sales Report', path: '/reports/sales/products' },
   'sales-categories': { title: 'Category Sales Report', path: '/reports/sales/categories' },
   stock: { title: 'Stock Report', path: '/reports/stock' },
-  purchases: { title: 'Purchase Report', path: '/reports/purchases' }
+  purchases: { title: 'Purchase Report', path: '/reports/purchases' },
+  'customer-outstanding': { title: 'Customer Outstanding Report', path: '/reports/customers/outstanding' },
+  'vendor-payables': { title: 'Vendor Payables Report', path: '/reports/vendors/payables' },
+  expenses: { title: 'Expense Report', path: '/reports/expenses' },
+  'cash-summary': { title: 'Daily Cash Summary', path: '/reports/cash-summary' }
 };
 
 /**
@@ -388,7 +562,63 @@ router.get('/reports/export/:report', (req, res) => {
           GST: p.tax,
           Total: p.totalAmount,
           Status: p.paymentStatus
-        }))
+        })),
+    'customer-outstanding': () =>
+      engine
+        .partyOutstanding(store, 'CUSTOMER', { to: req.query.to })
+        .filter((row) => row.balance > 0)
+        .map((row) => {
+          const customer = (store.customers || []).find((c) => c.id === row.partyId) || {};
+          return {
+            Customer: row.name,
+            Phone: customer.phone || '—',
+            Group: customer.group || 'Retail',
+            'Credit Limit': r2(customer.creditLimit),
+            Outstanding: r2(row.balance),
+            'Last Activity': row.lastActivity ? dayKey(row.lastActivity) : '—'
+          };
+        }),
+    'vendor-payables': () =>
+      engine
+        .partyOutstanding(store, 'VENDOR', { to: req.query.to })
+        .filter((row) => row.balance > 0)
+        .map((row) => {
+          const vendor = (store.vendors || []).find((v) => v.id === row.partyId) || {};
+          return {
+            Vendor: row.name,
+            Phone: vendor.phone || '—',
+            GSTIN: vendor.gstin || '—',
+            Payable: r2(row.balance),
+            'Last Activity': row.lastActivity ? dayKey(row.lastActivity) : '—'
+          };
+        }),
+    expenses: () =>
+      (store.expenses || [])
+        .filter((e) => inWindow(e.date, req.query.from, req.query.to))
+        .sort((a, b) => new Date(b.date) - new Date(a.date))
+        .map((e) => ({
+          Date: dayKey(e.date),
+          Category: e.category || 'General',
+          Vendor: e.vendorName || '—',
+          Amount: r2(e.amount),
+          GST: r2(e.tax),
+          'Paid By': e.unpaid ? 'Unpaid (Credit)' : e.paymentMode || 'Cash',
+          Voucher: e.voucherNo || '—',
+          Notes: e.notes || ''
+        })),
+    'cash-summary': () => {
+      const cash = (store.accounts || []).find((a) => a.systemKey === 'CASH');
+      if (!cash) return [];
+      const book = engine.dayBook(store, cash.id, { from: req.query.from, to: req.query.to });
+      return [...(book ? book.days : [])].reverse().map((d) => ({
+        Date: d.date,
+        Opening: r2(d.opening),
+        'Cash In': r2(d.inflow),
+        'Cash Out': r2(d.outflow),
+        Closing: r2(d.closing),
+        Entries: d.entries.length
+      }));
+    }
   };
 
   const rows = shapes[key]();

@@ -23,6 +23,8 @@ function ensureCollections() {
   if (!Array.isArray(memoryDb.payments)) memoryDb.payments = [];
 
   memoryDb.plans.forEach((plan) => {
+    // Widen any pre-catalogue feature list before it is read as a denial.
+    upgradePlanFeatures(plan);
     if (!plan.licenseModel) plan.licenseModel = plan.id === 'enterprise' ? 'PER_ORGANISATION' : 'PER_DEVICE';
     if (!plan.billingCycle) plan.billingCycle = 'Monthly';
     if (plan.trialDays === undefined) plan.trialDays = plan.id === 'starter' ? 14 : 0;
@@ -223,7 +225,8 @@ router.post('/devices/validate', (req, res) => {
     data: {
       device,
       tenant: { tenantId: tenant.tenantId, name: tenant.name, dbName: tenant.dbName, plan: tenant.plan },
-      features: tenant.features,
+      // Resolved so a device sees the same module set the POS routes allow.
+      features: resolveTenantFeatures(tenant),
       subscription: state
     }
   });
@@ -233,10 +236,15 @@ router.post('/devices/validate', (req, res) => {
  * Plan management
  * ------------------------------------------------------------------ */
 
-const FEATURE_KEYS = [
-  'billing', 'inventory', 'purchases', 'reports', 'accounts',
-  'compositeItems', 'tableMgmt', 'multiUser', 'hardwareIntegration', 'exportReports'
-];
+// One catalogue for the whole platform — see modules/features.js.
+const {
+  FEATURE_KEYS,
+  FEATURE_CATALOG,
+  featuresForPlan,
+  resolveTenantFeatures,
+  PLAN_DEFAULTS,
+  upgradePlanFeatures
+} = require('./features');
 
 router.get('/plans/catalog', (req, res) => {
   res.json({
@@ -249,7 +257,8 @@ router.get('/plans/catalog', (req, res) => {
           memoryDb.tenants.filter((t) => t.plan === plan.id && t.status === 'active').length *
           (plan.billingCycle === 'Yearly' ? Math.round(plan.price / 12) : plan.price)
       })),
-      featureKeys: FEATURE_KEYS
+      featureKeys: FEATURE_KEYS,
+      featureCatalog: FEATURE_CATALOG
     }
   });
 });
@@ -269,7 +278,7 @@ router.post('/plans', (req, res) => {
     price: Number(price) || 0,
     billingCycle: billingCycle || 'Monthly',
     maxDevices: Number(maxDevices) || 1,
-    features: Array.isArray(features) ? features : ['billing', 'inventory', 'reports'],
+    features: Array.isArray(features) ? features : [...(PLAN_DEFAULTS[planId] || PLAN_DEFAULTS.starter)],
     licenseModel: licenseModel || 'PER_DEVICE',
     trialDays: Number(trialDays) || 0,
     isActive: true,
@@ -358,10 +367,7 @@ router.post('/subscriptions/:tenantId/renew', (req, res) => {
     if (!plan) return res.status(400).json({ success: false, message: 'Unknown plan.' });
     tenant.plan = plan.id;
     tenant.maxDevices = plan.maxDevices;
-    tenant.features = FEATURE_KEYS.reduce((acc, key) => {
-      acc[key] = plan.features.includes(key);
-      return acc;
-    }, {});
+    tenant.features = featuresForPlan(plan, plan.id);
   }
 
   const plan = planOf(tenant);
@@ -564,10 +570,7 @@ function capturePayment(payment, { paymentId, signature, actor }) {
 
     tenant.plan = plan.id;
     tenant.maxDevices = plan.maxDevices;
-    tenant.features = FEATURE_KEYS.reduce((acc, key) => {
-      acc[key] = plan.features.includes(key);
-      return acc;
-    }, {});
+    tenant.features = featuresForPlan(plan, plan.id);
     tenant.expiryDate = dayKey(new Date(from.getTime() + days * 86400000));
     tenant.status = 'active';
     tenant.isTrial = false;

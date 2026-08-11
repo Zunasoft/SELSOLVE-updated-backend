@@ -1,17 +1,17 @@
 /**
  * Warehouse Controller
  * Manages warehouses CRUD and stock transfer between Main Warehouse and Shop Floor.
+ *
+ * Like the catalog controller, these handlers mutate only `req.tenantStore`;
+ * the tenant middleware writes it to the calling shop's own database.
  */
 
-const { logStockMovement } = require('../store');
+const { logStockMovement, defaultWarehouses } = require('../store');
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 
 function ensureWarehouses(store) {
   if (!Array.isArray(store.warehouses) || store.warehouses.length === 0) {
-    store.warehouses = [
-      { id: 'wh_main', name: 'Main Warehouse (Godown)', code: 'WH-MAIN', location: 'Main Storage', isDefault: true, createdAt: new Date().toISOString() },
-      { id: 'wh_shop', name: 'Shop Floor Stock', code: 'WH-SHOP', location: 'Retail Counter', isDefault: false, createdAt: new Date().toISOString() }
-    ];
+    store.warehouses = defaultWarehouses();
   }
   return store.warehouses;
 }
@@ -61,16 +61,6 @@ exports.createWarehouse = async (req, res) => {
 
   warehouses.push(warehouse);
 
-  const { getIsMongoConnected } = require('../db');
-  if (getIsMongoConnected()) {
-    try {
-      const WarehouseModel = require('../models/Warehouse.model');
-      await WarehouseModel.findOneAndUpdate({ id: warehouse.id }, warehouse, { upsert: true, new: true });
-    } catch (err) {
-      console.error('[Warehouse DB Sync Error]:', err.message);
-    }
-  }
-
   res.status(201).json({ success: true, message: 'Warehouse created.', data: warehouse });
 };
 
@@ -85,16 +75,6 @@ exports.updateWarehouse = async (req, res) => {
   if (name) wh.name = name;
   if (code) wh.code = code;
   if (location !== undefined) wh.location = location;
-
-  const { getIsMongoConnected } = require('../db');
-  if (getIsMongoConnected()) {
-    try {
-      const WarehouseModel = require('../models/Warehouse.model');
-      await WarehouseModel.findOneAndUpdate({ id: wh.id }, wh, { upsert: true, new: true });
-    } catch (err) {
-      console.error('[Warehouse DB Sync Error]:', err.message);
-    }
-  }
 
   res.json({ success: true, message: 'Warehouse updated.', data: wh });
 };
@@ -116,16 +96,6 @@ exports.deleteWarehouse = async (req, res) => {
   }
 
   store.warehouses.splice(index, 1);
-
-  const { getIsMongoConnected } = require('../db');
-  if (getIsMongoConnected()) {
-    try {
-      const WarehouseModel = require('../models/Warehouse.model');
-      await WarehouseModel.findOneAndDelete({ id: req.params.id });
-    } catch (err) {
-      console.error('[Warehouse DB Sync Error]:', err.message);
-    }
-  }
 
   res.json({ success: true, message: 'Warehouse deleted.' });
 };
@@ -186,16 +156,6 @@ exports.transferStock = async (req, res) => {
     refId: `tr_${Date.now()}`,
     user: actor(req)
   });
-
-  const { getIsMongoConnected } = require('../db');
-  if (getIsMongoConnected()) {
-    try {
-      const ProductModel = require('../models/Product.model');
-      await ProductModel.findOneAndUpdate({ id: product.id }, product, { upsert: true, new: true });
-    } catch (err) {
-      console.error('[Product DB Sync Error]:', err.message);
-    }
-  }
 
   res.json({
     success: true,

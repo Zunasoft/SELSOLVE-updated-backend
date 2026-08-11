@@ -7,23 +7,28 @@ const express = require('express');
 const { logStockMovement } = require('../store');
 const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
-
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const r2 = engine.r2;
 
 /* --------------------------------- init --------------------------------- */
 
+/**
+ * Everything the terminal needs to boot. The store was already loaded from the
+ * tenant's own database by `resolveTenantDb`, so this reads straight from it.
+ */
 router.get('/init', (req, res) => {
   const store = req.tenantStore;
+
   res.json({
     success: true,
     tenantDb: req.tenantDbName,
+    shop: req.tenant ? { name: req.tenant.name, email: req.tenant.email, plan: req.tenant.plan } : undefined,
     data: {
-      categories: store.categories,
-      products: store.products,
+      categories: store.categories || [],
+      products: store.products || [],
       session: store.session,
-      customers: store.customers,
+      customers: store.customers || [],
       heldBills: store.heldBills || [],
       tables: store.tables || [],
       settings: store.settings,
@@ -91,6 +96,26 @@ router.delete('/bills/held/:id', (req, res) => {
  * instead of its own (notional) stock, which is what keeps raw-material
  * inventory honest for bakeries and kitchens.
  */
+/**
+ * A line billed in an alternate unit still moves base units of stock: one "box"
+ * of a product whose box factor is 12 takes 12 pieces off the shelf. The factor
+ * travels on the cart line, so a bill printed in boxes and a stock report
+ * counted in pieces stay in agreement.
+ */
+function baseQty(product, cartItem) {
+  const qty = Number(cartItem.qty) || 0;
+  const soldUnit = cartItem.saleUnit || cartItem.unit;
+
+  if (!soldUnit || !product || soldUnit === product.unit) return qty;
+
+  const alt = (product.altUnits || []).find(
+    (u) => String(u.unit).toLowerCase() === String(soldUnit).toLowerCase()
+  );
+  const factor = Number(cartItem.unitFactor) || (alt ? Number(alt.factor) : 0);
+
+  return factor > 0 ? qty * factor : qty;
+}
+
 function deductStock(store, items, orderId, user) {
   const shortages = [];
 
@@ -98,13 +123,14 @@ function deductStock(store, items, orderId, user) {
     const product = store.products.find((p) => p.id === cartItem.id || p.name === cartItem.name);
     if (!product) return;
 
+    const soldQty = baseQty(product, cartItem);
     const recipe = (store.recipes || []).find((r) => r.productId === product.id);
 
     if (product.isComposite && recipe) {
       recipe.ingredients.forEach((ing) => {
         const raw = store.products.find((p) => p.id === ing.productId);
         if (!raw) return;
-        const consumed = (Number(ing.qty) * Number(cartItem.qty)) / (recipe.yieldQty || 1);
+        const consumed = (Number(ing.qty) * soldQty) / (recipe.yieldQty || 1);
         raw.stock = r2(raw.stock - consumed);
         if (raw.stock < 0 && !store.settings.pos.allowNegativeStock) raw.stock = 0;
 
@@ -128,7 +154,7 @@ function deductStock(store, items, orderId, user) {
       return;
     }
 
-    const qty = Number(cartItem.qty);
+    const qty = soldQty;
     if (qty > product.stock && !store.settings.pos.allowNegativeStock) {
       shortages.push({ name: product.name, available: product.stock, requested: qty });
     }
@@ -157,11 +183,12 @@ function deductStock(store, items, orderId, user) {
   return shortages;
 }
 
-router.post('/orders', (req, res) => {
+router.post('/orders', async (req, res) => {
   const store = req.tenantStore;
   const {
     customerName, customerPhone, customerId, paymentMethod,
-    subtotal, tax, discount, total, items, tableId, splitPayments, notes
+    subtotal, tax, discount, total, items, tableId, splitPayments, notes,
+    redeemPoints
   } = req.body;
 
   if (!items || items.length === 0) {
@@ -201,6 +228,45 @@ router.post('/orders', (req, res) => {
     });
   }
 
+  /* ----------------------------- loyalty redemption -----------------------------
+   * Points come off the bill before it is posted, so the ledger, the drawer and
+   * the printed receipt all agree on what the customer actually paid.
+   */
+  const pos = store.settings.pos || {};
+  let loyaltyRedeemed = 0;
+  let pointsRedeemed = 0;
+
+  if (customer && Number(redeemPoints) > 0) {
+    if (pos.enableLoyalty === false) {
+      return res.status(400).json({ success: false, message: 'Loyalty points are switched off for this shop.' });
+    }
+
+    const available = customer.loyaltyPoints || 0;
+    const wanted = Math.floor(Number(redeemPoints));
+    const minPoints = Number(pos.loyaltyMinRedeemPoints) || 0;
+
+    if (wanted > available) {
+      return res.status(400).json({
+        success: false,
+        message: `${customer.name} has only ${available} point(s) available.`
+      });
+    }
+    if (wanted < minPoints) {
+      return res.status(400).json({
+        success: false,
+        message: `At least ${minPoints} points are needed before they can be redeemed.`
+      });
+    }
+
+    const rate = Number(pos.loyaltyRedeemValue) || 0;
+    // Redemption can settle a bill but never turn it into a refund.
+    loyaltyRedeemed = Math.min(r2(wanted * rate), r2(total));
+    pointsRedeemed = rate > 0 ? Math.ceil(loyaltyRedeemed / rate) : 0;
+    customer.loyaltyPoints = available - pointsRedeemed;
+  }
+
+  const payableTotal = r2(Number(total) - loyaltyRedeemed);
+
   const shortages = deductStock(store, items, orderId, actor(req));
 
   const order = {
@@ -213,7 +279,10 @@ router.post('/orders', (req, res) => {
     subtotal: r2(subtotal),
     tax: r2(tax),
     discount: r2(discount),
-    total: r2(total),
+    loyaltyRedeemed,
+    pointsRedeemed,
+    grossTotal: r2(total),
+    total: payableTotal,
     notes: notes || '',
     tableId: tableId || null,
     cashier: actor(req),
@@ -223,11 +292,13 @@ router.post('/orders', (req, res) => {
     items
   };
 
-  // Loyalty accrues on every non-credit sale.
-  if (customer && store.settings.pos.enableLoyalty) {
-    const earned = Math.floor((order.total / 100) * (store.settings.pos.loyaltyPointsPerHundred || 1));
+  // Points accrue on what was actually paid, not on the value settled with
+  // points — otherwise redeeming would keep topping the balance back up.
+  if (customer && pos.enableLoyalty !== false) {
+    const earned = Math.floor((order.total / 100) * (pos.loyaltyPointsPerHundred || 1));
     customer.loyaltyPoints = (customer.loyaltyPoints || 0) + earned;
     order.loyaltyEarned = earned;
+    order.loyaltyBalance = customer.loyaltyPoints;
   }
 
   // Cash sales move the counter drawer.
@@ -263,6 +334,9 @@ router.post('/orders', (req, res) => {
     if (account) customer.outstanding = Math.max(0, engine.accountBalance(store, account.id));
   }
 
+  // The invoice, the stock it moved and the vouchers it posted are all part of
+  // this tenant's store, which the tenant middleware flushes to the tenant's own
+  // database before this response is sent.
   store.orders.unshift(order);
 
   if (tableId) {
@@ -316,13 +390,15 @@ router.post('/orders/:orderId/void', (req, res) => {
     const product = store.products.find((p) => p.id === item.id || p.name === item.name);
     if (!product) return;
 
+    // Return exactly what the sale took, alternate units included.
+    const soldQty = baseQty(product, item);
     const recipe = (store.recipes || []).find((r) => r.productId === product.id);
 
     if (product.isComposite && recipe) {
       recipe.ingredients.forEach((ing) => {
         const raw = store.products.find((p) => p.id === ing.productId);
         if (!raw) return;
-        const returned = (Number(ing.qty) * Number(item.qty)) / (recipe.yieldQty || 1);
+        const returned = (Number(ing.qty) * soldQty) / (recipe.yieldQty || 1);
         raw.stock = r2(raw.stock + returned);
         
         if (raw.warehouses) {
@@ -342,16 +418,16 @@ router.post('/orders/:orderId/void', (req, res) => {
       return;
     }
 
-    product.stock = r2(product.stock + Number(item.qty));
+    product.stock = r2(product.stock + soldQty);
     if (product.warehouses) {
-      product.warehouses['wh_shop'] = (product.warehouses['wh_shop'] || 0) + Number(item.qty);
+      product.warehouses['wh_shop'] = (product.warehouses['wh_shop'] || 0) + soldQty;
       product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
     }
 
     logStockMovement(store, {
       product,
       type: 'RETURN',
-      qtyChange: Number(item.qty),
+      qtyChange: soldQty,
       reason: `Void of ${order.orderId}`,
       refId: order.orderId,
       user: actor(req)
@@ -377,6 +453,14 @@ router.post('/orders/:orderId/void', (req, res) => {
       reason: `Void ${order.orderId}`,
       time: new Date().toISOString()
     });
+  }
+
+  // Unwind loyalty in both directions: take back what the bill earned and give
+  // back what it consumed, so a void leaves the customer exactly where they were.
+  const customer = (store.customers || []).find((c) => c.id === order.customerId);
+  if (customer) {
+    const balance = (customer.loyaltyPoints || 0) - (order.loyaltyEarned || 0) + (order.pointsRedeemed || 0);
+    customer.loyaltyPoints = Math.max(0, balance);
   }
 
   order.status = 'VOID';
