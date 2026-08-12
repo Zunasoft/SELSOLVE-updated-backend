@@ -128,9 +128,46 @@ function deductStock(store, items, orderId, user) {
 
     if (product.isComposite && recipe) {
       recipe.ingredients.forEach((ing) => {
+        const raw = store.products.find((p) => p.id === ing.productId);
+        if (!raw) return;
+        const deducted = (Number(ing.qty) * soldQty) / (recipe.yieldQty || 1);
+        
+        if (raw.stock < deducted) {
+          shortages.push({ name: raw.name, available: raw.stock });
+        }
+        
+        raw.stock = r2(raw.stock - deducted);
+        if (raw.warehouses) {
+          raw.warehouses['wh_shop'] = (raw.warehouses['wh_shop'] || 0) - deducted;
+          raw.stock = Object.values(raw.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
+        }
+
+        logStockMovement(store, {
+          product: raw,
+          type: 'SALE',
+          qtyChange: -deducted,
+          reason: `Sold on ${orderId}`,
+          refId: orderId,
+          user
+        });
+      });
+      return;
+    }
+
+    if (product.stock < soldQty) {
+      shortages.push({ name: product.name, available: product.stock });
+    }
+
+    product.stock = r2(product.stock - soldQty);
+    if (product.warehouses) {
+      product.warehouses['wh_shop'] = (product.warehouses['wh_shop'] || 0) - soldQty;
+      product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
+    }
+
+    logStockMovement(store, {
       product,
       type: 'SALE',
-      qtyChange: -qty,
+      qtyChange: -soldQty,
       reason: `Sold on ${orderId}`,
       refId: orderId,
       user

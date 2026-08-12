@@ -1,28 +1,7 @@
-/**
- * Tenant database layer — the single place that talks to a tenant's isolated
- * MongoDB database.
- *
- * The POS route handlers all work against a plain JavaScript object
- * (`req.tenantStore`). This module is what makes that object durable and
- * tenant-scoped: it hydrates the store from the tenant's own database before a
- * request runs, and writes every change back to that same database afterwards.
- *
- * Nothing in here ever touches the master database. Master holds tenants,
- * plans, super admins and audit logs; a tenant's operational data lives only in
- * `tenant_db_<slug>`.
- */
 
 const crypto = require('crypto');
 const mongoose = require('mongoose');
 const { emptyStore, defaultSettings } = require('./store');
-
-/* ------------------------------------------------------------------ *
- * Collection map
- *
- * Every key the POS route handlers read or write off `req.tenantStore`
- * appears here. If it is not in this list it is not persisted, so any new
- * store key must be registered below.
- * ------------------------------------------------------------------ */
 
 const ARRAY_COLLECTIONS = [
   { key: 'categories', collection: 'categories', idField: 'id' },
@@ -69,13 +48,7 @@ const getTenantDb = (dbName) => {
   return mongoose.connection.useDb(dbName, { useCache: true }).db;
 };
 
-/* ------------------------------------------------------------------ *
- * Change tracking
- *
- * A baseline fingerprint is taken at hydrate time so a flush only writes the
- * documents that actually changed, instead of rewriting the whole catalogue on
- * every request.
- * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 
 const baselines = new WeakMap();
 

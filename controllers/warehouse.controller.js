@@ -20,6 +20,23 @@ exports.getWarehouses = (req, res) => {
   const store = req.tenantStore;
   const warehouses = ensureWarehouses(store);
 
+  const data = warehouses.map((wh) => {
+    let itemCounts = 0;
+    let totalStock = 0;
+
+    (store.products || []).forEach((p) => {
+      const whStock = p.warehouses && p.warehouses[wh.id] !== undefined
+        ? Number(p.warehouses[wh.id])
+        : wh.id === 'wh_shop' || (wh.isDefault && !p.warehouses)
+        ? Number(p.stock || 0)
+        : 0;
+
+      if (whStock > 0) {
+        itemCounts += 1;
+        totalStock += whStock;
+      }
+    });
+
     return { ...wh, itemCounts, totalStock };
   });
 
