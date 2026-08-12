@@ -1,5 +1,8 @@
 /**
- * Payment Mongoose Schema
+ * Payment Mongoose Schema — a Razorpay order and its outcome.
+ *
+ * The order is written the moment checkout opens, so a payment that is never
+ * completed still leaves a record to reconcile against.
  */
 
 const mongoose = require('mongoose');
@@ -7,17 +10,27 @@ const mongoose = require('mongoose');
 const paymentSchema = new mongoose.Schema(
   {
     id: { type: String, required: true, unique: true },
-    tenantId: { type: String, required: true },
+    orderId: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    shopName: { type: String },
     planId: { type: String },
+    planName: { type: String },
+    purpose: { type: String, default: 'RENEWAL' },
     amount: { type: Number, required: true },
+    amountInPaise: { type: Number },
     currency: { type: String, default: 'INR' },
-    status: { type: String, default: 'COMPLETED' },
-    gateway: { type: String, default: 'SIMULATED' },
-    transactionId: { type: String },
-    purpose: { type: String, default: 'NEW_SUBSCRIPTION' },
-    createdAt: { type: String, default: () => new Date().toISOString() }
+    receipt: { type: String },
+    status: { type: String, default: 'CREATED' },
+    gateway: { type: String, default: 'RAZORPAY_SIMULATION' },
+    razorpayPaymentId: { type: String, default: null },
+    signature: { type: String, default: null },
+    failureReason: { type: String, default: null },
+    failureCode: { type: String, default: null },
+    createdAt: { type: String, default: () => new Date().toISOString() },
+    paidAt: { type: String, default: null },
+    failedAt: { type: String, default: null }
   },
-  { timestamps: true }
+  { timestamps: true, strict: false, minimize: false }
 );
 
 module.exports = mongoose.models.Payment || mongoose.model('Payment', paymentSchema);

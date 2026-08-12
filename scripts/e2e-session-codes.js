@@ -14,7 +14,7 @@ const mongoose = require('mongoose');
 
 const app = require('../server');
 const config = require('../config/config');
-const { memoryDb, getIsMongoConnected } = require('../db');
+const { getIsMongoConnected } = require('../db');
 const { SESSION_ENDED_CODES } = require('../middlewares/tenant.middleware');
 
 const SHOP = { name: 'E2E Session Codes', email: 'e2e-session@example.test' };
@@ -96,7 +96,6 @@ async function cleanup() {
     await mongoose.connection.useDb(existing.dbName, { useCache: true }).db.dropDatabase().catch(() => {});
   }
   await TenantModel.deleteOne({ email: SHOP.email });
-  memoryDb.tenants = memoryDb.tenants.filter((t) => t.email !== SHOP.email);
 }
 
 (async () => {
@@ -108,7 +107,7 @@ async function cleanup() {
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
 
-  // A starter shop: the plan excludes multi-warehouse stock.
+  // A starter shop — the lowest tier, so every core module must still open.
   const created = await request('POST', '/api/admin/tenants', {
     token: adminToken(),
     body: { ...SHOP, plan: 'starter' }
@@ -119,9 +118,11 @@ async function cleanup() {
 
   console.log('\n[1] Opening the Stock screen must not sign the user out');
 
+  // Multi-warehouse stock is a core module in the feature catalogue, so the
+  // Stock screen opens on every tier. Whichever way it answers, the one thing
+  // it must never do is end the session.
   const warehouses = await request('GET', '/api/pos/warehouses', { token });
-  ok('Warehouses refused as not-in-plan', warehouses.status === 403 && warehouses.body?.code === 'FEATURE_NOT_IN_PLAN',
-    `status ${warehouses.status} code ${warehouses.body?.code}`);
+  ok('Stock screen opens on the lowest tier', warehouses.status === 200, `status ${warehouses.status}`);
   ok('...and the client stays signed in', clientWouldSignOut(warehouses) === false);
 
   for (const path of ['/api/pos/units', '/api/pos/inventory/summary', '/api/pos/products', '/api/pos/categories']) {

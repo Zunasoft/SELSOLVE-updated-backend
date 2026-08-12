@@ -13,7 +13,7 @@ const mongoose = require('mongoose');
 
 const app = require('../server');
 const config = require('../config/config');
-const { memoryDb, getIsMongoConnected } = require('../db');
+const { getIsMongoConnected } = require('../db');
 
 const SHOP_A = { name: 'E2E Alpha Mart', email: 'e2e-alpha@example.test' };
 const SHOP_B = { name: 'E2E Beta Store', email: 'e2e-beta@example.test' };
@@ -113,7 +113,6 @@ async function cleanup() {
       await mongoose.connection.useDb(existing.dbName, { useCache: true }).db.dropDatabase().catch(() => {});
     }
     await TenantModel.deleteOne({ email: shop.email });
-    memoryDb.tenants = memoryDb.tenants.filter((t) => t.email !== shop.email);
   }
 }
 
@@ -231,12 +230,11 @@ async function cleanup() {
   const noAuth = await request('GET', '/api/pos/products', { headers: { 'x-tenant-db': tenantA.dbName } });
   ok('Unauthenticated access is rejected', noAuth.status === 401, `status ${noAuth.status}`);
 
-  /* ---------------- 6. Data survives a restart ---------------- */
-  console.log('\n[6] Data survives a process restart (cache dropped, reloaded from the shop DB)');
+  /* ---------------- 6. Every read comes from the shop's database ---------------- */
+  console.log('\n[6] Reads come from the shop database, not from process memory');
 
-  const { tenantDatabases } = require('../store');
-  Object.keys(tenantDatabases).forEach((k) => delete tenantDatabases[k]);
-
+  // There is no cache to drop: each request builds a fresh working set and
+  // fills it from `tenant_db_*`, which is what makes two instances agree.
   const afterRestart = await request('GET', '/api/pos/init', { token: tokA });
   const products = afterRestart.body?.data?.products || [];
   const reloaded = products.find((p) => p.name === 'Alpha Apple');

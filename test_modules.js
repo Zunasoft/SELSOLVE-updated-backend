@@ -1,23 +1,24 @@
 /**
  * End-to-end check of the SOW modules against the real Express app.
  *
- * Runs entirely in-process with no MongoDB: the tenant middleware falls back to
- * the in-memory store, which is exactly the path a fresh shop takes before its
- * database is provisioned. A tenant is injected into the master memory store and
- * a session token signed for it, so every request goes through the genuine auth,
- * tenant-isolation and plan-feature middleware rather than around them.
+ * Runs against the real databases, because the application has no other mode:
+ * the master database holds the shop record and an isolated `tenant_db_*`
+ * database holds its data. A test shop is written to the master database and a
+ * session token signed for it, so every request goes through the genuine auth,
+ * tenant-isolation and plan-feature middleware rather than around them. The
+ * shop and its database are removed again when the run finishes.
  *
- *   node test_modules.js
+ *   node test_modules.js          (needs ADMIN_BE_URL / MONGODB_URI set)
  */
 
-process.env.MONGO_URI = 'mongodb://127.0.0.1:1/offline-for-tests';
 process.env.NODE_ENV = 'test';
 
 const http = require('http');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 
 const app = require('./server.js');
-const { memoryDb } = require('./db');
+const { models, ensureMasterDB } = require('./db');
 const config = require('./config/config');
 const { featuresForPlan } = require('./modules/features');
 
@@ -41,8 +42,30 @@ const TENANT = {
   maxDevices: 25,
   createdAt: new Date().toISOString()
 };
-TENANT.features = featuresForPlan(memoryDb.plans.find((p) => p.id === 'enterprise'), 'enterprise');
-memoryDb.tenants.push(TENANT);
+/** Plans, read once from the master database at setup. */
+let PLANS = [];
+const planById = (id) => PLANS.find((p) => p.id === id) || null;
+
+/** Put the test shop in the master database and give it a clean tenant database. */
+async function setup() {
+  if (!(await ensureMasterDB())) {
+    throw new Error('MongoDB is unreachable — set ADMIN_BE_URL (or MONGODB_URI) before running the suite.');
+  }
+
+  PLANS = await models.Plan.find().lean();
+  TENANT.features = featuresForPlan(planById('enterprise'), 'enterprise');
+
+  await mongoose.connection.useDb(TENANT.dbName, { useCache: true }).db.dropDatabase().catch(() => {});
+  await models.Tenant.findOneAndUpdate({ id: TENANT.id }, TENANT, { upsert: true });
+}
+
+/** The feature map is stored on the shop, so a mid-run change has to be written. */
+const setTenantFeatures = (features) => models.Tenant.updateOne({ id: TENANT.id }, { $set: { features } });
+
+async function teardown() {
+  await models.Tenant.deleteOne({ id: TENANT.id });
+  await mongoose.connection.useDb(TENANT.dbName, { useCache: true }).db.dropDatabase().catch(() => {});
+}
 
 const TOKEN = jwt.sign(
   {
@@ -146,13 +169,13 @@ async function run() {
     'purchases', 'vendors', 'accounts', 'expenses', 'reports', 'exports', 'cashFlow'];
 
   for (const plan of ['trial', 'starter', 'monthly', 'pro', 'yearly', 'enterprise', 'no-such-plan']) {
-    const map = featuresForPlan(memoryDb.plans.find((p) => p.id === plan), plan);
+    const map = featuresForPlan(planById(plan), plan);
     const missing = CORE_MODULES.filter((k) => !map[k]);
     check(`Plan "${plan}" keeps every core module`, missing.length === 0, missing.length ? `hidden: ${missing.join(', ')}` : 'all present');
   }
 
   // Downgrade the shop mid-flight and confirm the gate bites only on add-ons.
-  TENANT.features = featuresForPlan({ features: ['billing', 'products', 'inventory', 'reports'] }, 'starter');
+  await setTenantFeatures(featuresForPlan({ features: ['billing', 'products', 'inventory', 'reports'] }, 'starter'));
 
   const blocked = await request('GET', '/tables');
   check('A tier-sold add-on outside the plan is blocked', blocked.status === 403, `status ${blocked.status}`);
@@ -173,7 +196,7 @@ async function run() {
     check(`${label} stays reachable on the lowest tier`, res.status === 200, `status ${res.status}`);
   }
 
-  TENANT.features = featuresForPlan(memoryDb.plans.find((p) => p.id === 'enterprise'), 'enterprise');
+  await setTenantFeatures(featuresForPlan(planById('enterprise'), 'enterprise'));
 
   section('Module 4 — products, barcodes, multiple units');
 
@@ -476,14 +499,20 @@ async function run() {
   return failed;
 }
 
-const server = app.listen(PORT, async () => {
+(async () => {
   let code = 1;
+  let server;
   try {
+    await setup();
+    server = app.listen(PORT);
+    await new Promise((resolve) => server.once('listening', resolve));
     code = await run();
   } catch (err) {
     console.error('\n💥 Test run crashed:', err);
   } finally {
-    server.close();
+    await teardown().catch(() => {});
+    if (server) server.close();
+    await mongoose.disconnect().catch(() => {});
     process.exit(code ? 1 : 0);
   }
-});
+})();

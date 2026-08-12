@@ -366,19 +366,28 @@ function genericStore() {
 }
 
 /**
- * Per-process cache of tenant working sets, keyed by the tenant's database
- * name. This is only a cache: `tenantDb.hydrateTenantStore` refills it from the
- * tenant's own MongoDB database before each request, and
- * `tenantDb.persistTenantStore` writes it back afterwards.
+ * A blank working set for one request.
+ *
+ * Deliberately NOT cached per tenant. `tenantDb.hydrateTenantStore` fills it
+ * from the tenant's own MongoDB database at the start of every request and
+ * `tenantDb.persistTenantStore` writes the changes back before the response —
+ * so MongoDB, not this object, is the state of the shop. Keeping one object per
+ * tenant in process memory would let a read be answered from whatever the last
+ * request on this instance happened to leave behind, which is exactly the
+ * behaviour that made results differ between instances.
  */
-const tenantDatabases = {};
+function newTenantStore() {
+  return genericStore();
+}
 
+/**
+ * Retained for callers outside a request (scripts, migrations) that ask for a
+ * store by database name. It is a fresh object every time, so it must be
+ * hydrated before use.
+ */
 function getTenantStore(dbName) {
   if (!dbName) throw new Error('getTenantStore requires a tenant database name.');
-  if (!tenantDatabases[dbName]) {
-    tenantDatabases[dbName] = genericStore();
-  }
-  return tenantDatabases[dbName];
+  return newTenantStore();
 }
 
 module.exports = {
@@ -390,11 +399,11 @@ module.exports = {
   DEFAULT_UNITS,
   DEFAULT_CUSTOMER_GROUPS,
   getTenantStore,
+  newTenantStore,
   logStockMovement,
   emptyStore,
   genericStore,
   defaultSettings,
   defaultWarehouses,
-  defaultPriceSheets,
-  tenantDatabases
+  defaultPriceSheets
 };

@@ -13,9 +13,9 @@
 
 const jwt = require('jsonwebtoken');
 const config = require('../config/config');
-const { getTenantStore } = require('../store');
+const { newTenantStore } = require('../store');
 const { hydrateTenantStore, persistTenantStore } = require('../tenantDb');
-const { memoryDb, getIsMongoConnected } = require('../db');
+const { findTenant, ensureMasterDB } = require('../db');
 
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -37,27 +37,6 @@ const SESSION_ENDED_CODES = [
 ];
 
 const deny = (res, status, code, message) => res.status(status).json({ success: false, code, message });
-
-/** Look the tenant up in the master database, falling back to the cached list. */
-async function findTenant({ tenantId, email, dbName }) {
-  if (getIsMongoConnected()) {
-    try {
-      const TenantModel = require('../models/Tenant.model');
-      const query = tenantId ? { tenantId } : email ? { email: String(email).toLowerCase() } : { dbName };
-      const found = await TenantModel.findOne(query).lean();
-      if (found) return found;
-    } catch (err) {
-      console.error('[Tenant lookup error]:', err.message);
-    }
-  }
-
-  return (memoryDb.tenants || []).find(
-    (t) =>
-      (tenantId && t.tenantId === tenantId) ||
-      (email && String(t.email).toLowerCase() === String(email).toLowerCase()) ||
-      (dbName && t.dbName === dbName)
-  );
-}
 
 const resolveTenantDb = async (req, res, next) => {
   const authHeader = req.headers['authorization'] || '';
@@ -83,7 +62,24 @@ const resolveTenantDb = async (req, res, next) => {
     return deny(res, 403, 'TENANT_MISMATCH', 'This session is not permitted to access that shop database.');
   }
 
-  const tenant = await findTenant({ tenantId: claims.tenantId, email: claims.email, dbName: claims.dbName });
+  // The shop is re-read from the master database on every request, in the order
+  // the token identifies it. Nothing is answered from process memory, so a
+  // deactivation or a plan change takes effect on the very next call.
+  if (!(await ensureMasterDB())) {
+    return deny(res, 503, 'MASTER_DB_UNAVAILABLE', 'The master database is unreachable. Please try again in a moment.');
+  }
+
+  let tenant;
+  try {
+    tenant =
+      (await findTenant({ tenantId: claims.tenantId })) ||
+      (await findTenant({ email: claims.email })) ||
+      (await findTenant({ dbName: claims.dbName }));
+  } catch (err) {
+    console.error('[Tenant lookup error]:', err.message);
+    return deny(res, 503, 'MASTER_DB_UNAVAILABLE', 'Could not verify your shop account. Please try again in a moment.');
+  }
+
   if (!tenant) {
     return deny(res, 404, 'TENANT_NOT_FOUND', 'This shop account no longer exists. Contact your administrator.');
   }
@@ -100,7 +96,10 @@ const resolveTenantDb = async (req, res, next) => {
   req.user = claims;
 
   try {
-    req.tenantStore = await hydrateTenantStore(tenant.dbName, getTenantStore(tenant.dbName));
+    // A fresh working set per request, filled from the tenant's own database.
+    // Reusing one across requests would mean a value written by an earlier
+    // request on this instance could be read back without touching MongoDB.
+    req.tenantStore = await hydrateTenantStore(tenant.dbName, newTenantStore(), tenant);
   } catch (err) {
     console.error(`[Tenant hydrate error ${tenant.dbName}]:`, err.message);
     return deny(res, 503, 'TENANT_DB_UNAVAILABLE', 'Could not reach your shop database. Please try again in a moment.');
@@ -109,22 +108,34 @@ const resolveTenantDb = async (req, res, next) => {
   // Persist before the response goes out, so a read that follows a write always
   // sees the write — including when the next request lands on another instance.
   if (MUTATING.has(req.method)) {
-    let flushed = false;
-    const flush = () => {
-      if (flushed) return Promise.resolve();
-      flushed = true;
-      return persistTenantStore(tenant.dbName, req.tenantStore);
-    };
+    let flush;
+    const runFlush = () => persistTenantStore(tenant.dbName, req.tenantStore);
+    const flushOnce = () => (flush = flush || runFlush());
 
     const sendJson = res.json.bind(res);
     res.json = (body) => {
-      flush().finally(() => sendJson(body));
+      flushOnce().then((result) => {
+        // A write that never reached MongoDB must not be reported as saved —
+        // the client would show a record that does not exist anywhere.
+        if (result && result.persisted === false) {
+          console.error(`[Tenant persist failed ${tenant.dbName}]:`, result.reason);
+          if (!res.headersSent) {
+            res.status(503);
+            return sendJson({
+              success: false,
+              code: 'TENANT_WRITE_FAILED',
+              message: 'Your shop database could not be updated. Please retry — nothing was saved.'
+            });
+          }
+        }
+        return sendJson(body);
+      });
       return res;
     };
 
     // Safety net for any handler that answers without res.json().
     res.on('finish', () => {
-      flush();
+      flushOnce();
     });
   }
 

@@ -1,28 +1,17 @@
 /**
- * Upload Router Definitions with Multer Storage
+ * Product image upload.
+ *
+ * The file is held in memory only long enough to be written into the calling
+ * shop's own MongoDB database. Nothing is written to the server's filesystem:
+ * on a serverless host that disk is read-only in places and thrown away between
+ * invocations, so an uploaded image would disappear minutes after it was saved.
  */
 
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const uploadController = require('../controllers/upload.controller');
 
 const router = express.Router();
-
-const uploadDir = path.join(__dirname, '../uploads/products');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || '.png';
-    const cleanName = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9]/g, '_');
-    cb(null, `prod_${Date.now()}_${cleanName}${ext}`);
-  }
-});
 
 const fileFilter = (req, file, cb) => {
   const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
@@ -34,7 +23,7 @@ const fileFilter = (req, file, cb) => {
 };
 
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   fileFilter,
   limits: { fileSize: 5 * 1024 * 1024 }
 });

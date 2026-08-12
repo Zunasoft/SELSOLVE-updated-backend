@@ -17,7 +17,7 @@ const mongoose = require('mongoose');
 
 const app = require('../server');
 const config = require('../config/config');
-const { memoryDb, getIsMongoConnected } = require('../db');
+const { getIsMongoConnected } = require('../db');
 const { FEATURE_KEYS, CORE_FEATURES, PLAN_DEFAULTS, resolveTenantFeatures } = require('../modules/features');
 
 const SHOP = { name: 'E2E Plan Features', email: 'e2e-plans@example.test' };
@@ -91,7 +91,6 @@ async function cleanup() {
     await mongoose.connection.useDb(existing.dbName, { useCache: true }).db.dropDatabase().catch(() => {});
   }
   await TenantModel.deleteOne({ email: SHOP.email });
-  memoryDb.tenants = memoryDb.tenants.filter((t) => t.email !== SHOP.email);
 }
 
 (async () => {
@@ -181,8 +180,8 @@ async function cleanup() {
   ok('Legacy map widened to the tier', FEATURE_KEYS.every((k) => widened[k] === true),
     `still off: ${FEATURE_KEYS.filter((k) => !widened[k]).join(', ')}`);
 
-  const idx = memoryDb.tenants.findIndex((t) => t.id === tenant.id);
-  if (idx >= 0) memoryDb.tenants[idx] = legacy;
+  // No cache to refresh — the request below re-reads the shop from the master
+  // database, so the legacy map written above is what the gate sees.
   const legacyFeat = await request('GET', '/api/pos/features', { token: tokenFor(legacy) });
   const legacyEnabled = legacyFeat.body?.data?.enabled || [];
   ok('/features agrees with the route gate', legacyEnabled.length === FEATURE_KEYS.length,

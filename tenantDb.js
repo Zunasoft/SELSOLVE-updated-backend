@@ -115,17 +115,30 @@ function mergeSettings(base, stored) {
   return out;
 }
 
-async function doHydrate(dbName, store) {
-  const db = getTenantDb(dbName);
-  if (!db) return store;
-
+/** Read the tenant's singleton values as one plain object. */
+async function readMeta(db) {
   const metaDocs = await db.collection(META_COLLECTION).find({}).toArray();
   const meta = {};
   for (const doc of metaDocs) meta[doc._key] = doc.value;
+  return meta;
+}
 
-  // A database that has never been provisioned keeps whatever defaults the
-  // in-memory store was seeded with; the first flush then writes them down.
-  const provisioned = Boolean(meta[PROVISION_KEY]);
+async function doHydrate(dbName, store, tenant) {
+  const db = getTenantDb(dbName);
+  if (!db) {
+    // Never fall back to the blank defaults: an empty catalogue served as if it
+    // were the shop's data reads as "everything was deleted".
+    throw new Error(`No MongoDB connection for tenant database "${dbName}".`);
+  }
+
+  let meta = await readMeta(db);
+
+  // A database that has never been provisioned is built now, on first use, so
+  // every later read has real rows to return.
+  if (!meta[PROVISION_KEY]) {
+    await doProvision(dbName, tenant);
+    meta = await readMeta(db);
+  }
 
   const loaded = await Promise.all(
     ARRAY_COLLECTIONS.map(async (spec) => {
@@ -136,12 +149,10 @@ async function doHydrate(dbName, store) {
     })
   );
 
+  // Every collection comes from the database, including the empty ones — what
+  // the shop's database holds is the whole of the shop's state.
   for (const { spec, rows } of loaded) {
-    if (rows.length > 0 || provisioned) {
-      store[spec.key] = rows.map(stripId);
-    } else if (!Array.isArray(store[spec.key])) {
-      store[spec.key] = [];
-    }
+    store[spec.key] = rows.map(stripId);
   }
 
   if (meta.settings !== undefined) store.settings = mergeSettings(defaultSettings(), meta.settings);
@@ -186,8 +197,11 @@ async function adoptLegacyData(db, store, meta) {
 /**
  * Load a tenant's store from its own database.
  * Queued behind any flush already running for the same tenant.
+ *
+ * `tenant` is the master-database record, used only if the shop's database has
+ * to be provisioned on the spot.
  */
-const hydrateTenantStore = (dbName, store) => enqueue(dbName, () => doHydrate(dbName, store));
+const hydrateTenantStore = (dbName, store, tenant) => enqueue(dbName, () => doHydrate(dbName, store, tenant));
 
 /* ------------------------------------------------------------------ *
  * Persist
@@ -277,54 +291,56 @@ function seedStoreForTenant(tenant = {}) {
 }
 
 /**
+ * The provisioning work itself, WITHOUT the per-tenant queue.
+ *
+ * Kept separate because `doHydrate` provisions on first use from inside that
+ * queue — going through `provisionTenantDB` there would make the queue wait on
+ * a task it is already running.
+ */
+async function doProvision(dbName, tenant = {}) {
+  const db = getTenantDb(dbName);
+  if (!db) throw new Error(`Cannot provision "${dbName}" — no MongoDB connection.`);
+
+  const marker = await db.collection(META_COLLECTION).findOne({ _key: PROVISION_KEY });
+  if (marker) return { dbName, created: false };
+
+  const store = seedStoreForTenant(tenant);
+  baselines.set(store, {});
+  await doPersist(dbName, store);
+
+  await db.collection(META_COLLECTION).updateOne(
+    { _key: PROVISION_KEY },
+    {
+      $set: {
+        _key: PROVISION_KEY,
+        value: { tenantId: tenant.tenantId || null, email: tenant.email || null, provisionedAt: new Date() }
+      }
+    },
+    { upsert: true }
+  );
+
+  await Promise.all([
+    db.collection('products').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+    db.collection('products').createIndex({ barcode: 1 }).catch(() => {}),
+    db.collection('categories').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+    db.collection('sales').createIndex({ orderId: 1 }, { unique: true }).catch(() => {}),
+    db.collection('sales').createIndex({ date: -1 }).catch(() => {}),
+    db.collection('customers').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+    db.collection('vendors').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+    db.collection(META_COLLECTION).createIndex({ _key: 1 }, { unique: true }).catch(() => {})
+  ]);
+
+  console.log(`🗄️  [Tenant DB ${dbName}] provisioned and seeded for "${tenant.name || dbName}".`);
+  return { dbName, created: true };
+}
+
+/**
  * Create and seed a tenant's isolated database.
  * Safe to call repeatedly — an already-provisioned database is left untouched.
  */
-async function provisionTenantDB(dbName, tenant = {}) {
-  if (!dbName) return null;
-
-  const db = getTenantDb(dbName);
-  if (!db) {
-    console.warn(`[Tenant DB ${dbName}] cannot provision — no MongoDB connection.`);
-    return null;
-  }
-
-  return enqueue(dbName, async () => {
-    const marker = await db.collection(META_COLLECTION).findOne({ _key: PROVISION_KEY });
-    if (marker) {
-      console.log(`🗄️  [Tenant DB ${dbName}] already provisioned.`);
-      return { dbName, created: false };
-    }
-
-    const store = seedStoreForTenant(tenant);
-    baselines.set(store, {});
-    await doPersist(dbName, store);
-
-    await db.collection(META_COLLECTION).updateOne(
-      { _key: PROVISION_KEY },
-      {
-        $set: {
-          _key: PROVISION_KEY,
-          value: { tenantId: tenant.tenantId || null, email: tenant.email || null, provisionedAt: new Date() }
-        }
-      },
-      { upsert: true }
-    );
-
-    await Promise.all([
-      db.collection('products').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
-      db.collection('products').createIndex({ barcode: 1 }).catch(() => {}),
-      db.collection('categories').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
-      db.collection('sales').createIndex({ orderId: 1 }, { unique: true }).catch(() => {}),
-      db.collection('sales').createIndex({ date: -1 }).catch(() => {}),
-      db.collection('customers').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
-      db.collection('vendors').createIndex({ id: 1 }, { unique: true }).catch(() => {}),
-      db.collection(META_COLLECTION).createIndex({ _key: 1 }, { unique: true }).catch(() => {})
-    ]);
-
-    console.log(`🗄️  [Tenant DB ${dbName}] provisioned and seeded for "${tenant.name || dbName}".`);
-    return { dbName, created: true };
-  });
+function provisionTenantDB(dbName, tenant = {}) {
+  if (!dbName) return Promise.resolve(null);
+  return enqueue(dbName, () => doProvision(dbName, tenant));
 }
 
 /** Diagnostics for the Super Admin database-health screen. */

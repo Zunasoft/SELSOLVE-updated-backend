@@ -1,49 +1,69 @@
 /**
  * Device management, subscriptions and Razorpay payments —
  * SOW Modules 1 (Device Management, Plan Management) and 14 (Payment Gateway).
+ *
+ * Every device, plan, subscription event and payment is read from and written
+ * to the master database. Previously these lived in a process-local array,
+ * which meant a device registered on one instance was invisible to the next and
+ * gone entirely after a restart.
  */
 
 const express = require('express');
 const crypto = require('crypto');
-const { memoryDb, addAuditLog } = require('../db');
+const { models, addAuditLog, findTenant } = require('../db');
+
+// One catalogue for the whole platform — see modules/features.js.
+const {
+  FEATURE_KEYS,
+  FEATURE_CATALOG,
+  featuresForPlan,
+  resolveTenantFeatures,
+  PLAN_DEFAULTS,
+  upgradePlanFeatures
+} = require('./features');
 
 const router = express.Router();
 
 const actorOf = (req) => req.admin?.email || 'SuperAdmin';
 const iso = () => new Date().toISOString();
 const dayKey = (d) => new Date(d).toISOString().slice(0, 10);
+const daysUntil = (date) => Math.ceil((new Date(date) - new Date()) / 86400000);
+
+/** Wrap an async handler so a rejected promise reaches the error middleware. */
+const handler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 /* ------------------------------------------------------------------ *
- * Collections
+ * Plans
  * ------------------------------------------------------------------ */
 
-function ensureCollections() {
-  if (!Array.isArray(memoryDb.devices)) memoryDb.devices = [];
-  if (!Array.isArray(memoryDb.subscriptions)) memoryDb.subscriptions = [];
-  if (!Array.isArray(memoryDb.payments)) memoryDb.payments = [];
-
-  memoryDb.plans.forEach((plan) => {
-    // Widen any pre-catalogue feature list before it is read as a denial.
-    upgradePlanFeatures(plan);
-    if (!plan.licenseModel) plan.licenseModel = plan.id === 'enterprise' ? 'PER_ORGANISATION' : 'PER_DEVICE';
-    if (!plan.billingCycle) plan.billingCycle = 'Monthly';
-    if (plan.trialDays === undefined) plan.trialDays = plan.id === 'starter' ? 14 : 0;
-    if (plan.isActive === undefined) plan.isActive = true;
-  });
+/**
+ * Fill in the licensing fields a plan written before this module existed does
+ * not carry, and widen any pre-catalogue feature list. Applied on read, so an
+ * old plan document never reads as "no trial, no licence model".
+ */
+function withPlanDefaults(plan) {
+  if (!plan) return null;
+  const filled = upgradePlanFeatures({ ...plan });
+  if (!filled.licenseModel) filled.licenseModel = filled.id === 'enterprise' ? 'PER_ORGANISATION' : 'PER_DEVICE';
+  if (!filled.billingCycle) filled.billingCycle = 'Monthly';
+  if (filled.trialDays === undefined) filled.trialDays = filled.id === 'starter' ? 14 : 0;
+  if (filled.isActive === undefined) filled.isActive = true;
+  return filled;
 }
 
-router.use((req, res, next) => {
-  ensureCollections();
-  next();
-});
+const allPlans = async () => (await models.Plan.find().sort({ price: 1 }).lean()).map(withPlanDefaults);
 
-const findTenant = (id) => memoryDb.tenants.find((t) => t.id === id || t.tenantId === id);
+const planById = async (planId) =>
+  planId ? withPlanDefaults(await models.Plan.findOne({ id: planId }).lean()) : null;
 
-const planOf = (tenant) => memoryDb.plans.find((p) => p.id === tenant.plan) || null;
+const planOf = (tenant, plans) => plans.find((p) => p.id === tenant.plan) || null;
 
-function licenceUsage(tenant) {
-  const plan = planOf(tenant);
-  const devices = memoryDb.devices.filter((d) => d.tenantId === tenant.tenantId);
+/* ------------------------------------------------------------------ *
+ * Licence & subscription state
+ * ------------------------------------------------------------------ */
+
+/** Seat usage for one shop, given its plan and its registered devices. */
+function licenceUsage(tenant, plan, devices = []) {
   const active = devices.filter((d) => d.status === 'active');
   const model = plan?.licenseModel || 'PER_DEVICE';
 
@@ -51,19 +71,26 @@ function licenceUsage(tenant) {
     model,
     seats: model === 'PER_ORGANISATION' ? null : tenant.maxDevices,
     used: active.length,
-    available: model === 'PER_ORGANISATION' ? null : Math.max(0, tenant.maxDevices - active.length),
+    available: model === 'PER_ORGANISATION' ? null : Math.max(0, (tenant.maxDevices || 0) - active.length),
     registered: devices.length,
     blocked: devices.filter((d) => d.status === 'blocked').length
   };
 }
 
-const daysUntil = (date) => Math.ceil((new Date(date) - new Date()) / 86400000);
+/** Seat usage read fresh from the database for a single shop. */
+async function licenceUsageFor(tenant) {
+  const [plan, devices] = await Promise.all([
+    planById(tenant.plan),
+    models.Device.find({ tenantId: tenant.tenantId }).lean()
+  ]);
+  return licenceUsage(tenant, plan, devices);
+}
 
-function subscriptionState(tenant) {
+function subscriptionState(tenant, plan) {
   const remaining = daysUntil(tenant.expiryDate);
   return {
     plan: tenant.plan,
-    planName: planOf(tenant)?.name || tenant.plan,
+    planName: plan?.name || tenant.plan,
     expiryDate: tenant.expiryDate,
     daysRemaining: remaining,
     status:
@@ -78,376 +105,458 @@ function subscriptionState(tenant) {
   };
 }
 
+const subscriptionStateFor = async (tenant) => subscriptionState(tenant, await planById(tenant.plan));
+
 /* ------------------------------------------------------------------ *
  * Device management
  * ------------------------------------------------------------------ */
 
-router.get('/devices', (req, res) => {
-  const { tenantId, status } = req.query;
+router.get(
+  '/devices',
+  handler(async (req, res) => {
+    const { tenantId, status } = req.query;
 
-  let rows = memoryDb.devices;
-  if (tenantId) rows = rows.filter((d) => d.tenantId === tenantId);
-  if (status && status !== 'ALL') rows = rows.filter((d) => d.status === status);
+    const [allDevices, tenants, plans] = await Promise.all([
+      models.Device.find().sort({ registeredAt: -1 }).lean(),
+      models.Tenant.find().lean(),
+      allPlans()
+    ]);
 
-  res.json({
-    success: true,
-    data: {
-      devices: rows.map((d) => {
-        const tenant = memoryDb.tenants.find((t) => t.tenantId === d.tenantId);
-        return { ...d, shopName: tenant ? tenant.name : '—' };
-      }),
-      summary: {
-        total: memoryDb.devices.length,
-        active: memoryDb.devices.filter((d) => d.status === 'active').length,
-        blocked: memoryDb.devices.filter((d) => d.status === 'blocked').length,
-        online: memoryDb.devices.filter((d) => d.lastSeenAt && daysUntil(d.lastSeenAt) > -1).length
-      },
-      licences: memoryDb.tenants.map((t) => ({
-        tenantId: t.tenantId,
-        shopName: t.name,
-        plan: t.plan,
-        ...licenceUsage(t)
-      }))
+    let rows = allDevices;
+    if (tenantId) rows = rows.filter((d) => d.tenantId === tenantId);
+    if (status && status !== 'ALL') rows = rows.filter((d) => d.status === status);
+
+    const byTenant = new Map();
+    for (const device of allDevices) {
+      if (!byTenant.has(device.tenantId)) byTenant.set(device.tenantId, []);
+      byTenant.get(device.tenantId).push(device);
     }
-  });
-});
 
-router.post('/devices', (req, res) => {
-  const { tenantId, deviceName, deviceId, model, androidVersion, appVersion } = req.body;
-
-  const tenant = findTenant(tenantId);
-  if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
-  if (!deviceName) return res.status(400).json({ success: false, message: 'Device name is required.' });
-
-  const hardwareId = deviceId || `dev-${crypto.randomBytes(4).toString('hex')}`;
-
-  const duplicate = memoryDb.devices.find(
-    (d) => d.deviceId === hardwareId && d.tenantId === tenant.tenantId
-  );
-  if (duplicate) {
-    return res.status(400).json({ success: false, message: 'This device is already registered to the shop.' });
-  }
-
-  const usage = licenceUsage(tenant);
-  if (usage.model === 'PER_DEVICE' && usage.available <= 0) {
-    return res.status(400).json({
-      success: false,
-      message: `Licence limit reached — the ${planOf(tenant)?.name || tenant.plan} plan allows ${tenant.maxDevices} device(s). Upgrade the plan or block an existing device.`
+    res.json({
+      success: true,
+      data: {
+        devices: rows.map((d) => ({
+          ...d,
+          shopName: tenants.find((t) => t.tenantId === d.tenantId)?.name || '—'
+        })),
+        summary: {
+          total: allDevices.length,
+          active: allDevices.filter((d) => d.status === 'active').length,
+          blocked: allDevices.filter((d) => d.status === 'blocked').length,
+          online: allDevices.filter((d) => d.lastSeenAt && daysUntil(d.lastSeenAt) > -1).length
+        },
+        licences: tenants.map((t) => ({
+          tenantId: t.tenantId,
+          shopName: t.name,
+          plan: t.plan,
+          ...licenceUsage(t, planOf(t, plans), byTenant.get(t.tenantId) || [])
+        }))
+      }
     });
-  }
+  })
+);
 
-  const device = {
-    id: `dv_${Date.now()}`,
-    tenantId: tenant.tenantId,
-    deviceId: hardwareId,
-    deviceName,
-    model: model || 'Android POS Terminal',
-    androidVersion: androidVersion || '—',
-    appVersion: appVersion || '—',
-    licenseKey: `${tenant.tenantId.slice(0, 4).toUpperCase()}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
-    licenseModel: usage.model,
-    status: 'active',
-    registeredAt: iso(),
-    lastSeenAt: iso()
-  };
+router.post(
+  '/devices',
+  handler(async (req, res) => {
+    const { tenantId, deviceName, deviceId, model, androidVersion, appVersion } = req.body;
 
-  memoryDb.devices.push(device);
-  addAuditLog('DEVICE_REGISTERED', actorOf(req), `Mapped device "${deviceName}" to shop "${tenant.name}"`);
+    const tenant = await findTenant({ id: tenantId });
+    if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
+    if (!deviceName) return res.status(400).json({ success: false, message: 'Device name is required.' });
 
-  res.status(201).json({
-    success: true,
-    message: `Device "${deviceName}" registered to ${tenant.name}.`,
-    data: device
-  });
-});
+    const hardwareId = deviceId || `dev-${crypto.randomBytes(4).toString('hex')}`;
 
-router.patch('/devices/:id/status', (req, res) => {
-  const device = memoryDb.devices.find((d) => d.id === req.params.id);
-  if (!device) return res.status(404).json({ success: false, message: 'Device not found.' });
+    const duplicate = await models.Device.findOne({ tenantId: tenant.tenantId, deviceId: hardwareId }).lean();
+    if (duplicate) {
+      return res.status(400).json({ success: false, message: 'This device is already registered to the shop.' });
+    }
 
-  const { status } = req.body;
-  if (!['active', 'blocked'].includes(status)) {
-    return res.status(400).json({ success: false, message: 'Status must be "active" or "blocked".' });
-  }
+    const plan = await planById(tenant.plan);
+    const devices = await models.Device.find({ tenantId: tenant.tenantId }).lean();
+    const usage = licenceUsage(tenant, plan, devices);
 
-  if (status === 'active' && device.status === 'blocked') {
-    const tenant = memoryDb.tenants.find((t) => t.tenantId === device.tenantId);
-    const usage = licenceUsage(tenant);
     if (usage.model === 'PER_DEVICE' && usage.available <= 0) {
       return res.status(400).json({
         success: false,
-        message: 'No licence seats free — block another device or upgrade the plan first.'
+        message: `Licence limit reached — the ${plan?.name || tenant.plan} plan allows ${tenant.maxDevices} device(s). Upgrade the plan or block an existing device.`
       });
     }
-  }
 
-  device.status = status;
-  addAuditLog('DEVICE_STATUS_CHANGE', actorOf(req), `Device "${device.deviceName}" set to ${status.toUpperCase()}`);
+    const device = {
+      id: `dv_${Date.now()}`,
+      tenantId: tenant.tenantId,
+      deviceId: hardwareId,
+      deviceName,
+      model: model || 'Android POS Terminal',
+      androidVersion: androidVersion || '—',
+      appVersion: appVersion || '—',
+      licenseKey: `${tenant.tenantId.slice(0, 4).toUpperCase()}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
+      licenseModel: usage.model,
+      status: 'active',
+      registeredAt: iso(),
+      lastSeenAt: iso()
+    };
 
-  res.json({ success: true, message: `Device ${status === 'active' ? 'activated' : 'blocked'}.`, data: device });
-});
+    await models.Device.create(device);
+    await addAuditLog('DEVICE_REGISTERED', actorOf(req), `Mapped device "${deviceName}" to shop "${tenant.name}"`);
 
-router.delete('/devices/:id', (req, res) => {
-  const device = memoryDb.devices.find((d) => d.id === req.params.id);
-  if (!device) return res.status(404).json({ success: false, message: 'Device not found.' });
-
-  memoryDb.devices = memoryDb.devices.filter((d) => d.id !== req.params.id);
-  addAuditLog('DEVICE_REMOVED', actorOf(req), `Removed device "${device.deviceName}" and released its licence seat`);
-
-  res.json({ success: true, message: 'Device removed and its licence seat released.' });
-});
-
-router.post('/devices/validate', (req, res) => {
-  const { deviceId, licenseKey } = req.body;
-  const device = memoryDb.devices.find((d) => d.deviceId === deviceId || d.licenseKey === licenseKey);
-
-  if (!device) return res.status(404).json({ success: false, message: 'Device is not registered.' });
-  if (device.status !== 'active') {
-    return res.status(403).json({ success: false, message: 'This device has been blocked by the administrator.' });
-  }
-
-  const tenant = memoryDb.tenants.find((t) => t.tenantId === device.tenantId);
-  const state = subscriptionState(tenant);
-
-  if (state.status === 'EXPIRED' || state.status === 'SUSPENDED') {
-    return res.status(403).json({
-      success: false,
-      message: state.status === 'EXPIRED' ? 'The shop subscription has expired.' : 'The shop account is suspended.',
-      data: { subscription: state }
+    res.status(201).json({
+      success: true,
+      message: `Device "${deviceName}" registered to ${tenant.name}.`,
+      data: device
     });
-  }
+  })
+);
 
-  device.lastSeenAt = iso();
+router.patch(
+  '/devices/:id/status',
+  handler(async (req, res) => {
+    const device = await models.Device.findOne({ id: req.params.id }).lean();
+    if (!device) return res.status(404).json({ success: false, message: 'Device not found.' });
 
-  res.json({
-    success: true,
-    message: 'Licence valid.',
-    data: {
-      device,
-      tenant: { tenantId: tenant.tenantId, name: tenant.name, dbName: tenant.dbName, plan: tenant.plan },
-      // Resolved so a device sees the same module set the POS routes allow.
-      features: resolveTenantFeatures(tenant),
-      subscription: state
+    const { status } = req.body;
+    if (!['active', 'blocked'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be "active" or "blocked".' });
     }
-  });
-});
+
+    if (status === 'active' && device.status === 'blocked') {
+      const tenant = await models.Tenant.findOne({ tenantId: device.tenantId }).lean();
+      if (tenant) {
+        const usage = await licenceUsageFor(tenant);
+        if (usage.model === 'PER_DEVICE' && usage.available <= 0) {
+          return res.status(400).json({
+            success: false,
+            message: 'No licence seats free — block another device or upgrade the plan first.'
+          });
+        }
+      }
+    }
+
+    const updated = await models.Device.findOneAndUpdate(
+      { id: device.id },
+      { $set: { status } },
+      { new: true, lean: true }
+    );
+
+    await addAuditLog(
+      'DEVICE_STATUS_CHANGE',
+      actorOf(req),
+      `Device "${device.deviceName}" set to ${status.toUpperCase()}`
+    );
+
+    res.json({ success: true, message: `Device ${status === 'active' ? 'activated' : 'blocked'}.`, data: updated });
+  })
+);
+
+router.delete(
+  '/devices/:id',
+  handler(async (req, res) => {
+    const device = await models.Device.findOneAndDelete({ id: req.params.id }).lean();
+    if (!device) return res.status(404).json({ success: false, message: 'Device not found.' });
+
+    await addAuditLog(
+      'DEVICE_REMOVED',
+      actorOf(req),
+      `Removed device "${device.deviceName}" and released its licence seat`
+    );
+
+    res.json({ success: true, message: 'Device removed and its licence seat released.' });
+  })
+);
+
+router.post(
+  '/devices/validate',
+  handler(async (req, res) => {
+    const { deviceId, licenseKey } = req.body;
+
+    const device = await models.Device.findOne({
+      $or: [{ deviceId: deviceId || '__none__' }, { licenseKey: licenseKey || '__none__' }]
+    }).lean();
+
+    if (!device) return res.status(404).json({ success: false, message: 'Device is not registered.' });
+    if (device.status !== 'active') {
+      return res.status(403).json({ success: false, message: 'This device has been blocked by the administrator.' });
+    }
+
+    const tenant = await models.Tenant.findOne({ tenantId: device.tenantId }).lean();
+    if (!tenant) return res.status(404).json({ success: false, message: 'The shop for this device no longer exists.' });
+
+    const plan = await planById(tenant.plan);
+    const state = subscriptionState(tenant, plan);
+
+    if (state.status === 'EXPIRED' || state.status === 'SUSPENDED') {
+      return res.status(403).json({
+        success: false,
+        message: state.status === 'EXPIRED' ? 'The shop subscription has expired.' : 'The shop account is suspended.',
+        data: { subscription: state }
+      });
+    }
+
+    const lastSeenAt = iso();
+    await models.Device.updateOne({ id: device.id }, { $set: { lastSeenAt } });
+
+    res.json({
+      success: true,
+      message: 'Licence valid.',
+      data: {
+        device: { ...device, lastSeenAt },
+        tenant: { tenantId: tenant.tenantId, name: tenant.name, dbName: tenant.dbName, plan: tenant.plan },
+        // Resolved so a device sees the same module set the POS routes allow.
+        features: resolveTenantFeatures(tenant),
+        subscription: state
+      }
+    });
+  })
+);
 
 /* ------------------------------------------------------------------ *
  * Plan management
  * ------------------------------------------------------------------ */
 
-// One catalogue for the whole platform — see modules/features.js.
-const {
-  FEATURE_KEYS,
-  FEATURE_CATALOG,
-  featuresForPlan,
-  resolveTenantFeatures,
-  PLAN_DEFAULTS,
-  upgradePlanFeatures
-} = require('./features');
+router.get(
+  '/plans/catalog',
+  handler(async (req, res) => {
+    const [plans, tenants] = await Promise.all([allPlans(), models.Tenant.find({}, { plan: 1, status: 1 }).lean()]);
 
-router.get('/plans/catalog', (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      plans: memoryDb.plans.map((plan) => ({
-        ...plan,
-        subscriberCount: memoryDb.tenants.filter((t) => t.plan === plan.id).length,
-        mrr:
-          memoryDb.tenants.filter((t) => t.plan === plan.id && t.status === 'active').length *
-          (plan.billingCycle === 'Yearly' ? Math.round(plan.price / 12) : plan.price)
-      })),
-      featureKeys: FEATURE_KEYS,
-      featureCatalog: FEATURE_CATALOG
-    }
-  });
-});
-
-router.post('/plans', (req, res) => {
-  const { id, name, price, billingCycle, maxDevices, features, licenseModel, trialDays } = req.body;
-  if (!name) return res.status(400).json({ success: false, message: 'Plan name is required.' });
-
-  const planId = (id || name).toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (memoryDb.plans.some((p) => p.id === planId)) {
-    return res.status(400).json({ success: false, message: 'A plan with that identifier already exists.' });
-  }
-
-  const plan = {
-    id: planId,
-    name,
-    price: Number(price) || 0,
-    billingCycle: billingCycle || 'Monthly',
-    maxDevices: Number(maxDevices) || 1,
-    features: Array.isArray(features) ? features : [...(PLAN_DEFAULTS[planId] || PLAN_DEFAULTS.starter)],
-    licenseModel: licenseModel || 'PER_DEVICE',
-    trialDays: Number(trialDays) || 0,
-    isActive: true,
-    createdAt: iso()
-  };
-
-  memoryDb.plans.push(plan);
-  addAuditLog('PLAN_CREATED', actorOf(req), `Created subscription tier "${name}" at ₹${plan.price}/${plan.billingCycle}`);
-
-  res.status(201).json({ success: true, message: `Plan "${name}" created.`, data: plan });
-});
-
-router.delete('/plans/:id', (req, res) => {
-  const plan = memoryDb.plans.find((p) => p.id === req.params.id);
-  if (!plan) return res.status(404).json({ success: false, message: 'Plan not found.' });
-
-  const subscribers = memoryDb.tenants.filter((t) => t.plan === plan.id);
-  if (subscribers.length) {
-    return res.status(400).json({
-      success: false,
-      message: `${subscribers.length} shop(s) are on this plan — move them before deleting it.`
+    res.json({
+      success: true,
+      data: {
+        plans: plans.map((plan) => ({
+          ...plan,
+          subscriberCount: tenants.filter((t) => t.plan === plan.id).length,
+          mrr:
+            tenants.filter((t) => t.plan === plan.id && t.status === 'active').length *
+            (plan.billingCycle === 'Yearly' ? Math.round(plan.price / 12) : plan.price)
+        })),
+        featureKeys: FEATURE_KEYS,
+        featureCatalog: FEATURE_CATALOG
+      }
     });
-  }
+  })
+);
 
-  memoryDb.plans = memoryDb.plans.filter((p) => p.id !== plan.id);
-  addAuditLog('PLAN_DELETED', actorOf(req), `Deleted subscription tier "${plan.name}"`);
+router.post(
+  '/plans',
+  handler(async (req, res) => {
+    const { id, name, price, billingCycle, maxDevices, features, licenseModel, trialDays } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Plan name is required.' });
 
-  res.json({ success: true, message: `Plan "${plan.name}" deleted.` });
-});
+    const planId = (id || name).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const clash = await models.Plan.findOne({ id: planId }).lean();
+    if (clash) {
+      return res.status(400).json({ success: false, message: 'A plan with that identifier already exists.' });
+    }
+
+    const plan = {
+      id: planId,
+      name,
+      price: Number(price) || 0,
+      billingCycle: billingCycle || 'Monthly',
+      maxDevices: Number(maxDevices) || 1,
+      features: Array.isArray(features) ? features : [...(PLAN_DEFAULTS[planId] || PLAN_DEFAULTS.starter)],
+      licenseModel: licenseModel || 'PER_DEVICE',
+      trialDays: Number(trialDays) || 0,
+      isActive: true,
+      featureSchema: 2,
+      createdAt: iso()
+    };
+
+    await models.Plan.create(plan);
+    await addAuditLog(
+      'PLAN_CREATED',
+      actorOf(req),
+      `Created subscription tier "${name}" at ₹${plan.price}/${plan.billingCycle}`
+    );
+
+    res.status(201).json({ success: true, message: `Plan "${name}" created.`, data: plan });
+  })
+);
+
+router.delete(
+  '/plans/:id',
+  handler(async (req, res) => {
+    const plan = await models.Plan.findOne({ id: req.params.id }).lean();
+    if (!plan) return res.status(404).json({ success: false, message: 'Plan not found.' });
+
+    const subscribers = await models.Tenant.countDocuments({ plan: plan.id });
+    if (subscribers) {
+      return res.status(400).json({
+        success: false,
+        message: `${subscribers} shop(s) are on this plan — move them before deleting it.`
+      });
+    }
+
+    await models.Plan.deleteOne({ id: plan.id });
+    await addAuditLog('PLAN_DELETED', actorOf(req), `Deleted subscription tier "${plan.name}"`);
+
+    res.json({ success: true, message: `Plan "${plan.name}" deleted.` });
+  })
+);
 
 /* ------------------------------------------------------------------ *
  * Subscriptions
  * ------------------------------------------------------------------ */
 
-router.get('/subscriptions', (req, res) => {
-  const rows = memoryDb.tenants.map((tenant) => {
-    const state = subscriptionState(tenant);
-    const plan = planOf(tenant);
-    const paid = memoryDb.payments
-      .filter((p) => p.tenantId === tenant.tenantId && p.status === 'SUCCESS')
-      .reduce((s, p) => s + p.amount, 0);
+router.get(
+  '/subscriptions',
+  handler(async (req, res) => {
+    const [tenants, plans, devices, payments, history] = await Promise.all([
+      models.Tenant.find().lean(),
+      allPlans(),
+      models.Device.find({}, { tenantId: 1, status: 1 }).lean(),
+      models.Payment.find({ status: 'SUCCESS' }, { tenantId: 1, amount: 1 }).lean(),
+      models.Subscription.find().sort({ createdAt: -1 }).limit(100).lean()
+    ]);
 
-    return {
-      tenantId: tenant.tenantId,
-      shopName: tenant.name,
-      email: tenant.email,
-      phone: tenant.phone,
-      ...state,
-      price: plan?.price || 0,
-      billingCycle: plan?.billingCycle || 'Monthly',
-      maxDevices: tenant.maxDevices,
-      devicesUsed: licenceUsage(tenant).used,
-      lifetimeValue: paid
-    };
-  });
+    const rows = tenants.map((tenant) => {
+      const plan = planOf(tenant, plans);
+      const state = subscriptionState(tenant, plan);
+      const shopDevices = devices.filter((d) => d.tenantId === tenant.tenantId);
+      const paid = payments
+        .filter((p) => p.tenantId === tenant.tenantId)
+        .reduce((sum, p) => sum + Number(p.amount || 0), 0);
 
-  res.json({
-    success: true,
-    data: {
-      subscriptions: rows,
-      summary: {
-        active: rows.filter((r) => r.status === 'ACTIVE').length,
-        expiringSoon: rows.filter((r) => r.status === 'EXPIRING_SOON').length,
-        expired: rows.filter((r) => r.status === 'EXPIRED').length,
-        suspended: rows.filter((r) => r.status === 'SUSPENDED').length,
-        trials: rows.filter((r) => r.isTrial).length,
-        mrr: rows
-          .filter((r) => r.status === 'ACTIVE' || r.status === 'EXPIRING_SOON')
-          .reduce((s, r) => s + (r.billingCycle === 'Yearly' ? Math.round(r.price / 12) : r.price), 0)
-      },
-      history: memoryDb.subscriptions.slice(0, 100)
-    }
-  });
-});
+      return {
+        tenantId: tenant.tenantId,
+        shopName: tenant.name,
+        email: tenant.email,
+        phone: tenant.phone,
+        ...state,
+        price: plan?.price || 0,
+        billingCycle: plan?.billingCycle || 'Monthly',
+        maxDevices: tenant.maxDevices,
+        devicesUsed: licenceUsage(tenant, plan, shopDevices).used,
+        lifetimeValue: paid
+      };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        subscriptions: rows,
+        summary: {
+          active: rows.filter((r) => r.status === 'ACTIVE').length,
+          expiringSoon: rows.filter((r) => r.status === 'EXPIRING_SOON').length,
+          expired: rows.filter((r) => r.status === 'EXPIRED').length,
+          suspended: rows.filter((r) => r.status === 'SUSPENDED').length,
+          trials: rows.filter((r) => r.isTrial).length,
+          mrr: rows
+            .filter((r) => r.status === 'ACTIVE' || r.status === 'EXPIRING_SOON')
+            .reduce((s, r) => s + (r.billingCycle === 'Yearly' ? Math.round(r.price / 12) : r.price), 0)
+        },
+        history
+      }
+    });
+  })
+);
 
 const CYCLE_DAYS = { Monthly: 30, Quarterly: 90, Yearly: 365 };
 
-router.post('/subscriptions/:tenantId/renew', (req, res) => {
-  const tenant = findTenant(req.params.tenantId);
-  if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
+router.post(
+  '/subscriptions/:tenantId/renew',
+  handler(async (req, res) => {
+    const tenant = await findTenant({ id: req.params.tenantId });
+    if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
 
-  const { planId, cycle, months, paymentId, notes } = req.body;
+    const { planId, cycle, months, paymentId, notes } = req.body;
 
-  if (planId) {
-    const plan = memoryDb.plans.find((p) => p.id === planId);
-    if (!plan) return res.status(400).json({ success: false, message: 'Unknown plan.' });
-    tenant.plan = plan.id;
-    tenant.maxDevices = plan.maxDevices;
-    tenant.features = featuresForPlan(plan, plan.id);
-  }
+    const update = {};
+    let plan = await planById(tenant.plan);
 
-  const plan = planOf(tenant);
-  const days = months ? Number(months) * 30 : CYCLE_DAYS[cycle || plan?.billingCycle || 'Monthly'] || 30;
+    if (planId && planId !== tenant.plan) {
+      const nextPlan = await planById(planId);
+      if (!nextPlan) return res.status(400).json({ success: false, message: 'Unknown plan.' });
+      plan = nextPlan;
+      update.plan = nextPlan.id;
+      update.maxDevices = nextPlan.maxDevices;
+      update.features = featuresForPlan(nextPlan, nextPlan.id);
+    }
 
-  const from = daysUntil(tenant.expiryDate) > 0 ? new Date(tenant.expiryDate) : new Date();
-  const expiry = new Date(from.getTime() + days * 86400000);
+    const days = months ? Number(months) * 30 : CYCLE_DAYS[cycle || plan?.billingCycle || 'Monthly'] || 30;
+    const from = daysUntil(tenant.expiryDate) > 0 ? new Date(tenant.expiryDate) : new Date();
+    const previousExpiry = tenant.expiryDate;
 
-  const previousExpiry = tenant.expiryDate;
-  tenant.expiryDate = dayKey(expiry);
-  tenant.status = 'active';
-  tenant.isTrial = false;
+    update.expiryDate = dayKey(new Date(from.getTime() + days * 86400000));
+    update.status = 'active';
+    update.isTrial = false;
 
-  const record = {
-    id: `sub_${Date.now()}`,
-    tenantId: tenant.tenantId,
-    shopName: tenant.name,
-    action: 'RENEWAL',
-    plan: tenant.plan,
-    planName: plan?.name || tenant.plan,
-    amount: plan?.price || 0,
-    days,
-    previousExpiry,
-    newExpiry: tenant.expiryDate,
-    paymentId: paymentId || null,
-    notes: notes || '',
-    performedBy: actorOf(req),
-    createdAt: iso()
-  };
+    const updated = await models.Tenant.findOneAndUpdate({ id: tenant.id }, { $set: update }, { new: true, lean: true });
 
-  memoryDb.subscriptions.unshift(record);
-  addAuditLog(
-    'SUBSCRIPTION_RENEWED',
-    actorOf(req),
-    `Renewed "${tenant.name}" on ${plan?.name || tenant.plan} until ${tenant.expiryDate}`
-  );
+    const record = {
+      id: `sub_${Date.now()}`,
+      tenantId: updated.tenantId,
+      shopName: updated.name,
+      action: 'RENEWAL',
+      plan: updated.plan,
+      planName: plan?.name || updated.plan,
+      amount: plan?.price || 0,
+      days,
+      previousExpiry,
+      newExpiry: updated.expiryDate,
+      paymentId: paymentId || null,
+      notes: notes || '',
+      performedBy: actorOf(req),
+      createdAt: iso()
+    };
 
-  res.json({
-    success: true,
-    message: `${tenant.name} renewed until ${tenant.expiryDate}.`,
-    data: { tenant, subscription: subscriptionState(tenant), record }
-  });
-});
+    await models.Subscription.create(record);
+    await addAuditLog(
+      'SUBSCRIPTION_RENEWED',
+      actorOf(req),
+      `Renewed "${updated.name}" on ${plan?.name || updated.plan} until ${updated.expiryDate}`
+    );
 
-router.post('/subscriptions/:tenantId/trial', (req, res) => {
-  const tenant = findTenant(req.params.tenantId);
-  if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
+    res.json({
+      success: true,
+      message: `${updated.name} renewed until ${updated.expiryDate}.`,
+      data: { tenant: updated, subscription: subscriptionState(updated, plan), record }
+    });
+  })
+);
 
-  const days = Number(req.body.days) || planOf(tenant)?.trialDays || 14;
-  const expiry = new Date(Date.now() + days * 86400000);
-  const previousExpiry = tenant.expiryDate;
+router.post(
+  '/subscriptions/:tenantId/trial',
+  handler(async (req, res) => {
+    const tenant = await findTenant({ id: req.params.tenantId });
+    if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
 
-  tenant.expiryDate = dayKey(expiry);
-  tenant.status = 'active';
-  tenant.isTrial = true;
+    const plan = await planById(tenant.plan);
+    const days = Number(req.body.days) || plan?.trialDays || 14;
+    const previousExpiry = tenant.expiryDate;
+    const expiryDate = dayKey(new Date(Date.now() + days * 86400000));
 
-  memoryDb.subscriptions.unshift({
-    id: `sub_${Date.now()}`,
-    tenantId: tenant.tenantId,
-    shopName: tenant.name,
-    action: 'TRIAL',
-    plan: tenant.plan,
-    planName: planOf(tenant)?.name || tenant.plan,
-    amount: 0,
-    days,
-    previousExpiry,
-    newExpiry: tenant.expiryDate,
-    notes: `${days}-day trial granted`,
-    performedBy: actorOf(req),
-    createdAt: iso()
-  });
+    const updated = await models.Tenant.findOneAndUpdate(
+      { id: tenant.id },
+      { $set: { expiryDate, status: 'active', isTrial: true } },
+      { new: true, lean: true }
+    );
 
-  addAuditLog('TRIAL_GRANTED', actorOf(req), `Granted a ${days}-day trial to "${tenant.name}"`);
+    await models.Subscription.create({
+      id: `sub_${Date.now()}`,
+      tenantId: updated.tenantId,
+      shopName: updated.name,
+      action: 'TRIAL',
+      plan: updated.plan,
+      planName: plan?.name || updated.plan,
+      amount: 0,
+      days,
+      previousExpiry,
+      newExpiry: updated.expiryDate,
+      notes: `${days}-day trial granted`,
+      performedBy: actorOf(req),
+      createdAt: iso()
+    });
 
-  res.json({
-    success: true,
-    message: `${days}-day trial granted to ${tenant.name}.`,
-    data: { tenant, subscription: subscriptionState(tenant) }
-  });
-});
+    await addAuditLog('TRIAL_GRANTED', actorOf(req), `Granted a ${days}-day trial to "${updated.name}"`);
+
+    res.json({
+      success: true,
+      message: `${days}-day trial granted to ${updated.name}.`,
+      data: { tenant: updated, subscription: subscriptionState(updated, plan) }
+    });
+  })
+);
 
 /* ------------------------------------------------------------------ *
  * Razorpay — SaaS subscription & renewal payments
@@ -469,221 +578,297 @@ router.get('/payments/config', (req, res) => {
   });
 });
 
-router.get('/payments', (req, res) => {
-  const { tenantId, status } = req.query;
+router.get(
+  '/payments',
+  handler(async (req, res) => {
+    const { tenantId, status } = req.query;
 
-  let rows = memoryDb.payments;
-  if (tenantId) rows = rows.filter((p) => p.tenantId === tenantId);
-  if (status && status !== 'ALL') rows = rows.filter((p) => p.status === status);
+    const all = await models.Payment.find().sort({ createdAt: -1 }).limit(500).lean();
 
-  const successful = memoryDb.payments.filter((p) => p.status === 'SUCCESS');
+    let rows = all;
+    if (tenantId) rows = rows.filter((p) => p.tenantId === tenantId);
+    if (status && status !== 'ALL') rows = rows.filter((p) => p.status === status);
 
-  res.json({
-    success: true,
-    data: {
-      payments: rows,
-      summary: {
-        collected: successful.reduce((s, p) => s + p.amount, 0),
-        count: successful.length,
-        failed: memoryDb.payments.filter((p) => p.status === 'FAILED').length,
-        pending: memoryDb.payments.filter((p) => p.status === 'CREATED').length,
-        thisMonth: successful
-          .filter((p) => dayKey(p.paidAt || p.createdAt).slice(0, 7) === dayKey(new Date()).slice(0, 7))
-          .reduce((s, p) => s + p.amount, 0)
+    const successful = all.filter((p) => p.status === 'SUCCESS');
+    const thisMonth = dayKey(new Date()).slice(0, 7);
+
+    res.json({
+      success: true,
+      data: {
+        payments: rows,
+        summary: {
+          collected: successful.reduce((s, p) => s + Number(p.amount || 0), 0),
+          count: successful.length,
+          failed: all.filter((p) => p.status === 'FAILED').length,
+          pending: all.filter((p) => p.status === 'CREATED').length,
+          thisMonth: successful
+            .filter((p) => dayKey(p.paidAt || p.createdAt).slice(0, 7) === thisMonth)
+            .reduce((s, p) => s + Number(p.amount || 0), 0)
+        }
       }
-    }
-  });
-});
+    });
+  })
+);
 
-router.post('/payments/order', (req, res) => {
-  const { tenantId, planId, purpose, amount: overrideAmount } = req.body;
+router.post(
+  '/payments/order',
+  handler(async (req, res) => {
+    const { tenantId, planId, purpose, amount: overrideAmount } = req.body;
 
-  const tenant = findTenant(tenantId);
-  if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
+    const tenant = await findTenant({ id: tenantId });
+    if (!tenant) return res.status(404).json({ success: false, message: 'Shop not found.' });
 
-  const plan = memoryDb.plans.find((p) => p.id === (planId || tenant.plan));
-  if (!plan) return res.status(400).json({ success: false, message: 'Unknown plan.' });
+    const plan = await planById(planId || tenant.plan);
+    if (!plan) return res.status(400).json({ success: false, message: 'Unknown plan.' });
 
-  const amount = Number(overrideAmount) || plan.price;
-  if (amount <= 0) return res.status(400).json({ success: false, message: 'Payment amount must be positive.' });
+    const amount = Number(overrideAmount) || plan.price;
+    if (amount <= 0) return res.status(400).json({ success: false, message: 'Payment amount must be positive.' });
 
-  const receipt = `SEL-${tenant.tenantId.slice(0, 6)}-${Date.now().toString().slice(-8)}`;
+    const payment = {
+      id: `pay_${Date.now()}`,
+      orderId: `order_${crypto.randomBytes(8).toString('hex')}`,
+      tenantId: tenant.tenantId,
+      shopName: tenant.name,
+      planId: plan.id,
+      planName: plan.name,
+      purpose: purpose || 'RENEWAL',
+      amount,
+      amountInPaise: Math.round(amount * 100),
+      currency: 'INR',
+      receipt: `SEL-${tenant.tenantId.slice(0, 6)}-${Date.now().toString().slice(-8)}`,
+      status: 'CREATED',
+      gateway: isLiveGateway ? 'RAZORPAY' : 'RAZORPAY_SIMULATION',
+      razorpayPaymentId: null,
+      failureReason: null,
+      createdAt: iso(),
+      paidAt: null
+    };
 
-  const payment = {
-    id: `pay_${Date.now()}`,
-    orderId: `order_${crypto.randomBytes(8).toString('hex')}`,
-    tenantId: tenant.tenantId,
-    shopName: tenant.name,
-    planId: plan.id,
-    planName: plan.name,
-    purpose: purpose || 'RENEWAL',
-    amount,
-    amountInPaise: Math.round(amount * 100),
-    currency: 'INR',
-    receipt,
-    status: 'CREATED',
-    gateway: isLiveGateway ? 'RAZORPAY' : 'RAZORPAY_SIMULATION',
-    razorpayPaymentId: null,
-    failureReason: null,
-    createdAt: iso(),
-    paidAt: null
-  };
+    await models.Payment.create(payment);
+    await addAuditLog(
+      'PAYMENT_ORDER_CREATED',
+      actorOf(req),
+      `Created ₹${amount} ${payment.purpose} order for "${tenant.name}"`
+    );
 
-  memoryDb.payments.unshift(payment);
-  addAuditLog('PAYMENT_ORDER_CREATED', actorOf(req), `Created ₹${amount} ${payment.purpose} order for "${tenant.name}"`);
-
-  res.status(201).json({
-    success: true,
-    message: `Payment order created for ₹${amount}.`,
-    data: {
-      ...payment,
-      checkout: {
-        key: RAZORPAY_KEY_ID,
-        order_id: payment.orderId,
-        amount: payment.amountInPaise,
-        currency: 'INR',
-        name: 'Selsolve by Zunasoft',
-        description: `${plan.name} — ${payment.purpose.toLowerCase()}`,
-        prefill: { email: tenant.email, contact: tenant.phone },
-        notes: { tenantId: tenant.tenantId, planId: plan.id }
+    res.status(201).json({
+      success: true,
+      message: `Payment order created for ₹${amount}.`,
+      data: {
+        ...payment,
+        checkout: {
+          key: RAZORPAY_KEY_ID,
+          order_id: payment.orderId,
+          amount: payment.amountInPaise,
+          currency: 'INR',
+          name: 'Selsolve by Zunasoft',
+          description: `${plan.name} — ${payment.purpose.toLowerCase()}`,
+          prefill: { email: tenant.email, contact: tenant.phone },
+          notes: { tenantId: tenant.tenantId, planId: plan.id }
+        }
       }
-    }
-  });
-});
+    });
+  })
+);
 
 const expectedSignature = (orderId, paymentId) =>
   crypto.createHmac('sha256', RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
 
-function capturePayment(payment, { paymentId, signature, actor }) {
-  payment.status = 'SUCCESS';
-  payment.razorpayPaymentId = paymentId || `sim_${crypto.randomBytes(6).toString('hex')}`;
-  payment.signature = signature || null;
-  payment.paidAt = iso();
+/**
+ * Mark a payment captured and extend the shop's subscription.
+ *
+ * The payment row is only flipped to SUCCESS if it is still CREATED, so two
+ * verify callbacks for the same order cannot extend the subscription twice.
+ */
+async function capturePayment(payment, { paymentId, signature, actor }) {
+  const paidAt = iso();
+  const claimed = await models.Payment.findOneAndUpdate(
+    { id: payment.id, status: 'CREATED' },
+    {
+      $set: {
+        status: 'SUCCESS',
+        razorpayPaymentId: paymentId || `sim_${crypto.randomBytes(6).toString('hex')}`,
+        signature: signature || null,
+        paidAt
+      }
+    },
+    { new: true, lean: true }
+  );
 
-  const tenant = memoryDb.tenants.find((t) => t.tenantId === payment.tenantId);
-  const plan = memoryDb.plans.find((p) => p.id === payment.planId);
+  if (!claimed) return null;
+
+  const [tenant, plan] = await Promise.all([
+    models.Tenant.findOne({ tenantId: claimed.tenantId }).lean(),
+    planById(claimed.planId)
+  ]);
+
+  let updatedTenant = tenant;
 
   if (tenant && plan) {
     const days = CYCLE_DAYS[plan.billingCycle] || 30;
     const from = daysUntil(tenant.expiryDate) > 0 ? new Date(tenant.expiryDate) : new Date();
     const previousExpiry = tenant.expiryDate;
+    const expiryDate = dayKey(new Date(from.getTime() + days * 86400000));
 
-    tenant.plan = plan.id;
-    tenant.maxDevices = plan.maxDevices;
-    tenant.features = featuresForPlan(plan, plan.id);
-    tenant.expiryDate = dayKey(new Date(from.getTime() + days * 86400000));
-    tenant.status = 'active';
-    tenant.isTrial = false;
+    updatedTenant = await models.Tenant.findOneAndUpdate(
+      { id: tenant.id },
+      {
+        $set: {
+          plan: plan.id,
+          maxDevices: plan.maxDevices,
+          features: featuresForPlan(plan, plan.id),
+          expiryDate,
+          status: 'active',
+          isTrial: false
+        }
+      },
+      { new: true, lean: true }
+    );
 
-    memoryDb.subscriptions.unshift({
+    await models.Subscription.create({
       id: `sub_${Date.now()}`,
       tenantId: tenant.tenantId,
       shopName: tenant.name,
-      action: payment.purpose,
+      action: claimed.purpose,
       plan: plan.id,
       planName: plan.name,
-      amount: payment.amount,
+      amount: claimed.amount,
       days,
       previousExpiry,
-      newExpiry: tenant.expiryDate,
-      paymentId: payment.id,
-      notes: `Paid online via ${payment.gateway}`,
+      newExpiry: expiryDate,
+      paymentId: claimed.id,
+      notes: `Paid online via ${claimed.gateway}`,
       performedBy: 'Razorpay',
       createdAt: iso()
     });
   }
 
-  addAuditLog(
+  await addAuditLog(
     'PAYMENT_SUCCESS',
     actor,
-    `Captured ₹${payment.amount} from "${payment.shopName}" — extended to ${tenant?.expiryDate}`
+    `Captured ₹${claimed.amount} from "${claimed.shopName}" — extended to ${updatedTenant?.expiryDate}`
   );
 
   return {
-    message: `Payment of ₹${payment.amount} captured. ${tenant?.name} is active until ${tenant?.expiryDate}.`,
-    data: { payment, tenant, subscription: tenant ? subscriptionState(tenant) : null }
+    message: `Payment of ₹${claimed.amount} captured. ${updatedTenant?.name} is active until ${updatedTenant?.expiryDate}.`,
+    data: {
+      payment: claimed,
+      tenant: updatedTenant,
+      subscription: updatedTenant ? subscriptionState(updatedTenant, plan) : null
+    }
   };
 }
 
-function failPayment(payment, { reason, code, actor }) {
-  payment.status = 'FAILED';
-  payment.failureReason = reason || 'Payment was cancelled or declined';
-  payment.failureCode = code || null;
-  payment.failedAt = iso();
+async function failPayment(payment, { reason, code, actor }) {
+  const updated = await models.Payment.findOneAndUpdate(
+    { id: payment.id },
+    {
+      $set: {
+        status: 'FAILED',
+        failureReason: reason || 'Payment was cancelled or declined',
+        failureCode: code || null,
+        failedAt: iso()
+      }
+    },
+    { new: true, lean: true }
+  );
 
-  addAuditLog(
+  await addAuditLog(
     'PAYMENT_FAILED',
     actor,
-    `Payment of ₹${payment.amount} for "${payment.shopName}" failed — ${payment.failureReason}`,
+    `Payment of ₹${updated.amount} for "${updated.shopName}" failed — ${updated.failureReason}`,
     'FAILED'
   );
 
-  return { message: 'Payment failure recorded.', data: payment };
+  return { message: 'Payment failure recorded.', data: updated };
 }
 
-router.post('/payments/verify', (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+router.post(
+  '/payments/verify',
+  handler(async (req, res) => {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
 
-  const payment = memoryDb.payments.find((p) => p.orderId === razorpay_order_id);
-  if (!payment) return res.status(404).json({ success: false, message: 'Payment order not found.' });
-  if (payment.status === 'SUCCESS') {
-    return res.status(400).json({ success: false, message: 'This payment has already been captured.' });
-  }
+    const payment = await models.Payment.findOne({ orderId: razorpay_order_id }).lean();
+    if (!payment) return res.status(404).json({ success: false, message: 'Payment order not found.' });
+    if (payment.status === 'SUCCESS') {
+      return res.status(400).json({ success: false, message: 'This payment has already been captured.' });
+    }
 
-  if (isLiveGateway && expectedSignature(razorpay_order_id, razorpay_payment_id) !== razorpay_signature) {
-    failPayment(payment, { reason: 'Signature verification failed', code: 'SIGNATURE_MISMATCH', actor: actorOf(req) });
-    return res.status(400).json({ success: false, message: 'Payment signature verification failed.' });
-  }
+    if (isLiveGateway && expectedSignature(razorpay_order_id, razorpay_payment_id) !== razorpay_signature) {
+      await failPayment(payment, {
+        reason: 'Signature verification failed',
+        code: 'SIGNATURE_MISMATCH',
+        actor: actorOf(req)
+      });
+      return res.status(400).json({ success: false, message: 'Payment signature verification failed.' });
+    }
 
-  const result = capturePayment(payment, {
-    paymentId: razorpay_payment_id,
-    signature: razorpay_signature,
-    actor: actorOf(req)
-  });
+    const result = await capturePayment(payment, {
+      paymentId: razorpay_payment_id,
+      signature: razorpay_signature,
+      actor: actorOf(req)
+    });
 
-  res.json({ success: true, ...result });
-});
+    if (!result) {
+      return res.status(400).json({ success: false, message: 'This payment has already been captured.' });
+    }
 
-router.post('/payments/failure', (req, res) => {
-  const payment = memoryDb.payments.find((p) => p.orderId === req.body.razorpay_order_id);
-  if (!payment) return res.status(404).json({ success: false, message: 'Payment order not found.' });
+    res.json({ success: true, ...result });
+  })
+);
 
-  const result = failPayment(payment, {
-    reason: req.body.reason,
-    code: req.body.code,
-    actor: actorOf(req)
-  });
+router.post(
+  '/payments/failure',
+  handler(async (req, res) => {
+    const payment = await models.Payment.findOne({ orderId: req.body.razorpay_order_id }).lean();
+    if (!payment) return res.status(404).json({ success: false, message: 'Payment order not found.' });
 
-  res.json({ success: true, ...result });
-});
+    const result = await failPayment(payment, {
+      reason: req.body.reason,
+      code: req.body.code,
+      actor: actorOf(req)
+    });
 
-router.post('/payments/:id/simulate', (req, res) => {
-  const payment = memoryDb.payments.find((p) => p.id === req.params.id);
-  if (!payment) return res.status(404).json({ success: false, message: 'Payment not found.' });
-  if (isLiveGateway) {
-    return res.status(400).json({ success: false, message: 'Simulation is disabled while live keys are configured.' });
-  }
-  if (payment.status === 'SUCCESS') {
-    return res.status(400).json({ success: false, message: 'This payment has already been captured.' });
-  }
+    res.json({ success: true, ...result });
+  })
+);
 
-  const result =
-    req.body.outcome === 'FAILED'
-      ? failPayment(payment, {
-          reason: 'Simulated failure — card declined',
-          code: 'BAD_REQUEST_ERROR',
-          actor: actorOf(req)
-        })
-      : capturePayment(payment, {
-          paymentId: `pay_sim_${crypto.randomBytes(6).toString('hex')}`,
-          signature: null,
-          actor: actorOf(req)
-        });
+router.post(
+  '/payments/:id/simulate',
+  handler(async (req, res) => {
+    const payment = await models.Payment.findOne({ id: req.params.id }).lean();
+    if (!payment) return res.status(404).json({ success: false, message: 'Payment not found.' });
+    if (isLiveGateway) {
+      return res.status(400).json({ success: false, message: 'Simulation is disabled while live keys are configured.' });
+    }
+    if (payment.status === 'SUCCESS') {
+      return res.status(400).json({ success: false, message: 'This payment has already been captured.' });
+    }
 
-  res.json({ success: true, ...result });
-});
+    const result =
+      req.body.outcome === 'FAILED'
+        ? await failPayment(payment, {
+            reason: 'Simulated failure — card declined',
+            code: 'BAD_REQUEST_ERROR',
+            actor: actorOf(req)
+          })
+        : await capturePayment(payment, {
+            paymentId: `pay_sim_${crypto.randomBytes(6).toString('hex')}`,
+            signature: null,
+            actor: actorOf(req)
+          });
+
+    if (!result) {
+      return res.status(400).json({ success: false, message: 'This payment has already been captured.' });
+    }
+
+    res.json({ success: true, ...result });
+  })
+);
 
 module.exports = router;
 module.exports.subscriptionState = subscriptionState;
+module.exports.subscriptionStateFor = subscriptionStateFor;
 module.exports.licenceUsage = licenceUsage;
+module.exports.licenceUsageFor = licenceUsageFor;
 module.exports.FEATURE_KEYS = FEATURE_KEYS;
