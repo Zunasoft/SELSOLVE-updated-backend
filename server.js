@@ -10,7 +10,7 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const config = require('./config/config');
-const { connectMasterDB, memoryDb, addAuditLog, SEED_SUPER_ADMIN_EMAIL, getIsMongoConnected } = require('./db');
+const { connectMasterDB, ensureMasterDB, memoryDb, addAuditLog, SEED_SUPER_ADMIN_EMAIL, getIsMongoConnected, getMongoDiagnostics } = require('./db');
 const { authRouter, requireSuperAdmin } = require('./auth');
 const { sendOtpEmail, verifyMailer, isSmtpConfigured } = require('./mailer');
 const licensingModule = require('./modules/licensing');
@@ -97,17 +97,29 @@ app.get('/api/admin/stats', (req, res) => {
 
 // Get Tenants List
 app.get('/api/admin/tenants', async (req, res) => {
-  if (getIsMongoConnected()) {
-    try {
-      const TenantModel = require('./models/Tenant.model');
-      const dbTenants = await TenantModel.find().lean();
-      if (dbTenants && dbTenants.length > 0) {
-        memoryDb.tenants = dbTenants;
-      }
-    } catch (err) {
-      console.error('[Tenant DB Fetch Error]:', err.message);
-    }
+  await ensureMasterDB();
+
+  if (!getIsMongoConnected()) {
+    // Returning an empty list here would render as "no shops registered" in the
+    // console — indistinguishable from a genuinely empty platform. Fail loudly.
+    return res.status(503).json({
+      success: false,
+      code: 'MASTER_DB_UNAVAILABLE',
+      message: 'Master database is unreachable — the tenant directory cannot be loaded.',
+      diagnostics: getMongoDiagnostics()
+    });
   }
+
+  try {
+    const TenantModel = require('./models/Tenant.model');
+    const dbTenants = await TenantModel.find().lean();
+    if (dbTenants && dbTenants.length > 0) {
+      memoryDb.tenants = dbTenants;
+    }
+  } catch (err) {
+    console.error('[Tenant DB Fetch Error]:', err.message);
+  }
+
   res.json({
     success: true,
     data: memoryDb.tenants
@@ -675,11 +687,13 @@ app.use('/api/pos', enforcePlanFeatures);
 app.use('/api/pos', apiRoutes);
 
 // Consolidated Health Check Endpoint
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+  await ensureMasterDB();
   res.json({
     success: true,
     service: 'Selsolve Master Unified Backend API',
     mongoMasterConnected: getIsMongoConnected(),
+    mongoDiagnostics: getMongoDiagnostics(),
     smtpConfigured: isSmtpConfigured,
     tenantsCount: memoryDb.tenants.length,
     activeTenants: Object.keys(tenantDatabases),
