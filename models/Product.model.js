@@ -31,21 +31,6 @@ const productSchema = new mongoose.Schema(
     purchasePrice: { type: Number, default: 0 },
     wholesalePrice: { type: Number, default: 0 },
     specialPrice: { type: Number, default: 0 },
-    stock: { type: Number, default: 0 },
-    minStock: { type: Number, default: 5 },
-    warehouses: { type: mongoose.Schema.Types.Mixed, default: {} },
-    imageUrl: { type: String, default: '' },
-    requiresWeight: { type: Boolean, default: false },
-    taxRate: { type: Number, default: 0 },
-    isComposite: { type: Boolean, default: false },
-    comboItems: [{ productId: String, qty: Number }],
-    recipeItems: [{ productId: String, name: String, qty: Number, unit: String }],
-    pricingHistory: [
-      {
-        date: { type: Date, default: Date.now },
-        oldPrice: Number,
-        newPrice: Number,
-        oldPurchasePrice: Number,
         newPurchasePrice: Number,
         updatedBy: String
       }

@@ -128,49 +128,6 @@ function deductStock(store, items, orderId, user) {
 
     if (product.isComposite && recipe) {
       recipe.ingredients.forEach((ing) => {
-        const raw = store.products.find((p) => p.id === ing.productId);
-        if (!raw) return;
-        const consumed = (Number(ing.qty) * soldQty) / (recipe.yieldQty || 1);
-        raw.stock = r2(raw.stock - consumed);
-        if (raw.stock < 0 && !store.settings.pos.allowNegativeStock) raw.stock = 0;
-
-        if (raw.warehouses) {
-          raw.warehouses['wh_shop'] = (raw.warehouses['wh_shop'] || 0) - consumed;
-          if (raw.warehouses['wh_shop'] < 0 && !store.settings.pos.allowNegativeStock) {
-            raw.warehouses['wh_shop'] = 0;
-          }
-          raw.stock = Object.values(raw.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-        }
-
-        logStockMovement(store, {
-          product: raw,
-          type: 'RECIPE',
-          qtyChange: -consumed,
-          reason: `Consumed for ${product.name}`,
-          refId: orderId,
-          user
-        });
-      });
-      return;
-    }
-
-    const qty = soldQty;
-    if (qty > product.stock && !store.settings.pos.allowNegativeStock) {
-      shortages.push({ name: product.name, available: product.stock, requested: qty });
-    }
-    product.stock = store.settings.pos.allowNegativeStock
-      ? r2(product.stock - qty)
-      : Math.max(0, r2(product.stock - qty));
-
-    if (product.warehouses) {
-      product.warehouses['wh_shop'] = (product.warehouses['wh_shop'] || 0) - qty;
-      if (product.warehouses['wh_shop'] < 0 && !store.settings.pos.allowNegativeStock) {
-        product.warehouses['wh_shop'] = 0;
-      }
-      product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-    }
-
-    logStockMovement(store, {
       product,
       type: 'SALE',
       qtyChange: -qty,

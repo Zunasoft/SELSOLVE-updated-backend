@@ -473,17 +473,6 @@ router.post('/purchases', (req, res) => {
   };
 
   // Receive stock and refresh costing.
-  lines.forEach((line) => {
-    const product = store.products.find((p) => p.id === line.productId || p.name === line.name);
-    if (!product) return;
-    const qty = Number(line.qty);
-    product.stock = r2(product.stock + qty);
-    if (Number(line.rate)) product.purchasePrice = Number(line.rate);
-    logStockMovement(store, {
-      product,
-      type: 'PURCHASE',
-      qtyChange: qty,
-      reason: `Received on ${purchase.invoiceNo}`,
       refId: purchase.id,
       user: actor(req)
     });

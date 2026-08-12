@@ -33,7 +33,7 @@ const ARRAY_COLLECTIONS = [
   { key: 'priceSheets', collection: 'pricesheets', idField: 'id' },
   { key: 'users', collection: 'users', idField: 'id' },
   { key: 'tables', collection: 'tables', idField: 'id' },
-  { key: 'recipes', collection: 'recipes', idField: 'id' },
+  { key: 'recipes', collection: 'recipes', idField: 'productId' },
   { key: 'heldBills', collection: 'heldbills', idField: 'id' },
   { key: 'purchases', collection: 'purchases', idField: 'id' },
   { key: 'accounts', collection: 'accounts', idField: 'id' },
