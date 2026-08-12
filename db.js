@@ -245,11 +245,39 @@ const seedMasterDB = async () => {
   }
 };
 
+/**
+ * Resolve the master connection string and record WHICH variable supplied it.
+ * On a serverless host a missing variable silently becomes the localhost
+ * default, which then fails with a confusing ECONNREFUSED — so the source name
+ * is worth surfacing alongside the error.
+ */
+const resolveMongoUri = () => {
+  const candidates = ['ADMIN_BE_URL', 'MONGO_URI', 'MONGODB_URI'];
+  const source = candidates.find((key) => process.env[key]);
+  return {
+    uri: source ? process.env[source] : 'mongodb://localhost:27017/selsolve',
+    source: source || 'default (localhost fallback — no env var set)'
+  };
+};
+
+/** Strip credentials so a URI can be logged or returned over HTTP. */
+const maskMongoUri = (uri) => String(uri).replace(/\/\/([^:]+):[^@]+@/, '//$1:***@');
+
+// Diagnostics for /api/health — why the master DB is unavailable, if it is.
+let mongoDiagnostics = { uriSource: null, uri: null, lastError: null, lastAttemptAt: null, attempts: 0 };
+let connectInFlight = null;
+
 const connectMasterDB = async () => {
-  const mongoUri = process.env.ADMIN_BE_URL || process.env.MONGO_URI || process.env.MONGODB_URI || 'mongodb://localhost:27017/selsolve';
+  const { uri: mongoUri, source } = resolveMongoUri();
+  mongoDiagnostics.uriSource = source;
+  mongoDiagnostics.uri = maskMongoUri(mongoUri);
+  mongoDiagnostics.lastAttemptAt = new Date().toISOString();
+  mongoDiagnostics.attempts += 1;
+
   try {
     const conn = await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 10000 });
     isMongoConnected = true;
+    mongoDiagnostics.lastError = null;
     console.log(`🍃 [MongoDB Connected] Master DB Host: ${conn.connection.host} | DB Name: ${conn.connection.name}`);
 
     // Seed data & sync store
@@ -258,17 +286,39 @@ const connectMasterDB = async () => {
     return conn;
   } catch (err) {
     isMongoConnected = false;
+    mongoDiagnostics.lastError = err.message;
     console.log(`⚠️ [MongoDB Connection Fallback] ${err.message}`);
+    console.log(`   URI source: ${source} → ${maskMongoUri(mongoUri)}`);
     console.log(`   Operating with dynamic in-memory store fallback.`);
     return null;
   }
 };
 
+/**
+ * Connect on demand, retrying if an earlier attempt failed.
+ *
+ * A serverless instance that loses the boot-time connect would otherwise serve
+ * the empty in-memory store for the rest of its life — every read looks like
+ * "no data" instead of "no database". Concurrent callers share one attempt.
+ */
+const ensureMasterDB = async () => {
+  if (isMongoConnected && mongoose.connection.readyState === 1) return true;
+  if (!connectInFlight) {
+    connectInFlight = connectMasterDB().finally(() => {
+      connectInFlight = null;
+    });
+  }
+  await connectInFlight;
+  return isMongoConnected;
+};
+
 module.exports = {
   connectMasterDB,
+  ensureMasterDB,
   seedMasterDB,
   memoryDb,
   addAuditLog,
   SEED_SUPER_ADMIN_EMAIL,
-  getIsMongoConnected: () => isMongoConnected
+  getIsMongoConnected: () => isMongoConnected,
+  getMongoDiagnostics: () => ({ ...mongoDiagnostics, readyState: mongoose.connection.readyState })
 };
