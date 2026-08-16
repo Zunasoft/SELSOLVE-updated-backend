@@ -11,6 +11,7 @@ const express = require('express');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { models, addAuditLog, ensureMasterDB, requireMasterDB, getOtpExpiryMinutes } = require('./db');
+const { permissionsFor } = require('./modules/users');
 const { sendOtpEmail, isSmtpConfigured } = require('./mailer');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_zunasoft_2026';
@@ -43,13 +44,21 @@ const findSuperAdmin = async (email) => {
   return models.SuperAdmin.findOne({ email: address }).lean();
 };
 
+/**
+ * What the console is told about the signed-in operator.
+ *
+ * `permissions` is derived from the stored role on every call rather than
+ * carried in the token, so a role change takes effect on the operator's next
+ * request instead of when their session finally expires.
+ */
 const publicAdmin = (admin) => ({
   id: admin.id,
   name: admin.name,
   email: admin.email,
   role: admin.role,
   status: admin.status,
-  lastLoginAt: admin.lastLoginAt
+  lastLoginAt: admin.lastLoginAt,
+  permissions: permissionsFor(admin)
 });
 
 // --- JWT GUARD ---
@@ -73,8 +82,11 @@ const requireSuperAdmin = async (req, res, next) => {
     });
   }
 
-  if (payload.role !== 'SuperAdmin' || payload.scope !== 'admin-console') {
-    return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Super Admin privileges required.' });
+  // Only the scope is trusted from the token. The role is deliberately NOT
+  // read from it: a token minted before a demotion still carries the old role,
+  // so the authoritative value is the one on the account below.
+  if (payload.scope !== 'admin-console') {
+    return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Console privileges required.' });
   }
 
   // The account is re-checked against the database on every call, so revoking
@@ -95,8 +107,12 @@ const requireSuperAdmin = async (req, res, next) => {
     return res.status(503).json({ success: false, code: 'MASTER_DB_UNAVAILABLE', message: 'Could not verify your account. Please try again.' });
   }
 
-  if (!admin || admin.status !== 'active') {
-    return res.status(403).json({ success: false, code: 'ACCOUNT_DISABLED', message: 'This Super Admin account is no longer active.' });
+  if (!admin) {
+    return res.status(403).json({ success: false, code: 'ACCOUNT_REMOVED', message: 'This console account no longer exists.' });
+  }
+
+  if (admin.status !== 'active') {
+    return res.status(403).json({ success: false, code: 'ACCOUNT_REVOKED', message: 'Your console access has been revoked. Please contact a Super Admin.' });
   }
 
   req.admin = admin;
@@ -119,16 +135,16 @@ router.post('/send-otp', async (req, res, next) => {
 
     const admin = await findSuperAdmin(email);
     if (!admin) {
-      await addAuditLog('ADMIN_OTP_DENIED', email, 'Login code requested for an unrecognised Super Admin email', 'FAILED');
+      await addAuditLog('ADMIN_OTP_DENIED', email, 'Login code requested for an unrecognised console email', 'FAILED');
       return res.status(404).json({
         success: false,
-        message: 'This email is not registered as a Super Admin account.'
+        message: 'This email has not been granted console access.'
       });
     }
 
     if (admin.status !== 'active') {
-      await addAuditLog('ADMIN_OTP_BLOCKED', email, 'Login code requested for a disabled Super Admin account', 'BLOCKED');
-      return res.status(403).json({ success: false, message: 'This Super Admin account has been disabled.' });
+      await addAuditLog('ADMIN_OTP_BLOCKED', email, 'Login code requested for a revoked console account', 'BLOCKED');
+      return res.status(403).json({ success: false, message: 'Console access for this account has been revoked.' });
     }
 
     const existing = await models.Otp.findOne({ email, scope: OTP_SCOPE }).lean();
@@ -239,7 +255,7 @@ router.post('/verify-otp', async (req, res, next) => {
 
     const admin = await findSuperAdmin(email);
     if (!admin || admin.status !== 'active') {
-      return res.status(403).json({ success: false, message: 'This Super Admin account is no longer active.' });
+      return res.status(403).json({ success: false, message: 'Console access for this account has been revoked.' });
     }
 
     const lastLoginAt = new Date().toISOString();
@@ -253,7 +269,8 @@ router.post('/verify-otp', async (req, res, next) => {
         sub: admin.id,
         email: admin.email,
         name: admin.name,
-        role: 'SuperAdmin',
+        // Informational only — every guard re-reads the role from the account.
+        role: admin.role || 'SuperAdmin',
         scope: 'admin-console'
       },
       JWT_SECRET,

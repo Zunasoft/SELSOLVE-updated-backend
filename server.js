@@ -36,6 +36,7 @@ const {
 const { authRouter, requireSuperAdmin, findSuperAdmin } = require('./auth');
 const { sendOtpEmail, verifyMailer, isSmtpConfigured } = require('./mailer');
 const licensingModule = require('./modules/licensing');
+const { usersRouter, enforceReadOnly } = require('./modules/users');
 const {
   featuresForPlan,
   enforcePlanFeatures,
@@ -129,8 +130,16 @@ app.use('/api', (req, res, next) => {
 // --- SUPER ADMIN AUTHENTICATION (public: email + OTP) ---
 app.use('/api/admin/auth', authRouter);
 
-// Everything else under /api/admin requires a valid Super Admin session token.
+// Everything else under /api/admin requires a valid console session token.
 app.use('/api/admin', requireSuperAdmin);
+
+// A read-only role may call GET and nothing else. Applied across the whole
+// admin API rather than route by route, so a screen added later is covered
+// without anyone having to remember to guard it.
+app.use('/api/admin', enforceReadOnly);
+
+// Console user management — who may sign in, and what they may do.
+app.use('/api/admin', usersRouter);
 
 // Device management, subscriptions, plan catalogue and Razorpay payments
 app.use('/api/admin', licensingModule);
