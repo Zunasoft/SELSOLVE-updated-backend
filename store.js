@@ -1,8 +1,3 @@
-/**
- * Multi-Tenant In-Memory State & Store Management.
- * Manages store cache and accounting state for active tenant sessions.
- */
-
 const engine = require('./accounting/engine');
 const posting = require('./accounting/posting');
 
@@ -208,8 +203,22 @@ function defaultSettings() {
 }
 
 const DEFAULT_UNITS = [
-  'pcs', 'kg', 'g', 'litre', 'ml', 'pack', 'box', 'dozen',
-  'bundle', 'metre', 'plate', 'nos', 'set', 'pair', 'bag', 'carton'
+  { name: 'pcs',    subUnit: null,  factor: null, locked: false },
+  { name: 'kg',     subUnit: 'g',   factor: 1000, locked: true  },
+  { name: 'g',      subUnit: null,  factor: null, locked: false },
+  { name: 'litre',  subUnit: 'ml',  factor: 1000, locked: true  },
+  { name: 'ml',     subUnit: null,  factor: null, locked: false },
+  { name: 'pack',   subUnit: 'pcs', factor: null, locked: false },
+  { name: 'box',    subUnit: 'pcs', factor: null, locked: false },
+  { name: 'dozen',  subUnit: 'pcs', factor: 12,   locked: false },
+  { name: 'bundle', subUnit: 'pcs', factor: null, locked: false },
+  { name: 'metre',  subUnit: 'cm',  factor: 100,  locked: true  },
+  { name: 'plate',  subUnit: null,  factor: null, locked: false },
+  { name: 'nos',    subUnit: null,  factor: null, locked: false },
+  { name: 'set',    subUnit: 'pcs', factor: null, locked: false },
+  { name: 'pair',   subUnit: 'pcs', factor: 2,    locked: false },
+  { name: 'bag',    subUnit: null,  factor: null, locked: false },
+  { name: 'carton', subUnit: 'pcs', factor: null, locked: false }
 ];
 
 /** Customer groups a shop starts with — Module 7 "Customer Group Allocation". */
@@ -363,10 +372,6 @@ function logStockMovement(store, { product, type, qtyChange, reason, refId, user
   if (store.stockMovements.length > 2000) store.stockMovements.pop();
   return movement;
 }
-
-/* ------------------------------------------------------------------ *
- * Clean Store Initializer for dynamic tenants
- * ------------------------------------------------------------------ */
 
 function genericStore() {
   const store = emptyStore({

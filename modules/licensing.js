@@ -1,12 +1,3 @@
-/**
- * Device management, subscriptions and Razorpay payments —
- * SOW Modules 1 (Device Management, Plan Management) and 14 (Payment Gateway).
- *
- * Every device, plan, subscription event and payment is read from and written
- * to the master database. Previously these lived in a process-local array,
- * which meant a device registered on one instance was invisible to the next and
- * gone entirely after a restart.
- */
 
 const express = require('express');
 const crypto = require('crypto');
@@ -62,7 +53,6 @@ const planOf = (tenant, plans) => plans.find((p) => p.id === tenant.plan) || nul
  * Licence & subscription state
  * ------------------------------------------------------------------ */
 
-/** Seat usage for one shop, given its plan and its registered devices. */
 function licenceUsage(tenant, plan, devices = []) {
   const active = devices.filter((d) => d.status === 'active');
   const model = plan?.licenseModel || 'PER_DEVICE';
@@ -77,7 +67,6 @@ function licenceUsage(tenant, plan, devices = []) {
   };
 }
 
-/** Seat usage read fresh from the database for a single shop. */
 async function licenceUsageFor(tenant) {
   const [plan, devices] = await Promise.all([
     planById(tenant.plan),

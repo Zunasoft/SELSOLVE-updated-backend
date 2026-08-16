@@ -292,7 +292,6 @@ router.delete('/customer-groups/:id', (req, res) => {
   res.json({ success: true, message: `Group "${group.name}" removed.` });
 });
 
-/** Move several customers into a group in one action. */
 router.post('/customer-groups/:id/assign', (req, res) => {
   const store = req.tenantStore;
   const group = getGroups(store).find((g) => g.id === req.params.id);
@@ -472,7 +471,6 @@ router.post('/purchases', (req, res) => {
     date: date || new Date().toISOString()
   };
 
-  // Receive stock and refresh costing.
   lines.forEach((line) => {
     const product = store.products.find((p) => p.id === line.productId || p.name === line.name);
     if (!product) return;
@@ -553,7 +551,6 @@ router.post('/vendors/:id/pay', (req, res) => {
   if (!Array.isArray(store.payments)) store.payments = [];
   store.payments.unshift(record);
 
-  // Apply the payment against outstanding invoices, oldest first.
   let remaining = record.amount + r2(discount);
   const settled = [];
   (store.purchases || [])

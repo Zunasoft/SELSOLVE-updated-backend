@@ -486,8 +486,6 @@ async function run() {
   const bs = await request('GET', '/accounts/reports/balance-sheet');
   check('Balance sheet balances', bs.body.data.isBalanced === true, `difference ₹${bs.body.data.difference}`);
 
-  /* ---------------------------------------------------------------- */
-
   console.log(`\n${'═'.repeat(64)}`);
   console.log(`  ${passed} passed · ${failed} failed`);
   if (failed) {

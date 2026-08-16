@@ -55,8 +55,15 @@ const baselines = new WeakMap();
 const fingerprint = (doc) => crypto.createHash('md5').update(JSON.stringify(doc)).digest('hex');
 
 const stripId = (doc) => {
-  if (doc && typeof doc === 'object' && '_id' in doc) delete doc._id;
-  return doc;
+  if (!doc || typeof doc !== 'object') return doc;
+  try {
+    const clone = JSON.parse(JSON.stringify(doc));
+    delete clone._id;
+    return clone;
+  } catch {
+    if ('_id' in doc) delete doc._id;
+    return doc;
+  }
 };
 
 function snapshot(store) {
@@ -204,7 +211,7 @@ async function adoptLegacyData(db, store, meta) {
 const hydrateTenantStore = (dbName, store, tenant) => enqueue(dbName, () => doHydrate(dbName, store, tenant));
 
 /* ------------------------------------------------------------------ *
- * Persist
+ * Persistence
  * ------------------------------------------------------------------ */
 
 async function doPersist(dbName, store) {
@@ -216,41 +223,64 @@ async function doPersist(dbName, store) {
   const written = {};
 
   const jobs = ARRAY_COLLECTIONS.map(async (spec) => {
-    const prev = before[spec.key] instanceof Map ? before[spec.key] : new Map();
-    const next = after[spec.key];
-    const rows = Array.isArray(store[spec.key]) ? store[spec.key] : [];
+    try {
+      const prev = before[spec.key] instanceof Map ? before[spec.key] : new Map();
+      const next = after[spec.key] instanceof Map ? after[spec.key] : new Map();
+      const rows = Array.isArray(store[spec.key]) ? store[spec.key] : [];
 
-    const operations = [];
-    for (const row of rows) {
-      const id = row?.[spec.idField];
-      if (id === undefined || id === null) continue;
-      const key = String(id);
-      if (prev.get(key) === next.get(key)) continue;
-      operations.push({
-        replaceOne: {
-          filter: { [spec.idField]: id },
-          replacement: stripId({ ...row }),
-          upsert: true
+      const operations = [];
+      for (const row of rows) {
+        const id = row?.[spec.idField];
+        if (id === undefined || id === null) continue;
+        const key = String(id);
+        if (prev.get(key) === next.get(key)) continue;
+        operations.push({
+          replaceOne: {
+            filter: { [spec.idField]: id },
+            replacement: stripId(row),
+            upsert: true
+          }
+        });
+      }
+
+      if (!spec.appendOnly) {
+        const removed = [...prev.keys()].filter((id) => !next.has(id));
+        if (removed.length) operations.push({ deleteMany: { filter: { [spec.idField]: { $in: removed } } } });
+      }
+
+      if (!operations.length) return;
+      await db.collection(spec.collection).bulkWrite(operations, { ordered: false });
+      written[spec.key] = operations.length;
+    } catch (err) {
+      console.warn(`[Tenant DB ${dbName}] bulkWrite warning on "${spec.collection}":`, err.message);
+      // Fallback: Individual item replacement to prevent entire request from failing
+      try {
+        const rows = Array.isArray(store[spec.key]) ? store[spec.key] : [];
+        for (const row of rows) {
+          const id = row?.[spec.idField];
+          if (id === undefined || id === null) continue;
+          await db.collection(spec.collection).replaceOne(
+            { [spec.idField]: id },
+            stripId(row),
+            { upsert: true }
+          ).catch(() => {});
         }
-      });
+      } catch (fallbackErr) {
+        console.error(`[Tenant DB ${dbName}] Fallback write error on ${spec.collection}:`, fallbackErr.message);
+      }
     }
-
-    if (!spec.appendOnly) {
-      const removed = [...prev.keys()].filter((id) => !next.has(id));
-      if (removed.length) operations.push({ deleteMany: { filter: { [spec.idField]: { $in: removed } } } });
-    }
-
-    if (!operations.length) return;
-    await db.collection(spec.collection).bulkWrite(operations, { ordered: false });
-    written[spec.key] = operations.length;
   });
 
   const metaJobs = META_KEYS.map(async (key) => {
-    if (before[key] === after[key]) return;
-    await db
-      .collection(META_COLLECTION)
-      .updateOne({ _key: key }, { $set: { _key: key, value: store[key] ?? null, updatedAt: new Date() } }, { upsert: true });
-    written[key] = 1;
+    try {
+      if (before[key] === after[key]) return;
+      await db
+        .collection(META_COLLECTION)
+        .updateOne({ _key: key }, { $set: { _key: key, value: store[key] ?? null, updatedAt: new Date() } }, { upsert: true });
+      written[key] = 1;
+    } catch (err) {
+      console.warn(`[Tenant DB ${dbName}] Error saving meta key "${key}":`, err.message);
+    }
   });
 
   await Promise.all([...jobs, ...metaJobs]);

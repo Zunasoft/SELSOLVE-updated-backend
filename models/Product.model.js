@@ -9,11 +9,13 @@ const productSchema = new mongoose.Schema(
     regionalName: { type: String, default: '' },
     description: { type: String, default: '' },
     categoryId: { type: String, default: 'cat_1' },
+    categoryIds: { type: [String], default: undefined },
     productType: {
       type: String,
       enum: ['standard', 'raw', 'service', 'combo', 'composite'],
       default: 'standard'
     },
+    productTypes: { type: [String], default: undefined },
     barcode: {
       type: String,
       default: () => Math.floor(1000000000 + Math.random() * 9000000000).toString(),

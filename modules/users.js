@@ -1,27 +1,9 @@
-/**
- * Console user management — who may sign in to the Super Admin console, and
- * what they may do once they are in.
- *
- * Sign-in is passwordless (email + one-time code), so there is no credential to
- * issue or reset here. A row in the SuperAdmin collection with
- * `status: 'active'` *is* the login access: creating one grants it, flipping
- * the status to `revoked` takes it away, and deleting the row removes the
- * account entirely.
- *
- * Revocation is immediate rather than eventual: auth.js re-reads the account
- * from the master database on every single request, so a revoked operator is
- * locked out on their very next click — their existing token is not waited out.
- */
 
 const express = require('express');
 const { models, addAuditLog, SEED_SUPER_ADMIN_EMAIL } = require('../db');
 
 const router = express.Router();
 
-/* ------------------------------------------------------------------ *
- * Roles — the single definition the backend guards with and the console
- * renders its role picker from.
- * ------------------------------------------------------------------ */
 
 const ROLE_CATALOG = [
   {
@@ -167,7 +149,6 @@ router.get('/users/roles', (req, res) => {
   res.json({ success: true, data: ROLE_CATALOG });
 });
 
-// List every console user.
 router.get(
   '/users',
   handler(async (req, res) => {
@@ -188,7 +169,6 @@ router.get(
   })
 );
 
-// Grant console login access to a new person.
 router.post(
   '/users',
   requireUserAdmin,
@@ -254,7 +234,6 @@ router.post(
   })
 );
 
-// Edit a console user's name or role.
 router.put(
   '/users/:id',
   requireUserAdmin,
@@ -324,7 +303,6 @@ router.put(
   })
 );
 
-// Revoke or restore login access.
 router.patch(
   '/users/:id/status',
   requireUserAdmin,
@@ -390,7 +368,6 @@ router.patch(
   })
 );
 
-// Delete a console user outright.
 router.delete(
   '/users/:id',
   requireUserAdmin,

@@ -1,8 +1,3 @@
-/**
- * Application Configuration
- * Centralized environment configuration for Selsolve POS Backend.
- */
-
 require('dotenv').config();
 
 const defaultAllowedOrigins = [

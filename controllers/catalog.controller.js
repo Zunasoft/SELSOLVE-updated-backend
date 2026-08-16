@@ -56,11 +56,111 @@ function shapeAltUnits(payload, existing, baseUnit) {
     }));
 }
 
+/**
+ * A product can belong to more than one category — e.g. "Egg" is both a
+ * sellable Product and a Raw Material used in recipes. `categoryIds` holds
+ * the full set; `categoryId` (categoryIds[0]) stays the primary category so
+ * existing single-category filters, reports and price sheets keep working.
+ */
+function shapeCategoryIds(payload, existing, store) {
+  let ids;
+  if (Array.isArray(payload.categoryIds)) {
+    ids = payload.categoryIds;
+  } else if (typeof payload.categoryIds === 'string' && payload.categoryIds.trim()) {
+    ids = payload.categoryIds.split(',');
+  } else if (payload.categoryId) {
+    ids = [payload.categoryId];
+  } else if (Array.isArray(existing?.categoryIds) && existing.categoryIds.length) {
+    ids = existing.categoryIds;
+  } else if (existing?.categoryId) {
+    ids = [existing.categoryId];
+  } else {
+    ids = [store.categories[0]?.id || 'cat_1'];
+  }
+  const clean = [...new Set(ids.map((id) => String(id).trim()).filter(Boolean))];
+  return clean.length ? clean : [store.categories[0]?.id || 'cat_1'];
+}
+
+/**
+ * Normalizes any string or legacy label to one of the canonical product types:
+ * - standard (Standard Item)
+ * - raw (Raw Material)
+ * - both (Both Raw Material & Standard Product)
+ * - service (Service)
+ * - combo (Combo Bundle)
+ * - composite (Composite / Recipe)
+ */
+function canonicalProductType(val) {
+  if (!val) return 'standard';
+  const clean = String(val).toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (clean.includes('both') || (clean.includes('raw') && (clean.includes('standard') || clean.includes('std') || clean.includes('product')))) {
+    return 'both';
+  }
+  if (clean.includes('service') || clean.includes('repair')) return 'service';
+  if (clean.includes('combo') || clean.includes('bundle')) return 'combo';
+  if (clean.includes('composite') || clean.includes('recipe')) return 'composite';
+  if (clean === 'raw' || clean === 'rawmaterial' || clean === 'rm' || clean.includes('raw')) {
+    return 'raw';
+  }
+  return 'standard';
+}
+
+/**
+ * Shapes product types. Items tagged as 'both' receive ['standard', 'raw'].
+ */
+function shapeProductTypes(payload, existing) {
+  let raw = '';
+  if (payload.productType) {
+    raw = payload.productType;
+  } else if (Array.isArray(payload.productTypes) && payload.productTypes.length > 1) {
+    raw = 'both';
+  } else if (Array.isArray(payload.productTypes) && payload.productTypes.length === 1) {
+    raw = payload.productTypes[0];
+  } else if (typeof payload.productTypes === 'string' && payload.productTypes.trim()) {
+    raw = payload.productTypes.includes(',') ? 'both' : payload.productTypes;
+  } else if (existing?.productType) {
+    raw = existing.productType;
+  } else if (Array.isArray(existing?.productTypes) && existing.productTypes.length > 1) {
+    raw = 'both';
+  } else if (Array.isArray(existing?.productTypes) && existing.productTypes.length === 1) {
+    raw = existing.productTypes[0];
+  } else if (payload.isComposite) {
+    raw = 'composite';
+  }
+
+  const type = canonicalProductType(raw);
+  const types = type === 'both' ? ['standard', 'raw'] : [type];
+  return types;
+}
+
+/**
+ * Returns the tenant's unit definitions as an array of objects.
+ * Migrates legacy flat-string arrays (`['pcs','kg',...]`) to the new
+ * object format (`[{ name, subUnit, factor, locked }, ...]`) on first access.
+ */
 function getTenantUnits(store) {
   if (!Array.isArray(store.units) || store.units.length === 0) {
-    store.units = [...DEFAULT_UNITS];
+    store.units = DEFAULT_UNITS.map((u) => ({ ...u }));
+    return store.units;
   }
+
+  // Migrate: if the first element is a plain string, convert the whole array
+  if (typeof store.units[0] === 'string') {
+    const defaultMap = Object.fromEntries(DEFAULT_UNITS.map((u) => [u.name, u]));
+    store.units = store.units.map((name) => {
+      const n = String(name).toLowerCase().trim();
+      if (defaultMap[n]) return { ...defaultMap[n] };
+      return { name: n, subUnit: null, factor: null, locked: false };
+    });
+  }
+
   return store.units;
+}
+
+/** Find a unit object by name (case-insensitive). */
+function findUnit(units, name) {
+  const clean = String(name).toLowerCase().trim();
+  return units.find((u) => u.name === clean);
 }
 
 function getTenantPriceSheets(store) {
@@ -103,7 +203,8 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     stock = Object.values(payload.warehouses).reduce((sum, v) => sum + num(v, 0), 0);
   }
 
-  const productType = payload.productType || existing?.productType || (payload.isComposite ? 'composite' : 'standard');
+  const productTypes = shapeProductTypes(payload, existing);
+  const productType = productTypes[0];
 
   let pricingHistory = existing?.pricingHistory || [];
   if (existing && (existing.price !== price || existing.purchasePrice !== purchasePrice)) {
@@ -119,6 +220,7 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
   }
 
   const unit = payload.unit || existing?.unit || 'pcs';
+  const categoryIds = shapeCategoryIds(payload, existing, store);
 
   return {
     id: existing?.id || `p_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
@@ -126,7 +228,8 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     printName: payload.regionalName ?? payload.printName ?? existing?.regionalName ?? existing?.printName ?? '',
     regionalName: payload.regionalName ?? payload.printName ?? existing?.regionalName ?? existing?.printName ?? '',
     description: payload.description ?? existing?.description ?? '',
-    categoryId: payload.categoryId || existing?.categoryId || store.categories[0]?.id || 'cat_1',
+    categoryId: categoryIds[0],
+    categoryIds,
     barcode,
     barcodes,
     defaultBarcode: barcode,
@@ -134,6 +237,7 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     unit,
     altUnits: shapeAltUnits(payload, existing, unit),
     productType,
+    productTypes,
     price,
     mrp: num(payload.mrp, existing?.mrp ?? price),
     purchasePrice,
@@ -167,33 +271,48 @@ exports.getUnits = (req, res) => {
 
 exports.createUnit = (req, res) => {
   const units = getTenantUnits(req.tenantStore);
-  const { name } = req.body;
+  const { name, subUnit, factor } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ success: false, message: 'Unit name is required.' });
 
   const clean = name.trim().toLowerCase();
-  if (units.includes(clean)) return res.status(400).json({ success: false, message: 'Unit already exists.' });
+  if (findUnit(units, clean)) return res.status(400).json({ success: false, message: 'Unit already exists.' });
 
-  units.push(clean);
-  res.status(201).json({ success: true, message: 'Unit created successfully.', data: clean });
+  const unitObj = {
+    name: clean,
+    subUnit: subUnit ? String(subUnit).trim().toLowerCase() : null,
+    factor: factor !== undefined && factor !== null && factor !== '' ? Number(factor) : null,
+    locked: false
+  };
+  units.push(unitObj);
+  res.status(201).json({ success: true, message: 'Unit created successfully.', data: unitObj });
 };
 
 exports.updateUnit = (req, res) => {
   const units = getTenantUnits(req.tenantStore);
   const oldName = req.params.oldName.toLowerCase();
-  const { newName } = req.body;
+  const { newName, subUnit, factor } = req.body;
 
   if (!newName || !newName.trim()) return res.status(400).json({ success: false, message: 'New unit name is required.' });
 
   const clean = newName.trim().toLowerCase();
-  const index = units.indexOf(oldName);
-  if (index < 0) return res.status(404).json({ success: false, message: 'Unit not found.' });
+  const existing = findUnit(units, oldName);
+  if (!existing) return res.status(404).json({ success: false, message: 'Unit not found.' });
 
-  units[index] = clean;
-  (req.tenantStore.products || []).forEach((p) => {
-    if (p.unit === oldName) p.unit = clean;
-  });
+  // Rename the unit in all products if the name changed
+  if (existing.name !== clean) {
+    (req.tenantStore.products || []).forEach((p) => {
+      if (p.unit === existing.name) p.unit = clean;
+    });
+    existing.name = clean;
+  }
 
-  res.json({ success: true, message: 'Unit updated.', data: clean });
+  // Update conversion fields (locked units keep their factor)
+  if (!existing.locked) {
+    existing.subUnit = subUnit !== undefined ? (subUnit ? String(subUnit).trim().toLowerCase() : null) : existing.subUnit;
+    existing.factor = factor !== undefined ? (factor !== null && factor !== '' ? Number(factor) : null) : existing.factor;
+  }
+
+  res.json({ success: true, message: 'Unit updated.', data: existing });
 };
 
 exports.deleteUnit = (req, res) => {
@@ -205,7 +324,7 @@ exports.deleteUnit = (req, res) => {
     return res.status(400).json({ success: false, message: `Cannot delete unit "${name}" because it is currently assigned to products.` });
   }
 
-  const index = units.indexOf(name);
+  const index = units.findIndex((u) => u.name === name);
   if (index >= 0) units.splice(index, 1);
 
   res.json({ success: true, message: `Unit "${name}" deleted.` });
@@ -219,7 +338,7 @@ exports.getCategories = (req, res) => {
     success: true,
     data: store.categories.map((c) => ({
       ...c,
-      productCount: (store.products || []).filter((p) => p.categoryId === c.id).length
+      productCount: (store.products || []).filter((p) => (p.categoryIds || [p.categoryId]).includes(c.id)).length
     }))
   });
 };
@@ -252,7 +371,7 @@ exports.updateCategory = (req, res) => {
 
 exports.deleteCategory = (req, res) => {
   const store = req.tenantStore;
-  const inUse = (store.products || []).some((p) => p.categoryId === req.params.id);
+  const inUse = (store.products || []).some((p) => (p.categoryIds || [p.categoryId]).includes(req.params.id));
   if (inUse) {
     return res.status(400).json({ success: false, message: 'Category is in use by existing products and cannot be deleted.' });
   }
@@ -268,8 +387,8 @@ exports.getProducts = (req, res) => {
   const { q, categoryId, lowStock, outOfStock, productType, status } = req.query;
 
   let rows = store.products || [];
-  if (categoryId && categoryId !== 'all') rows = rows.filter((p) => p.categoryId === categoryId);
-  if (productType && productType !== 'all') rows = rows.filter((p) => p.productType === productType);
+  if (categoryId && categoryId !== 'all') rows = rows.filter((p) => (p.categoryIds || [p.categoryId]).includes(categoryId));
+  if (productType && productType !== 'all') rows = rows.filter((p) => (p.productTypes || [p.productType]).includes(productType));
   if (status === 'active') rows = rows.filter((p) => p.isActive !== false);
   if (status === 'inactive') rows = rows.filter((p) => p.isActive === false);
 
@@ -298,7 +417,7 @@ exports.getProducts = (req, res) => {
         id: `rec_${p.id}`,
         productId: p.id,
         productName: p.name,
-        yieldQty: p.recipeYieldQty || 1,
+        yieldQty: 1,
         ingredients: p.recipeItems,
         notes: p.recipeNotes || ''
       };
@@ -549,14 +668,16 @@ exports.deletePriceSheet = (req, res) => {
 exports.getPriceSheetGrid = (req, res) => {
   const store = req.tenantStore;
   const rows = (store.products || []).map((p) => {
-    const category = store.categories.find((c) => c.id === p.categoryId);
+    const categoryNames = (p.categoryIds || [p.categoryId])
+      .map((id) => store.categories.find((c) => c.id === id)?.name)
+      .filter(Boolean);
     const margin = p.price - p.purchasePrice;
     return {
       id: p.id,
       name: p.name,
       printName: p.printName || p.regionalName,
       regionalName: p.regionalName || p.printName,
-      category: category ? category.name : '—',
+      category: categoryNames.length ? categoryNames.join(', ') : '—',
       barcode: p.barcode,
       hsn: p.hsn,
       unit: p.unit,
@@ -636,7 +757,11 @@ function normalizeImportRow(row) {
   const name = getVal('name', 'productname', 'itemname', 'product', 'item', 'title', 'description', 'itemdescription', 'productdescription');
   const regionalName = getVal('regionalName', 'regionalname', 'printname', 'localname', 'tamilname', 'regional', 'displayname');
   const categoryName = getVal('category', 'categoryname', 'group', 'categoryid', 'catname', 'itemcategory');
-  const productType = getVal('productType', 'producttype', 'type', 'itemtype') || 'standard';
+
+  const rawType = getVal('productType', 'producttype', 'type', 'itemtype', 'product_type', 'item_type', 'kind', 'nature') || 'standard';
+  const productType = canonicalProductType(rawType);
+  const productTypes = [productType];
+
   const unit = getVal('unit', 'uom', 'units', 'baseunit', 'unitofmeasure') || 'pcs';
   const barcode = getVal('barcode', 'code', 'sku', 'upc', 'itemcode', 'ean', 'barcodeno');
   const purchasePrice = cleanNumStr(getVal('purchasePrice', 'purchaseprice', 'costprice', 'cost', 'buyprice', 'unitcost', 'purchasecost'));
@@ -684,20 +809,13 @@ exports.bulkImportProducts = (req, res) => {
     const rawRow = products[i];
     const norm = normalizeImportRow(rawRow);
 
-    // Skip row completely if all values are empty
-    if (!norm.name && norm.price === '' && norm.barcode === '') {
-      continue;
-    }
-
+    if (!norm.name && norm.price === '' && norm.barcode === '') continue;
     if (!norm.name) {
       errors.push({ row: i + 1, name: 'N/A', message: 'Missing product name' });
       continue;
     }
 
-    // Default price to 0 if empty
-    if (norm.price === '') {
-      norm.price = '0';
-    }
+    if (norm.price === '') norm.price = '0';
 
     try {
       // Auto-resolve or create category
@@ -711,21 +829,25 @@ exports.bulkImportProducts = (req, res) => {
           cat = {
             id: `cat_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
             name: catNameClean,
-            description: 'Auto-created during CSV import',
+            icon: '📦',
+            color: '#6366f1',
+            taxRate: Number(norm.taxRate) || 0,
+            hsn: norm.hsn || '',
+            description: `Auto-created from import of ${norm.name}`,
             createdAt: new Date().toISOString()
           };
           store.categories.push(cat);
         }
         categoryId = cat.id;
-      } else if (store.categories[0]) {
+      } else if (store.categories.length) {
         categoryId = store.categories[0].id;
       }
 
       // Auto-register unit if missing
       if (norm.unit && Array.isArray(store.units)) {
         const cleanUnit = norm.unit.toLowerCase();
-        if (!store.units.includes(cleanUnit)) {
-          store.units.push(cleanUnit);
+        if (!findUnit(store.units, cleanUnit)) {
+          store.units.push({ name: cleanUnit, subUnit: null, factor: null, locked: false });
         }
       }
 
@@ -734,22 +856,23 @@ exports.bulkImportProducts = (req, res) => {
         categoryId
       };
 
-      // Match existing product by Barcode first, then by Name (case-insensitive)
+      // Match existing product by barcode (if non-empty) or exact name
       let existingProduct = null;
       if (norm.barcode) {
         existingProduct = store.products.find(
-          (p) => p.barcode === norm.barcode || (Array.isArray(p.barcodes) && p.barcodes.includes(norm.barcode))
+          (p) => p.barcode === norm.barcode || (p.barcodes || []).includes(norm.barcode)
         );
       }
       if (!existingProduct && norm.name) {
         existingProduct = store.products.find(
-          (p) => p.name.toLowerCase() === norm.name.toLowerCase()
+          (p) => p.name.toLowerCase().trim() === norm.name.toLowerCase().trim()
         );
       }
 
+      const oldStock = existingProduct ? existingProduct.stock : 0;
+      const shaped = shapeProduct(store, payload, existingProduct, actor(req));
+
       if (existingProduct) {
-        const oldStock = existingProduct.stock;
-        const shaped = shapeProduct(store, payload, existingProduct, actor(req));
         Object.assign(existingProduct, shaped);
         updated.push(existingProduct);
 
@@ -764,15 +887,14 @@ exports.bulkImportProducts = (req, res) => {
           });
         }
       } else {
-        const product = shapeProduct(store, payload, null, actor(req));
-        store.products.unshift(product);
-        added.push(product);
+        store.products.unshift(shaped);
+        added.push(shaped);
 
-        if (product.stock !== 0) {
+        if (shaped.stock !== 0) {
           logStockMovement(store, {
-            product,
+            product: shaped,
             type: 'OPENING',
-            qtyChange: product.stock,
+            qtyChange: shaped.stock,
             reason: 'CSV Bulk Import Initial Stock',
             user: actor(req)
           });
@@ -817,7 +939,7 @@ exports.getInventorySummary = (req, res) => {
   const lowStock = products.filter((p) => p.productType !== 'service' && p.stock <= (p.minStock ?? 5));
   const outOfStock = products.filter((p) => p.productType !== 'service' && p.stock <= 0);
 
-  const rawProducts = products.filter((p) => p.productType === 'raw');
+  const rawProducts = products.filter((p) => (p.productTypes || [p.productType]).includes('raw'));
   const serviceProducts = products.filter((p) => p.productType === 'service');
   const comboProducts = products.filter((p) => p.productType === 'combo');
   const compositeProducts = products.filter((p) => p.productType === 'composite' || p.isComposite);

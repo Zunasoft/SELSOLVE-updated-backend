@@ -92,11 +92,6 @@ router.delete('/bills/held/:id', (req, res) => {
 /* -------------------------------- checkout -------------------------------- */
 
 /**
- * Deduct sold quantities. A composite product consumes its recipe ingredients
- * instead of its own (notional) stock, which is what keeps raw-material
- * inventory honest for bakeries and kitchens.
- */
-/**
  * A line billed in an alternate unit still moves base units of stock: one "box"
  * of a product whose box factor is 12 takes 12 pieces off the shelf. The factor
  * travels on the cart line, so a bill printed in boxes and a stock report
@@ -104,18 +99,56 @@ router.delete('/bills/held/:id', (req, res) => {
  */
 function baseQty(product, cartItem) {
   const qty = Number(cartItem.qty) || 0;
-  const soldUnit = cartItem.saleUnit || cartItem.unit;
+  const soldUnit = String(cartItem.saleUnit || cartItem.unit || '').toLowerCase().trim();
+  const prodUnit = String(product?.unit || '').toLowerCase().trim();
 
-  if (!soldUnit || !product || soldUnit === product.unit) return qty;
+  if (!soldUnit || !prodUnit || soldUnit === prodUnit) return qty;
 
+  // 1. Explicit unitFactor passed on the cart item (e.g. 0.001 for grams when base is kg)
+  if (Number(cartItem.unitFactor) > 0) {
+    return qty * Number(cartItem.unitFactor);
+  }
+
+  // 2. Look up in product's altUnits
   const alt = (product.altUnits || []).find(
-    (u) => String(u.unit).toLowerCase() === String(soldUnit).toLowerCase()
+    (u) => String(u.unit).toLowerCase() === soldUnit
   );
-  const factor = Number(cartItem.unitFactor) || (alt ? Number(alt.factor) : 0);
+  if (alt && Number(alt.factor) > 0) {
+    return qty * Number(alt.factor);
+  }
 
-  return factor > 0 ? qty * factor : qty;
+  // 3. Look up in product's customSubUnit
+  const subName = String(product.customSubUnitName || '').toLowerCase().trim();
+  const subFactor = Number(product.customSubUnitFactor) || 0;
+  if (subName && subName === soldUnit && subFactor > 0) {
+    return qty / subFactor; // e.g. 500 g with subFactor 1000 => 500 / 1000 = 0.5 kg
+  }
+
+  // 4. Standard conversions fallback
+  if (prodUnit === 'kg' && (soldUnit === 'g' || soldUnit === 'gm' || soldUnit === 'grams')) {
+    return qty / 1000;
+  }
+  if ((prodUnit === 'g' || prodUnit === 'gm') && soldUnit === 'kg') {
+    return qty * 1000;
+  }
+  if ((prodUnit === 'ltr' || prodUnit === 'liter' || prodUnit === 'litre') && (soldUnit === 'ml' || soldUnit === 'milliliter')) {
+    return qty / 1000;
+  }
+  if (prodUnit === 'dozen' && soldUnit === 'pcs') {
+    return qty / (subFactor || 12);
+  }
+  if ((prodUnit === 'box' || prodUnit === 'carton') && soldUnit === 'pcs') {
+    return qty / (subFactor || 12);
+  }
+
+  return qty;
 }
 
+/**
+ * Deduct sold quantities. A composite product consumes its recipe ingredients
+ * instead of its own (notional) stock, which is what keeps raw-material
+ * inventory honest for bakeries and kitchens.
+ */
 function deductStock(store, items, orderId, user) {
   const shortages = [];
 
@@ -124,21 +157,24 @@ function deductStock(store, items, orderId, user) {
     if (!product) return;
 
     const soldQty = baseQty(product, cartItem);
+    const isComposite = product.isComposite || product.productType === 'composite';
     const recipe = (store.recipes || []).find((r) => r.productId === product.id);
+    const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
 
-    if (product.isComposite && recipe) {
-      recipe.ingredients.forEach((ing) => {
+    if (isComposite && ingredients.length > 0) {
+      ingredients.forEach((ing) => {
         const raw = store.products.find((p) => p.id === ing.productId);
         if (!raw) return;
-        const deducted = (Number(ing.qty) * soldQty) / (recipe.yieldQty || 1);
-        
+        const reqPerUnit = Number(ing.qty) || 0;
+        const deducted = Math.round(reqPerUnit * soldQty * 10000) / 10000;
+
         if (raw.stock < deducted) {
           shortages.push({ name: raw.name, available: raw.stock });
         }
-        
-        raw.stock = r2(raw.stock - deducted);
+
+        raw.stock = Math.max(0, Math.round((Number(raw.stock || 0) - deducted) * 10000) / 10000);
         if (raw.warehouses) {
-          raw.warehouses['wh_shop'] = (raw.warehouses['wh_shop'] || 0) - deducted;
+          raw.warehouses['wh_shop'] = Math.max(0, Math.round((Number(raw.warehouses['wh_shop'] || 0) - deducted) * 10000) / 10000);
           raw.stock = Object.values(raw.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
         }
 
@@ -146,7 +182,7 @@ function deductStock(store, items, orderId, user) {
           product: raw,
           type: 'SALE',
           qtyChange: -deducted,
-          reason: `Sold on ${orderId}`,
+          reason: `Consumed in ${product.name} (Sold on ${orderId})`,
           refId: orderId,
           user
         });
@@ -295,7 +331,6 @@ router.post('/orders', async (req, res) => {
     order.loyaltyBalance = customer.loyaltyPoints;
   }
 
-  // Cash sales move the counter drawer.
   if (String(paymentMethod).toLowerCase() === 'cash' && store.session) {
     store.session.currentCash = r2(store.session.currentCash + order.total);
     store.session.cashEntries.push({
@@ -384,19 +419,21 @@ router.post('/orders/:orderId/void', (req, res) => {
     const product = store.products.find((p) => p.id === item.id || p.name === item.name);
     if (!product) return;
 
-    // Return exactly what the sale took, alternate units included.
     const soldQty = baseQty(product, item);
+    const isComposite = product.isComposite || product.productType === 'composite';
     const recipe = (store.recipes || []).find((r) => r.productId === product.id);
+    const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
 
-    if (product.isComposite && recipe) {
-      recipe.ingredients.forEach((ing) => {
+    if (isComposite && ingredients.length > 0) {
+      ingredients.forEach((ing) => {
         const raw = store.products.find((p) => p.id === ing.productId);
         if (!raw) return;
-        const returned = (Number(ing.qty) * soldQty) / (recipe.yieldQty || 1);
-        raw.stock = r2(raw.stock + returned);
+        const reqPerUnit = Number(ing.qty) || 0;
+        const returned = Math.round(reqPerUnit * soldQty * 10000) / 10000;
+        raw.stock = Math.round((Number(raw.stock || 0) + returned) * 10000) / 10000;
         
         if (raw.warehouses) {
-          raw.warehouses['wh_shop'] = (raw.warehouses['wh_shop'] || 0) + returned;
+          raw.warehouses['wh_shop'] = Math.round((Number(raw.warehouses['wh_shop'] || 0) + returned) * 10000) / 10000;
           raw.stock = Object.values(raw.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
         }
 
@@ -404,7 +441,7 @@ router.post('/orders/:orderId/void', (req, res) => {
           product: raw,
           type: 'RETURN',
           qtyChange: returned,
-          reason: `Void of ${order.orderId}`,
+          reason: `Void of ${order.orderId} (Restored from ${product.name})`,
           refId: order.orderId,
           user: actor(req)
         });

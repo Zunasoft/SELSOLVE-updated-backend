@@ -1,8 +1,3 @@
-/**
- * Centralized API Router Index
- * Combines all modular routes under /api/pos
- */
-
 const express = require('express');
 const router = express.Router();
 

@@ -1,8 +1,3 @@
-/**
- * Database Connection Module
- * Connects to MongoDB using Mongoose with the connection string defined in ADMIN_BE_URL / MONGODB_URI.
- */
-
 const mongoose = require('mongoose');
 const config = require('./config');
 

@@ -1,7 +1,3 @@
-/**
- * Central Error Handler Middleware
- */
-
 const notFoundHandler = (req, res) => {
   res.status(404).json({ success: false, message: `No route matches ${req.method} ${req.originalUrl}` });
 };

@@ -126,7 +126,6 @@ async function cleanup() {
 
   const admin = adminToken();
 
-  /* ---------------- 1. Super Admin creates two shops ---------------- */
   console.log('\n[1] Super Admin provisions two shops');
 
   const createA = await request('POST', '/api/admin/tenants', { token: admin, body: { ...SHOP_A, plan: 'pro' } });
@@ -146,7 +145,6 @@ async function cleanup() {
   const masterTenant = await require('../models/Tenant.model').findOne({ email: SHOP_A.email }).lean();
   ok('Shop A details are in the MASTER database', Boolean(masterTenant) && masterTenant.dbName === tenantA.dbName);
 
-  /* ---------------- 2. Owner signs in and works in the POS ---------------- */
   console.log('\n[2] Shop A owner adds a category, a product and rings up a sale');
 
   const tokA = tokenFor(tenantA);
@@ -183,7 +181,6 @@ async function cleanup() {
 
   await request('PUT', '/api/pos/settings/company', { token: tokA, body: { name: 'Alpha Mart Pvt Ltd', gstin: '33ALPHA1234A1Z5' } });
 
-  /* ---------------- 3. It landed in Shop A's own database ---------------- */
   console.log("\n[3] Everything landed in Shop A's own database");
 
   const aProducts = await raw(tenantA.dbName, 'products').find({}).toArray();
@@ -204,7 +201,6 @@ async function cleanup() {
   ok('Stock movements persisted to Shop A DB', aMovements.length > 0, `found ${aMovements.length}`);
   ok('Store settings persisted to Shop A DB', aSettings?.value?.company?.gstin === '33ALPHA1234A1Z5');
 
-  /* ---------------- 4. Nothing leaked into master or the other shop ---------------- */
   console.log('\n[4] Nothing leaked into the master database or into Shop B');
 
   const masterDb = mongoose.connection.useDb('selsolve', { useCache: true }).db;
@@ -218,7 +214,6 @@ async function cleanup() {
   ok('Shop B cannot see Shop A products over the API', Array.isArray(bList.body?.data) && bList.body.data.length === 0,
     JSON.stringify(bList.body).slice(0, 200));
 
-  /* ---------------- 5. Isolation cannot be bypassed ---------------- */
   console.log('\n[5] A shop cannot reach another shop by changing headers');
 
   const spoof = await request('GET', '/api/pos/products', {
@@ -230,7 +225,6 @@ async function cleanup() {
   const noAuth = await request('GET', '/api/pos/products', { headers: { 'x-tenant-db': tenantA.dbName } });
   ok('Unauthenticated access is rejected', noAuth.status === 401, `status ${noAuth.status}`);
 
-  /* ---------------- 6. Every read comes from the shop's database ---------------- */
   console.log('\n[6] Reads come from the shop database, not from process memory');
 
   // There is no cache to drop: each request builds a fresh working set and
@@ -246,14 +240,12 @@ async function cleanup() {
   ok('Invoice still readable after restart', (ordersAfter.body?.data || []).length === 1,
     `found ${(ordersAfter.body?.data || []).length}`);
 
-  /* ---------------- 7. Deactivated shop is locked out ---------------- */
   console.log('\n[7] A deactivated shop cannot use the POS');
 
   await request('PATCH', `/api/admin/tenants/${tenantA.id}/status`, { token: admin, body: { status: 'inactive' } });
   const blocked = await request('GET', '/api/pos/products', { token: tokA });
   ok('Deactivated shop is blocked', blocked.status === 403, `status ${blocked.status}`);
 
-  /* ---------------- done ---------------- */
   console.log(`\n${'='.repeat(52)}\n  ${pass} passed, ${fail} failed\n${'='.repeat(52)}`);
 
   await cleanup();

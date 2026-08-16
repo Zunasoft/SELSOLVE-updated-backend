@@ -1,7 +1,3 @@
-/**
- * Stock Movement Audit Log Mongoose Schema
- */
-
 const mongoose = require('mongoose');
 
 const stockMovementSchema = new mongoose.Schema(

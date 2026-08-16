@@ -1,7 +1,3 @@
-/**
- * Tenant Mongoose Schema
- */
-
 const mongoose = require('mongoose');
 
 const tenantSchema = new mongoose.Schema(

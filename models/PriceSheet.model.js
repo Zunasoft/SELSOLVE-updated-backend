@@ -1,7 +1,3 @@
-/**
- * Price Sheet Mongoose Schema
- */
-
 const mongoose = require('mongoose');
 
 const priceSheetSchema = new mongoose.Schema(

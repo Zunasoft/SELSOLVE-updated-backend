@@ -58,7 +58,6 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_zunasoft_2026
 connectMasterDB().catch(() => {});
 verifyMailer();
 
-// CORS setup
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
@@ -130,7 +129,6 @@ app.use('/api', (req, res, next) => {
 // --- SUPER ADMIN AUTHENTICATION (public: email + OTP) ---
 app.use('/api/admin/auth', authRouter);
 
-// Everything else under /api/admin requires a valid console session token.
 app.use('/api/admin', requireSuperAdmin);
 
 // A read-only role may call GET and nothing else. Applied across the whole
@@ -138,7 +136,6 @@ app.use('/api/admin', requireSuperAdmin);
 // without anyone having to remember to guard it.
 app.use('/api/admin', enforceReadOnly);
 
-// Console user management — who may sign in, and what they may do.
 app.use('/api/admin', usersRouter);
 
 // Device management, subscriptions, plan catalogue and Razorpay payments
@@ -152,7 +149,6 @@ const handler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// Get Overview Stats
 app.get(
   '/api/admin/stats',
   handler(async (req, res) => {
@@ -176,7 +172,6 @@ app.get(
   })
 );
 
-// Get Tenants List
 app.get(
   '/api/admin/tenants',
   handler(async (req, res) => {
@@ -206,7 +201,6 @@ const uniqueSlugFor = async (name) => {
   return `${base}${n}`;
 };
 
-// Create New Tenant Shop (Provisions unique DB)
 app.post(
   '/api/admin/tenants',
   handler(async (req, res) => {
@@ -276,7 +270,6 @@ app.post(
   })
 );
 
-// Toggle Tenant Status (Activate / Deactivate)
 app.patch(
   '/api/admin/tenants/:id/status',
   handler(async (req, res) => {
@@ -304,7 +297,6 @@ app.patch(
   })
 );
 
-// Update Tenant Profile Details
 app.put(
   '/api/admin/tenants/:id',
   handler(async (req, res) => {
@@ -422,7 +414,6 @@ app.get('/api/admin/features', (req, res) => {
   res.json({ success: true, data: FEATURE_CATALOG });
 });
 
-// Get Subscription Plans
 app.get(
   '/api/admin/plans',
   handler(async (req, res) => {
@@ -431,7 +422,6 @@ app.get(
   })
 );
 
-// Update Subscription Plan Details
 app.put(
   '/api/admin/plans/:id',
   handler(async (req, res) => {
@@ -455,7 +445,6 @@ app.put(
   })
 );
 
-// Database Health & Pool Diagnostics — read from the tenant databases themselves.
 app.get(
   '/api/admin/database/health',
   handler(async (req, res) => {
@@ -492,7 +481,6 @@ app.get(
   })
 );
 
-// Audit Logs Endpoint
 app.get(
   '/api/admin/audit-logs',
   handler(async (req, res) => {
@@ -501,7 +489,6 @@ app.get(
   })
 );
 
-// Platform Settings Endpoints
 app.get(
   '/api/admin/settings',
   handler(async (req, res) => {
@@ -761,16 +748,13 @@ app.post(
 
 // --- POS TERMINAL ENDPOINTS ---
 
-// Tenant Resolution Middleware for POS routes
 app.use('/api/pos', resolveTenantDb);
 
 // Plan-based feature gate — a shop cannot call into a module its tier excludes.
 app.use('/api/pos', enforcePlanFeatures);
 
-// API Routes
 app.use('/api/pos', apiRoutes);
 
-// Consolidated Health Check Endpoint
 app.get('/api/health', async (req, res) => {
   const connected = await ensureMasterDB();
 
@@ -799,11 +783,9 @@ app.get('/api/health', async (req, res) => {
   });
 });
 
-// Global Error Handling Middlewares
 app.use(notFoundHandler);
 app.use(errorHandler);
 
-// Start Server if launched directly
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`🚀 [Selsolve Unified Master Backend] Running on http://localhost:${PORT}`);

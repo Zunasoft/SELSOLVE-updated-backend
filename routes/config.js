@@ -229,7 +229,6 @@ router.post('/hardware/barcode-label', (req, res) => {
 
 /* ------------------------------ users & roles ------------------------------ */
 
-/** Human labels for the permission matrix columns. */
 const PERMISSION_LABELS = {
   canDiscount: 'Apply discount',
   canVoidBill: 'Void / cancel bill',

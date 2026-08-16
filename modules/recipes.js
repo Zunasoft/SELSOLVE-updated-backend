@@ -1,13 +1,3 @@
-/**
- * Composite items — Module 18 of the SOW.
- *
- * A composite product (a thali, a gift hamper, a cup of tea) has no stock of its
- * own: selling one consumes the raw materials in its recipe. That relationship
- * belongs to the product, so it is captured on the Add/Edit Product screen in
- * Inventory rather than on a separate settings page — this module is the shared
- * logic both the product endpoints and the standalone `/recipes` endpoints use,
- * so the two can never disagree about what a recipe is.
- */
 
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -68,7 +58,6 @@ function buildRecipe(store, product, payload = {}) {
     throw new Error('That recipe is circular — one of the raw materials is itself made from this product.');
   }
 
-  const yieldQty = Number(payload.yieldQty) > 0 ? Number(payload.yieldQty) : 1;
   const batchCost = ingredients.reduce((sum, i) => sum + i.cost * i.qty, 0);
 
   const existing = (store.recipes || []).find((r) => r.productId === product.id);
@@ -77,11 +66,10 @@ function buildRecipe(store, product, payload = {}) {
     id: existing?.id || `rec_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
     productId: product.id,
     productName: product.name,
-    yieldQty,
+    yieldQty: 1,
     ingredients,
-    // Cost of one sellable unit, which is what drives the margin shown on the
-    // product form and keeps COGS honest when the composite is billed.
-    unitCost: r2(batchCost / yieldQty),
+    // Cost of one sellable unit — 1:1 with batch cost (no yield multiplier).
+    unitCost: r2(batchCost),
     batchCost: r2(batchCost),
     notes: payload.notes || existing?.notes || '',
     createdAt: existing?.createdAt || new Date().toISOString(),
@@ -89,7 +77,6 @@ function buildRecipe(store, product, payload = {}) {
   };
 }
 
-/** Replace (or remove) the recipe attached to a product. */
 function setRecipe(store, product, payload) {
   if (!Array.isArray(store.recipes)) store.recipes = [];
 
@@ -110,7 +97,7 @@ function setRecipe(store, product, payload) {
   // Mirrored onto the product so a single GET /products call is enough to render
   // the recipe back into the edit form.
   product.recipeItems = recipe.ingredients;
-  product.recipeYieldQty = recipe.yieldQty;
+  product.recipeYieldQty = 1;
   product.recipeUnitCost = recipe.unitCost;
   // A composite is costed from its ingredients, never from a typed-in figure.
   product.purchasePrice = recipe.unitCost;
@@ -139,14 +126,14 @@ function decorateRecipe(store, recipe) {
   });
 
   const batchCost = ingredients.reduce((sum, i) => sum + (i.cost || 0) * i.qty, 0);
-  const unitCost = r2(batchCost / (recipe.yieldQty || 1));
+  const unitCost = r2(batchCost);
 
   // How many sellable units the raw materials on hand can actually produce —
-  // the number a kitchen cares about before it puts an item on the board.
+  // strict 1:1 ratio with listed ingredients.
   const producible = ingredients.length
     ? Math.floor(
         Math.min(
-          ...ingredients.map((i) => (i.qty > 0 ? (i.available / i.qty) * (recipe.yieldQty || 1) : 0))
+          ...ingredients.map((i) => (i.qty > 0 ? i.available / i.qty : 0))
         )
       )
     : 0;
@@ -168,12 +155,12 @@ function decorateRecipe(store, recipe) {
 
 /**
  * Extract a recipe payload from a product form submission. The client may send
- * it as `recipe`, or flat as `recipeItems` + `recipeYieldQty`.
+ * it as `recipe`, or flat as `recipeItems`.
  */
 function recipeFromProductPayload(payload = {}) {
   if (payload.recipe && typeof payload.recipe === 'object') return payload.recipe;
   if (Array.isArray(payload.recipeItems)) {
-    return { ingredients: payload.recipeItems, yieldQty: payload.recipeYieldQty, notes: payload.recipeNotes };
+    return { ingredients: payload.recipeItems, yieldQty: 1, notes: payload.recipeNotes };
   }
   return null;
 }

@@ -1,27 +1,4 @@
-/**
- * Plan-wise feature availability — Module 1 of the SOW.
- *
- * One catalogue, used by every layer that has an opinion about what a shop is
- * allowed to do:
- *
- *   • Super Admin plan editor  — chooses which features a tier includes
- *   • Tenant provisioning      — stamps the plan's features onto the shop
- *   • POS feature middleware   — refuses calls into a feature the plan excludes
- *   • POS client               — hides tabs the plan does not include
- *
- * Keeping the list here means adding a feature is a one-line change that shows
- * up in all four places at once.
- */
 
-/**
- * Every toggleable capability, in the order the Super Admin console shows them.
- *
- * `core: true` means the module ships with every shop on every tier and can
- * never be switched off. That covers the whole standard POS — billing, stock,
- * parties, purchases, accounts, reports — because those are what the product
- * *is*; gating them would take working modules away from shops that already
- * depend on them. Only the genuine differentiators below are sold by tier.
- */
 const FEATURE_CATALOG = [
   { key: 'dashboard', label: 'Shop Dashboard', group: 'Core', core: true },
   { key: 'billing', label: 'POS Billing', group: 'Core', core: true },
