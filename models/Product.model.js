@@ -1,6 +1,3 @@
-/**
- * Product Mongoose Schema
- */
 
 const mongoose = require('mongoose');
 
@@ -31,13 +28,26 @@ const productSchema = new mongoose.Schema(
     purchasePrice: { type: Number, default: 0 },
     wholesalePrice: { type: Number, default: 0 },
     specialPrice: { type: Number, default: 0 },
+    pricingHistory: [
+      {
+        date: String,
+        oldPrice: Number,
+        newPrice: Number,
+        oldPurchasePrice: Number,
         newPurchasePrice: Number,
         updatedBy: String
       }
     ],
+    isComposite: { type: Boolean, default: false },
+    comboItems: [{ productId: String, qty: Number }],
+    recipeItems: [{ productId: String, name: String, qty: Number, unit: String, cost: Number }],
+    recipeYieldQty: { type: Number, default: 1 },
+    recipeNotes: { type: String, default: '' },
+    useCustomPricing: { type: Boolean, default: false },
+    warehouses: { type: Map, of: Number },
     isActive: { type: Boolean, default: true }
   },
-  { timestamps: true }
+  { timestamps: true, strict: false }
 );
 
 module.exports = mongoose.models.Product || mongoose.model('Product', productSchema);

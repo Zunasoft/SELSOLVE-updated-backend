@@ -38,7 +38,6 @@ function request(method, path, body = null) {
 async function run() {
   server = app.listen(5099, async () => {
     console.log('🚀 Internal test server listening on 5099');
-    }
   });
 }
 

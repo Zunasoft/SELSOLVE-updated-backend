@@ -332,15 +332,29 @@ function seedAccounting(store, { openingCash = 0, openingBank = 0, bankName = 'H
   }
 }
 
-function logStockMovement(store, { product, type, qtyChange, reason, refId, user }) {
+function logStockMovement(store, { product, type, qtyChange, reason, refId, user, timestamp }) {
+  const now = new Date();
+  const isoTimestamp = timestamp || now.toISOString();
   const movement = {
     id: `sm_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-    timestamp: new Date().toISOString(),
+    timestamp: isoTimestamp,
+    dateTime: new Date(isoTimestamp).toLocaleString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    }),
+    date: isoTimestamp.split('T')[0],
+    time: new Date(isoTimestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
     productId: product.id,
     productName: product.name,
     type,
     qtyChange,
     resultingStock: product.stock,
+    unit: product.unit || 'pcs',
     reason: reason || type,
     refId: refId || null,
     user: user || 'Owner'

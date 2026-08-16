@@ -14,7 +14,12 @@ const posting = require('../accounting/posting');
 const { setRecipe, removeRecipe, decorateRecipe, recipeFromProductPayload } = require('../modules/recipes');
 
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
-const num = (v, fallback = 0) => (v === undefined || v === null || v === '' ? fallback : Number(v));
+const num = (v, fallback = 0) => {
+  if (v === undefined || v === null || v === '') return fallback;
+  const cleaned = String(v).replace(/[₹$,\s]/g, '');
+  const val = Number(cleaned);
+  return isNaN(val) ? fallback : val;
+};
 const randomBarcode = () => Math.floor(1000000000 + Math.random() * 9000000000).toString();
 
 /**
@@ -142,8 +147,11 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     taxRate: num(payload.taxRate, existing?.taxRate ?? 0),
     isComposite: productType === 'composite' || Boolean(payload.isComposite),
     comboItems: Array.isArray(payload.comboItems) ? payload.comboItems : existing?.comboItems || [],
-    recipeItems: Array.isArray(payload.recipeItems) ? payload.recipeItems : existing?.recipeItems || [],
-    pricingHistory,
+    customSubUnitName: payload.customSubUnitName ?? existing?.customSubUnitName ?? '',
+    customSubUnitFactor: num(payload.customSubUnitFactor, existing?.customSubUnitFactor ?? 0),
+    customSubUnitPrice: num(payload.customSubUnitPrice, existing?.customSubUnitPrice ?? 0),
+    customSubUnitBarcode: payload.customSubUnitBarcode ?? existing?.customSubUnitBarcode ?? '',
+    enableMinorUnit: payload.enableMinorUnit !== undefined ? Boolean(payload.enableMinorUnit) : Boolean(existing?.enableMinorUnit),
     isActive: payload.isActive !== undefined ? Boolean(payload.isActive) : existing?.isActive ?? true,
     createdAt: existing?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -284,8 +292,23 @@ exports.getProducts = (req, res) => {
   // fully populated without a second round trip.
   const data = rows.map((p) => {
     if (!p.isComposite && p.productType !== 'composite') return p;
-    const recipe = (store.recipes || []).find((r) => r.productId === p.id);
-    return { ...p, recipe: recipe ? decorateRecipe(store, recipe) : null };
+    let recipe = (store.recipes || []).find((r) => r.productId === p.id);
+    if (!recipe && Array.isArray(p.recipeItems) && p.recipeItems.length) {
+      recipe = {
+        id: `rec_${p.id}`,
+        productId: p.id,
+        productName: p.name,
+        yieldQty: p.recipeYieldQty || 1,
+        ingredients: p.recipeItems,
+        notes: p.recipeNotes || ''
+      };
+    }
+    const decorated = recipe ? decorateRecipe(store, recipe) : null;
+    return {
+      ...p,
+      recipeItems: p.recipeItems?.length ? p.recipeItems : (recipe?.ingredients || []),
+      recipe: decorated
+    };
   });
 
   res.json({ success: true, data });
@@ -473,7 +496,7 @@ exports.getPriceSheets = (req, res) => {
 
 exports.createPriceSheet = (req, res) => {
   const priceSheets = getTenantPriceSheets(req.tenantStore);
-  const { name, code, customerType, pricingMap } = req.body;
+  const { name, code, customerType, defaultDiscountPercent, pricingMap, discountMap } = req.body;
 
   if (!name) return res.status(400).json({ success: false, message: 'Price sheet name is required.' });
 
@@ -482,8 +505,10 @@ exports.createPriceSheet = (req, res) => {
     name,
     code: code || name.toUpperCase().replace(/[^A-Z0-9]/g, '_'),
     customerType: customerType || 'Retail',
+    defaultDiscountPercent: Number(defaultDiscountPercent) || 0,
     isActive: true,
     pricingMap: pricingMap || {},
+    discountMap: discountMap || {},
     createdAt: new Date().toISOString()
   };
 
@@ -497,12 +522,14 @@ exports.updatePriceSheet = (req, res) => {
   const sheet = priceSheets.find((s) => s.id === req.params.id);
   if (!sheet) return res.status(404).json({ success: false, message: 'Price sheet not found.' });
 
-  const { name, code, customerType, isActive, pricingMap } = req.body;
+  const { name, code, customerType, defaultDiscountPercent, isActive, pricingMap, discountMap } = req.body;
   if (name) sheet.name = name;
   if (code) sheet.code = code;
   if (customerType) sheet.customerType = customerType;
+  if (defaultDiscountPercent !== undefined) sheet.defaultDiscountPercent = Number(defaultDiscountPercent) || 0;
   if (isActive !== undefined) sheet.isActive = Boolean(isActive);
-  if (pricingMap && typeof pricingMap === 'object') sheet.pricingMap = { ...sheet.pricingMap, ...pricingMap };
+  if (pricingMap && typeof pricingMap === 'object') sheet.pricingMap = { ...pricingMap };
+  if (discountMap && typeof discountMap === 'object') sheet.discountMap = { ...discountMap };
 
   sheet.updatedAt = new Date().toISOString();
 
@@ -578,6 +605,67 @@ exports.updatePriceSheetGrid = (req, res) => {
 
 /* ------------------------------- Bulk Import ------------------------------- */
 
+function normalizeImportRow(row) {
+  if (!row || typeof row !== 'object') return {};
+
+  const cleanNumStr = (v) => {
+    if (v === undefined || v === null) return '';
+    return String(v).replace(/[₹$,\s]/g, '').trim();
+  };
+
+  const getVal = (...keys) => {
+    for (const k of keys) {
+      if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== '') {
+        return String(row[k]).replace(/^\uFEFF/, '').trim();
+      }
+    }
+    const rowKeys = Object.keys(row);
+    for (const k of keys) {
+      const targetClean = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const match = rowKeys.find((rk) => {
+        const rkClean = rk.replace(/^\uFEFF/, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        return rkClean === targetClean;
+      });
+      if (match && row[match] !== undefined && row[match] !== null && String(row[match]).trim() !== '') {
+        return String(row[match]).replace(/^\uFEFF/, '').trim();
+      }
+    }
+    return '';
+  };
+
+  const name = getVal('name', 'productname', 'itemname', 'product', 'item', 'title', 'description', 'itemdescription', 'productdescription');
+  const regionalName = getVal('regionalName', 'regionalname', 'printname', 'localname', 'tamilname', 'regional', 'displayname');
+  const categoryName = getVal('category', 'categoryname', 'group', 'categoryid', 'catname', 'itemcategory');
+  const productType = getVal('productType', 'producttype', 'type', 'itemtype') || 'standard';
+  const unit = getVal('unit', 'uom', 'units', 'baseunit', 'unitofmeasure') || 'pcs';
+  const barcode = getVal('barcode', 'code', 'sku', 'upc', 'itemcode', 'ean', 'barcodeno');
+  const purchasePrice = cleanNumStr(getVal('purchasePrice', 'purchaseprice', 'costprice', 'cost', 'buyprice', 'unitcost', 'purchasecost'));
+  const price = cleanNumStr(getVal('price', 'sellingprice', 'saleprice', 'rate', 'sale_price', 'mrp', 'retailprice', 'unitprice', 'sellprice', 'offerprice', 'netprice'));
+  const mrp = cleanNumStr(getVal('mrp', 'maxretailprice', 'maximumretailprice'));
+  const wholesalePrice = cleanNumStr(getVal('wholesalePrice', 'wholesaleprice', 'wholesale', 'wholesalerate'));
+  const stock = cleanNumStr(getVal('stock', 'qty', 'quantity', 'openingstock', 'currentstock', 'stockqty', 'availableqty', 'onhand'));
+  const minStock = cleanNumStr(getVal('minStock', 'minstock', 'reorderlevel', 'minimumstock', 'minqty'));
+  const hsn = getVal('hsn', 'hsncode', 'sac', 'hsn_code');
+  const taxRate = cleanNumStr(getVal('taxRate', 'taxrate', 'gst', 'tax', 'gstrate', 'taxpercent', 'gstpercent'));
+
+  return {
+    name,
+    regionalName,
+    categoryName,
+    productType,
+    unit,
+    barcode,
+    purchasePrice,
+    price,
+    mrp,
+    wholesalePrice,
+    stock,
+    minStock,
+    hsn,
+    taxRate
+  };
+}
+
 exports.bulkImportProducts = (req, res) => {
   const store = req.tenantStore;
   const { products } = req.body;
@@ -585,45 +673,139 @@ exports.bulkImportProducts = (req, res) => {
     return res.status(400).json({ success: false, message: 'Invalid product list format.' });
   }
 
-  const errors = [];
-  const added = [];
+  if (!Array.isArray(store.categories)) store.categories = [];
   if (!Array.isArray(store.products)) store.products = [];
 
+  const errors = [];
+  const added = [];
+  const updated = [];
+
   for (let i = 0; i < products.length; i++) {
-    const row = products[i];
-    if (!row.name || row.price === undefined || row.price === '') {
-      errors.push({ row: i + 1, name: row.name || 'N/A', message: 'Missing product name or selling price' });
+    const rawRow = products[i];
+    const norm = normalizeImportRow(rawRow);
+
+    // Skip row completely if all values are empty
+    if (!norm.name && norm.price === '' && norm.barcode === '') {
       continue;
     }
 
+    if (!norm.name) {
+      errors.push({ row: i + 1, name: 'N/A', message: 'Missing product name' });
+      continue;
+    }
+
+    // Default price to 0 if empty
+    if (norm.price === '') {
+      norm.price = '0';
+    }
+
     try {
-      const product = shapeProduct(store, row, null, actor(req));
-      store.products.unshift(product);
-      added.push(product);
+      // Auto-resolve or create category
+      let categoryId = 'cat_1';
+      if (norm.categoryName) {
+        const catNameClean = norm.categoryName.trim();
+        let cat = store.categories.find(
+          (c) => c.name.toLowerCase() === catNameClean.toLowerCase() || c.id === catNameClean
+        );
+        if (!cat) {
+          cat = {
+            id: `cat_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+            name: catNameClean,
+            description: 'Auto-created during CSV import',
+            createdAt: new Date().toISOString()
+          };
+          store.categories.push(cat);
+        }
+        categoryId = cat.id;
+      } else if (store.categories[0]) {
+        categoryId = store.categories[0].id;
+      }
+
+      // Auto-register unit if missing
+      if (norm.unit && Array.isArray(store.units)) {
+        const cleanUnit = norm.unit.toLowerCase();
+        if (!store.units.includes(cleanUnit)) {
+          store.units.push(cleanUnit);
+        }
+      }
+
+      const payload = {
+        ...norm,
+        categoryId
+      };
+
+      // Match existing product by Barcode first, then by Name (case-insensitive)
+      let existingProduct = null;
+      if (norm.barcode) {
+        existingProduct = store.products.find(
+          (p) => p.barcode === norm.barcode || (Array.isArray(p.barcodes) && p.barcodes.includes(norm.barcode))
+        );
+      }
+      if (!existingProduct && norm.name) {
+        existingProduct = store.products.find(
+          (p) => p.name.toLowerCase() === norm.name.toLowerCase()
+        );
+      }
+
+      if (existingProduct) {
+        const oldStock = existingProduct.stock;
+        const shaped = shapeProduct(store, payload, existingProduct, actor(req));
+        Object.assign(existingProduct, shaped);
+        updated.push(existingProduct);
+
+        const qtyDiff = existingProduct.stock - oldStock;
+        if (qtyDiff !== 0) {
+          logStockMovement(store, {
+            product: existingProduct,
+            type: 'ADJUSTMENT',
+            qtyChange: qtyDiff,
+            reason: `CSV Bulk Import Update (stock changed from ${oldStock} to ${existingProduct.stock})`,
+            user: actor(req)
+          });
+        }
+      } else {
+        const product = shapeProduct(store, payload, null, actor(req));
+        store.products.unshift(product);
+        added.push(product);
+
+        if (product.stock !== 0) {
+          logStockMovement(store, {
+            product,
+            type: 'OPENING',
+            qtyChange: product.stock,
+            reason: 'CSV Bulk Import Initial Stock',
+            user: actor(req)
+          });
+        }
+      }
     } catch (e) {
-      errors.push({ row: i + 1, name: row.name, message: e.message });
+      errors.push({ row: i + 1, name: norm.name || 'N/A', message: e.message });
     }
   }
 
-  const stockValue = added.reduce((s, p) => s + (p.productType === 'service' ? 0 : p.stock * p.purchasePrice), 0);
+  const affectedProducts = [...added, ...updated];
+  const stockValue = affectedProducts.reduce((s, p) => s + (p.productType === 'service' ? 0 : p.stock * p.purchasePrice), 0);
   if (stockValue > 0) {
     posting.postStockAdjustment(
       store,
-      { id: `bulk_${Date.now()}`, productName: `${added.length} imported products`, reason: 'Bulk import', value: stockValue, date: new Date().toISOString() },
+      { id: `bulk_${Date.now()}`, productName: `${affectedProducts.length} imported/updated products`, reason: 'Bulk CSV import/update', value: stockValue, date: new Date().toISOString() },
       { createdBy: actor(req) }
     );
   }
 
-  res.status(201).json({
+  const message = `Bulk import complete: ${added.length} new created, ${updated.length} updated${errors.length ? `, ${errors.length} skipped.` : '.'}`;
+
+  res.status(200).json({
     success: true,
-    message: `Successfully imported ${added.length} product(s)${errors.length ? `, ${errors.length} record(s) failed validation.` : '.'}`,
+    message,
     summary: {
       total: products.length,
       importedCount: added.length,
+      updatedCount: updated.length,
       failedCount: errors.length,
       errors
     },
-    data: added
+    data: affectedProducts
   });
 };
 
