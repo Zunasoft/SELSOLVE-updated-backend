@@ -327,6 +327,31 @@ function postPayment(store, payment, { vendor, createdBy } = {}) {
   });
 }
 
+/**
+ * Vendor repayment / refund — vendor pays money back into cash drawer (clearing debt/balance).
+ *   Dr Cash / Bank        money received
+ *      Cr Vendor Account  debt / payable cleared
+ */
+function postVendorRefund(store, { amount, vendor, notes, createdBy } = {}) {
+  const value = r2(amount);
+  const partyAccount = ensurePartyAccount(store, vendor, 'VENDOR');
+  const cash = bySystemKey(store, 'CASH') || { id: 'acc_cash' };
+
+  return postJournal(store, {
+    type: 'RECEIPT',
+    date: new Date().toISOString(),
+    narration: notes || `Cash debt repayment / refund from ${vendor.name}`,
+    refType: 'VENDOR_REFUND',
+    partyId: vendor.id,
+    paymentMode: 'Cash',
+    createdBy,
+    lines: [
+      { accountId: cash.id, debit: value },
+      { accountId: partyAccount.id, credit: value, partyId: vendor.id, narration: `Cash repayment from ${vendor.name}` }
+    ].filter((l) => l.accountId)
+  });
+}
+
 /** Fund transfer between two cash/bank ledgers (contra voucher). */
 function postFundTransfer(store, transfer, { createdBy } = {}) {
   const amount = r2(transfer.amount);
@@ -426,6 +451,7 @@ module.exports = {
   postIncome,
   postReceipt,
   postPayment,
+  postVendorRefund,
   postFundTransfer,
   postOpeningBalance,
   postStockAdjustment

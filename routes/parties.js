@@ -365,14 +365,100 @@ router.put('/vendors/:id', async (req, res) => {
   const vendor = store.vendors.find((v) => v.id === req.params.id);
   if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found.' });
 
-  const { outstandingPayable, id, ...safe } = req.body;
-  Object.assign(vendor, safe);
+  const {
+    name,
+    phone,
+    email,
+    gstin,
+    address,
+    category,
+    contactPerson,
+    paymentTerms,
+    outstandingPayable,
+    changeReason
+  } = req.body;
+
+  const changedFields = [];
+
+  const compareAndTrack = (field, label, newVal, oldVal) => {
+    if (newVal !== undefined && String(newVal ?? '').trim() !== String(oldVal ?? '').trim()) {
+      changedFields.push({
+        field: label || field,
+        old: oldVal || '—',
+        new: newVal || '—'
+      });
+    }
+  };
+
+  compareAndTrack('name', 'Vendor Name', name, vendor.name);
+  compareAndTrack('phone', 'Phone Number', phone, vendor.phone);
+  compareAndTrack('email', 'Email Address', email, vendor.email);
+  compareAndTrack('gstin', 'GSTIN', gstin, vendor.gstin);
+  compareAndTrack('address', 'Address', address, vendor.address);
+  compareAndTrack('category', 'Category', category, vendor.category);
+  compareAndTrack('contactPerson', 'Contact Person', contactPerson, vendor.contactPerson);
+  compareAndTrack('paymentTerms', 'Payment Terms', paymentTerms, vendor.paymentTerms);
+
+  // Apply core field updates
+  if (name !== undefined) vendor.name = name;
+  if (phone !== undefined) vendor.phone = phone;
+  if (email !== undefined) vendor.email = email;
+  if (gstin !== undefined) vendor.gstin = gstin;
+  if (address !== undefined) vendor.address = address;
+  if (category !== undefined) vendor.category = category;
+  if (contactPerson !== undefined) vendor.contactPerson = contactPerson;
+  if (paymentTerms !== undefined) vendor.paymentTerms = paymentTerms;
+
+  const account = engine.ensurePartyAccount(store, vendor, 'VENDOR');
+
+  // Handle editable Amount Payable adjustment
+  if (outstandingPayable !== undefined && outstandingPayable !== null && outstandingPayable !== '') {
+    const newPayable = Number(outstandingPayable) || 0;
+    const currentPayable = Number(vendor.outstandingPayable || 0);
+
+    if (Math.abs(newPayable - currentPayable) > 0.001) {
+      changedFields.push({
+        field: 'Amount Payable',
+        old: `₹${currentPayable.toLocaleString('en-IN')}`,
+        new: `₹${newPayable.toLocaleString('en-IN')}`
+      });
+
+      const diff = newPayable - currentPayable;
+      posting.postOpeningBalance(store, {
+        accountId: account.id,
+        amount: Math.abs(diff),
+        side: diff > 0 ? 'CR' : 'DR',
+        createdBy: actor(req)
+      });
+      vendor.outstandingPayable = newPayable;
+      vendor.outstanding = newPayable;
+    }
+  }
+
+  // Record modification history entry if any fields changed
+  if (changedFields.length > 0) {
+    vendor.history = vendor.history || [];
+    vendor.history.unshift({
+      id: `vh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: new Date().toISOString(),
+      user: actor(req),
+      reason: changeReason || 'Vendor details updated',
+      changes: changedFields
+    });
+  }
+
   await savePartyToDb(req.tenantDbName, { ...vendor, type: 'vendor' });
 
-  const account = (store.accounts || []).find((a) => a.partyId === vendor.id && a.partyType === 'VENDOR');
   if (account) account.name = vendor.name;
 
-  res.json({ success: true, data: vendor });
+  res.json({ success: true, message: 'Vendor details updated successfully.', data: vendor });
+});
+
+router.get('/vendors/:id/history', (req, res) => {
+  const store = req.tenantStore;
+  const vendor = (store.vendors || []).find((v) => v.id === req.params.id);
+  if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found.' });
+  res.json({ success: true, data: vendor.history || [] });
 });
 
 router.delete('/vendors/:id', (req, res) => {

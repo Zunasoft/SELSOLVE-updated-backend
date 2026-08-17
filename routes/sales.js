@@ -29,9 +29,11 @@ router.get('/init', (req, res) => {
       products: store.products || [],
       session: store.session,
       customers: store.customers || [],
+      vendors: store.vendors || [],
       heldBills: store.heldBills || [],
       tables: store.tables || [],
       settings: store.settings,
+      priceSheets: store.priceSheets || [],
       users: (store.users || []).map(({ pin, ...u }) => u)
     }
   });
@@ -183,6 +185,37 @@ function deductStock(store, items, orderId, user) {
           type: 'SALE',
           qtyChange: -deducted,
           reason: `Consumed in ${product.name} (Sold on ${orderId})`,
+          refId: orderId,
+          user
+        });
+      });
+      return;
+    }
+
+    const isCombo = product.isCombo || product.productType === 'combo';
+    const comboItems = product.comboItems || product.bundleItems || [];
+    if (isCombo && comboItems.length > 0) {
+      comboItems.forEach((ci) => {
+        const comp = store.products.find((p) => p.id === ci.productId || p.id === ci.id);
+        if (!comp) return;
+        const compQty = Number(ci.qty || ci.quantity || 1);
+        const deducted = Math.round(compQty * soldQty * 10000) / 10000;
+
+        if (comp.stock < deducted) {
+          shortages.push({ name: comp.name, available: comp.stock });
+        }
+
+        comp.stock = Math.max(0, Math.round((Number(comp.stock || 0) - deducted) * 10000) / 10000);
+        if (comp.warehouses) {
+          comp.warehouses['wh_shop'] = Math.max(0, Math.round((Number(comp.warehouses['wh_shop'] || 0) - deducted) * 10000) / 10000);
+          comp.stock = Object.values(comp.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
+        }
+
+        logStockMovement(store, {
+          product: comp,
+          type: 'SALE',
+          qtyChange: -deducted,
+          reason: `Bundled in combo ${product.name} (Sold on ${orderId})`,
           refId: orderId,
           user
         });
@@ -449,6 +482,33 @@ router.post('/orders/:orderId/void', (req, res) => {
       return;
     }
 
+    const isCombo = product.isCombo || product.productType === 'combo';
+    const comboItems = product.comboItems || product.bundleItems || [];
+    if (isCombo && comboItems.length > 0) {
+      comboItems.forEach((ci) => {
+        const comp = store.products.find((p) => p.id === ci.productId || p.id === ci.id);
+        if (!comp) return;
+        const compQty = Number(ci.qty || ci.quantity || 1);
+        const returned = Math.round(compQty * soldQty * 10000) / 10000;
+        comp.stock = Math.round((Number(comp.stock || 0) + returned) * 10000) / 10000;
+
+        if (comp.warehouses) {
+          comp.warehouses['wh_shop'] = Math.round((Number(comp.warehouses['wh_shop'] || 0) + returned) * 10000) / 10000;
+          comp.stock = Object.values(comp.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
+        }
+
+        logStockMovement(store, {
+          product: comp,
+          type: 'RETURN',
+          qtyChange: returned,
+          reason: `Void of ${order.orderId} (Restored from combo ${product.name})`,
+          refId: order.orderId,
+          user: actor(req)
+        });
+      });
+      return;
+    }
+
     product.stock = r2(product.stock + soldQty);
     if (product.warehouses) {
       product.warehouses['wh_shop'] = (product.warehouses['wh_shop'] || 0) + soldQty;
@@ -513,15 +573,32 @@ router.get('/sessions', (req, res) => {
 
 router.post('/session/open', (req, res) => {
   const store = req.tenantStore;
-  const openingCash = Number(req.body.openingCash) || 0;
+  const denominations = req.body.denominations || null;
+  let openingCash = Number(req.body.openingCash) || 0;
+
+  if (denominations && typeof denominations === 'object') {
+    const dTotal =
+      (Number(denominations['2000'] || 0) * 2000) +
+      (Number(denominations['500'] || 0) * 500) +
+      (Number(denominations['200'] || 0) * 200) +
+      (Number(denominations['100'] || 0) * 100) +
+      (Number(denominations['50'] || 0) * 50) +
+      (Number(denominations['20'] || 0) * 20) +
+      (Number(denominations['10'] || 0) * 10) +
+      (Number(denominations['coins'] || 0));
+    if (dTotal > 0 || openingCash === 0) {
+      openingCash = dTotal;
+    }
+  }
 
   store.session = {
     id: `sess_${Date.now()}`,
     status: 'open',
     openedAt: new Date().toISOString(),
     openedBy: req.body.user || actor(req),
-    openingCash,
-    currentCash: openingCash,
+    openingCash: r2(openingCash),
+    currentCash: r2(openingCash),
+    openingDenominations: denominations,
     cashEntries: []
   };
 
@@ -534,18 +611,34 @@ router.post('/session/close', (req, res) => {
     return res.status(400).json({ success: false, message: 'No open session to close.' });
   }
 
-  const countedCash = req.body.countedCash !== undefined ? Number(req.body.countedCash) : store.session.currentCash;
-  const sessionOrders = store.orders.filter((o) => o.sessionId === store.session.id && o.status !== 'VOID');
+  const denominations = req.body.closingDenominations || req.body.denominations || null;
+  let countedCash = req.body.countedCash !== undefined ? Number(req.body.countedCash) : store.session.currentCash;
+
+  if (denominations && typeof denominations === 'object') {
+    const dTotal =
+      (Number(denominations['2000'] || 0) * 2000) +
+      (Number(denominations['500'] || 0) * 500) +
+      (Number(denominations['200'] || 0) * 200) +
+      (Number(denominations['100'] || 0) * 100) +
+      (Number(denominations['50'] || 0) * 50) +
+      (Number(denominations['20'] || 0) * 20) +
+      (Number(denominations['10'] || 0) * 10) +
+      (Number(denominations['coins'] || 0));
+    countedCash = dTotal;
+  }
+
+  const sessionOrders = (store.orders || []).filter((o) => o.sessionId === store.session.id && o.status !== 'VOID');
 
   Object.assign(store.session, {
     status: 'closed',
     closedAt: new Date().toISOString(),
     closedBy: req.body.user || actor(req),
-    countedCash,
-    expectedCash: store.session.currentCash,
+    countedCash: r2(countedCash),
+    closingDenominations: denominations,
+    expectedCash: r2(store.session.currentCash),
     variance: r2(countedCash - store.session.currentCash),
     billCount: sessionOrders.length,
-    salesTotal: r2(sessionOrders.reduce((s, o) => s + o.total, 0)),
+    salesTotal: r2(sessionOrders.reduce((s, o) => s + (o.total || 0), 0)),
     notes: req.body.notes || ''
   });
 
@@ -556,50 +649,104 @@ router.post('/session/close', (req, res) => {
 
 router.post('/session/cash-entry', (req, res) => {
   const store = req.tenantStore;
-  const { type, amount, reason, accountId } = req.body;
+  const { type, amount, reason, person, purpose, classification, expenseCategory, accountId, vendorId } = req.body;
   const value = Number(amount);
   if (!value) return res.status(400).json({ success: false, message: 'Amount is required.' });
   if (!store.session || store.session.status !== 'open') {
     return res.status(400).json({ success: false, message: 'Open a counter session first.' });
   }
 
-  store.session.currentCash = r2(type === 'IN' ? store.session.currentCash + value : store.session.currentCash - value);
-  store.session.cashEntries.push({
-    type,
-    amount: value,
-    reason: reason || 'Cash adjustment',
-    time: new Date().toISOString(),
-    user: actor(req)
-  });
+  const isUnofficial = classification === 'UNOFFICIAL';
+  const isExpense = classification === 'EXPENSE' || type === 'EXPENSE';
+  const isVendorRepay = classification === 'VENDOR_REPAY' || Boolean(vendorId);
+  const effectiveType = isExpense ? 'OUT' : (type === 'IN' ? 'IN' : 'OUT');
 
-  // Cash moved in or out of the drawer is a real fund transfer, so it posts.
-  let voucherNo = null;
-  try {
-    const cash = engine.bySystemKey(store, 'CASH');
-    const bank = (store.accounts || []).find((a) => a.systemKey === 'BANK');
-    const counter = accountId ? engine.resolveAccount(store, accountId) : bank;
+  store.session.currentCash = r2(
+    effectiveType === 'IN'
+      ? store.session.currentCash + value
+      : store.session.currentCash - value
+  );
 
-    if (counter && counter.id !== cash.id) {
-      const voucher = posting.postFundTransfer(
-        store,
-        {
-          id: `cashentry_${Date.now()}`,
-          fromAccountId: type === 'IN' ? counter.id : cash.id,
-          toAccountId: type === 'IN' ? cash.id : counter.id,
-          amount: value,
-          charges: 0,
-          notes: reason || `Counter cash ${type}`,
-          date: new Date().toISOString()
-        },
-        { createdBy: actor(req) }
-      );
-      voucherNo = voucher.voucherNo;
-    }
-  } catch (err) {
-    /* the drawer entry still stands even if the contra could not be posted */
+  let vendorObj = null;
+  if (isVendorRepay) {
+    vendorObj = (store.vendors || []).find((v) => v.id === vendorId || (v.name && person && v.name.toLowerCase() === person.toLowerCase())) || null;
   }
 
-  res.json({ success: true, message: `Cash ${type} entry recorded.`, data: { session: store.session, voucherNo } });
+  const entry = {
+    id: `ce_${Date.now()}`,
+    type: effectiveType,
+    amount: value,
+    classification: isExpense ? 'EXPENSE' : isVendorRepay ? 'VENDOR_REPAY' : isUnofficial ? 'UNOFFICIAL' : 'OFFICIAL',
+    person: (vendorObj ? vendorObj.name : person) || '',
+    vendorId: vendorObj ? vendorObj.id : null,
+    purpose: purpose || reason || (isExpense ? 'Internal business expense' : isVendorRepay ? 'Vendor Debt Repayment / Refund' : `Cash ${effectiveType}`),
+    expenseCategory: expenseCategory || (isExpense ? 'General' : null),
+    reason: reason || purpose || `Cash ${effectiveType}`,
+    time: new Date().toISOString(),
+    user: actor(req)
+  };
+
+  store.session.cashEntries.push(entry);
+
+  let voucherNo = null;
+  // Official fund transfers, vendor repayments, or expenses post to double-entry ledger
+  if (!isUnofficial) {
+    try {
+      const cash = engine.bySystemKey(store, 'CASH');
+      if (isVendorRepay && vendorObj) {
+        const voucher = posting.postVendorRefund(store, {
+          amount: value,
+          vendor: vendorObj,
+          notes: `${entry.purpose} (Vendor: ${vendorObj.name})`,
+          createdBy: actor(req)
+        });
+        voucherNo = voucher.voucherNo;
+      } else if (isExpense) {
+        const expenseAcc = (store.accounts || []).find((a) => a.type === 'EXPENSE') || { id: 'acc_gen_expense' };
+        const voucher = posting.postDirectExpense(
+          store,
+          {
+            id: `exp_${Date.now()}`,
+            accountId: expenseAcc.id,
+            paidFromAccountId: cash.id,
+            amount: value,
+            taxAmount: 0,
+            notes: `${expenseCategory ? `[${expenseCategory}] ` : ''}${entry.purpose} (Recipient: ${person || 'N/A'})`,
+            date: new Date().toISOString()
+          },
+          { createdBy: actor(req) }
+        );
+        voucherNo = voucher.voucherNo;
+      } else {
+        const bank = (store.accounts || []).find((a) => a.systemKey === 'BANK');
+        const counter = accountId ? engine.resolveAccount(store, accountId) : bank;
+        if (counter && counter.id !== cash.id) {
+          const voucher = posting.postFundTransfer(
+            store,
+            {
+              id: `cashentry_${Date.now()}`,
+              fromAccountId: effectiveType === 'IN' ? counter.id : cash.id,
+              toAccountId: effectiveType === 'IN' ? cash.id : counter.id,
+              amount: value,
+              charges: 0,
+              notes: `${entry.purpose}${person ? ` (Person: ${person})` : ''}`,
+              date: new Date().toISOString()
+            },
+            { createdBy: actor(req) }
+          );
+          voucherNo = voucher.voucherNo;
+        }
+      }
+    } catch (err) {
+      /* the drawer entry still stands even if double-entry posting fails */
+    }
+  }
+
+  res.json({
+    success: true,
+    message: `${entry.classification === 'EXPENSE' ? 'Expense' : isUnofficial ? 'Unofficial cash' : 'Cash'} ${effectiveType} recorded.`,
+    data: { session: store.session, entry, voucherNo }
+  });
 });
 
 /* --------------------------------- tables --------------------------------- */
