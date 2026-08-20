@@ -89,8 +89,17 @@ router.put('/customers/:id', async (req, res) => {
   const customer = store.customers.find((c) => c.id === req.params.id);
   if (!customer) return res.status(404).json({ success: false, message: 'Customer not found.' });
 
-  const { outstanding, loyaltyPoints, id, ...safe } = req.body;
-  Object.assign(customer, safe);
+  // Whitelisted so the edit form's shared field set (it also carries vendor-only
+  // keys like `outstandingPayable`/`changeReason` in its state object) can never
+  // leak stray properties onto the customer record or clobber its field types.
+  const { name, phone, email, address, group, creditLimit, gstin } = req.body;
+  if (name !== undefined) customer.name = name;
+  if (phone !== undefined) customer.phone = phone;
+  if (email !== undefined) customer.email = email;
+  if (address !== undefined) customer.address = address;
+  if (group !== undefined) customer.group = group;
+  if (creditLimit !== undefined) customer.creditLimit = Number(creditLimit) || 0;
+  if (gstin !== undefined) customer.gstin = gstin;
   await savePartyToDb(req.tenantDbName, { ...customer, type: 'customer' });
 
   const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
@@ -193,11 +202,7 @@ router.post('/customers/:id/send-whatsapp', (req, res) => {
   });
 });
 
-/* ---------------------------- customer groups ----------------------------
- * Groups carry a default discount and an optional price sheet, which is what
- * makes "allocate this customer to Wholesale" mean something at the counter
- * rather than being a label.
- */
+
 
 function getGroups(store) {
   if (!Array.isArray(store.customerGroups) || store.customerGroups.length === 0) {
@@ -431,7 +436,6 @@ router.put('/vendors/:id', async (req, res) => {
         createdBy: actor(req)
       });
       vendor.outstandingPayable = newPayable;
-      vendor.outstanding = newPayable;
     }
   }
 
@@ -463,11 +467,29 @@ router.get('/vendors/:id/history', (req, res) => {
 
 router.delete('/vendors/:id', (req, res) => {
   const store = req.tenantStore;
-  if ((store.purchases || []).some((p) => p.vendorId === req.params.id)) {
+  const vendor = (store.vendors || []).find((v) => v.id === req.params.id);
+  if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found.' });
+
+  if ((store.purchases || []).some((p) => p.vendorId === vendor.id)) {
     return res.status(400).json({ success: false, message: 'Vendor has purchase history and cannot be deleted.' });
   }
-  store.vendors = store.vendors.filter((v) => v.id !== req.params.id);
-  res.json({ success: true, message: 'Vendor removed.' });
+
+  // Mirrors the customer guard: a vendor with money still owed to them must not
+  // be removable, or the payable becomes permanently invisible while the ledger
+  // that tracks it silently keeps the real balance forever.
+  const balance = ledgerBalance(store, vendor.id, 'VENDOR');
+  if (Math.abs(balance) > 0.009) {
+    return res.status(400).json({
+      success: false,
+      message: `${vendor.name} has an open balance of ₹${Math.abs(balance).toFixed(2)}. Settle it before removing the vendor.`
+    });
+  }
+
+  store.vendors = store.vendors.filter((v) => v.id !== vendor.id);
+  store.accounts = (store.accounts || []).filter(
+    (a) => !(a.partyId === vendor.id && a.partyType === 'VENDOR')
+  );
+  res.json({ success: true, message: `${vendor.name} removed.` });
 });
 
 router.get('/vendors/:id/ledger', (req, res) => {
@@ -486,7 +508,9 @@ router.get('/purchases', (req, res) => {
   const store = req.tenantStore;
   const { vendorId, from, to } = req.query;
 
-  let rows = store.purchases || [];
+  let rows = [...(store.purchases || [])];
+  rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
   if (vendorId) rows = rows.filter((p) => p.vendorId === vendorId);
   if (from) rows = rows.filter((p) => engine.dayKey(p.date) >= engine.dayKey(from));
   if (to) rows = rows.filter((p) => engine.dayKey(p.date) <= engine.dayKey(to));
@@ -496,8 +520,8 @@ router.get('/purchases', (req, res) => {
     data: rows,
     summary: {
       count: rows.length,
-      total: r2(rows.reduce((s, p) => s + p.totalAmount, 0)),
-      unpaid: r2(rows.filter((p) => p.paymentStatus !== 'PAID').reduce((s, p) => s + p.totalAmount, 0))
+      total: r2(rows.reduce((s, p) => s + (Number(p.totalAmount) || 0), 0)),
+      unpaid: r2(rows.filter((p) => p.paymentStatus !== 'PAID').reduce((s, p) => s + (Number(p.totalAmount) || 0), 0))
     }
   });
 });
@@ -561,7 +585,12 @@ router.post('/purchases', (req, res) => {
     const product = store.products.find((p) => p.id === line.productId || p.name === line.name);
     if (!product) return;
     const qty = Number(line.qty);
-    product.stock = r2(product.stock + qty);
+    product.stock = r2(Number(product.stock || 0) + qty);
+    if (product.warehouses && typeof product.warehouses === 'object') {
+      const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+      product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) + qty);
+      product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+    }
     if (Number(line.rate)) product.purchasePrice = Number(line.rate);
     logStockMovement(store, {
       product,

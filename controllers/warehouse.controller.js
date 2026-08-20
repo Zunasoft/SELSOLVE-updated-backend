@@ -95,6 +95,20 @@ exports.deleteWarehouse = async (req, res) => {
     return res.status(400).json({ success: false, message: 'Cannot delete the default warehouse.' });
   }
 
+  // A warehouse still holding stock cannot go — deleting it out from under its
+  // products would strand that quantity in a warehouse key no product form or
+  // transfer screen can address again, while it keeps counting toward the
+  // product's total stock as if it were still reachable.
+  const strandedStock = (store.products || []).some(
+    (p) => p.warehouses && typeof p.warehouses === 'object' && Number(p.warehouses[wh.id] || 0) > 0
+  );
+  if (strandedStock) {
+    return res.status(400).json({
+      success: false,
+      message: `"${wh.name}" still holds stock. Transfer all remaining stock out of this warehouse before deleting it.`
+    });
+  }
+
   store.warehouses.splice(index, 1);
 
   res.json({ success: true, message: 'Warehouse deleted.' });

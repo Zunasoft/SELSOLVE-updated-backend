@@ -106,12 +106,17 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
     lines: lines.filter((l) => l.accountId)
   });
 
-  // Cost of goods sold moves value out of inventory into the P&L.
+  // Cost of goods sold moves value out of inventory into the P&L. `purchasePrice`
+  // is quoted per base unit, so it must be costed against the base-unit quantity
+  // actually deducted from stock (`item.baseQty`) — not the as-sold `item.qty`,
+  // which is in whatever unit the line was billed in (e.g. grams vs. kg) and can
+  // overstate COGS by orders of magnitude otherwise.
   const cogsAmount = r2(
     (order.items || []).reduce((sum, item) => {
       const product = (store.products || []).find((p) => p.id === item.id || p.name === item.name);
       const cost = Number(item.purchasePrice ?? product?.purchasePrice ?? 0);
-      return sum + cost * Number(item.qty || 0);
+      const qty = Number(item.baseQty ?? item.qty ?? 0);
+      return sum + cost * qty;
     }, 0)
   );
 

@@ -6,6 +6,7 @@
 
 const express = require('express');
 const engine = require('../accounting/engine');
+const { calculateProductStock } = require('../store');
 
 const router = express.Router();
 const r2 = engine.r2;
@@ -27,38 +28,68 @@ const windowed = (store, req) =>
 
 router.get('/analytics', (req, res) => {
   const store = req.tenantStore;
-  const orders = liveOrders(store);
+  const orders = [...liveOrders(store)].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
   const today = dayKey(new Date());
   const monthStart = `${today.slice(0, 7)}-01`;
 
   const todays = orders.filter((o) => dayKey(o.date) === today);
   const monthly = orders.filter((o) => dayKey(o.date) >= monthStart);
 
-  const cash = engine.balanceOf(store, 'CASH');
+  // Cash in hand mirrors the Bank Balance calc just below: sum every account of
+  // that kind, not just the first one. A shop with a second cash drawer/account
+  // must not have it silently dropped from this tile.
+  const cash = r2(
+    (store.accounts || [])
+      .filter((a) => a.systemKey === 'CASH')
+      .reduce((s, a) => s + engine.accountBalance(store, a.id), 0)
+  );
   const bank = r2(
     (store.accounts || [])
       .filter((a) => a.systemKey === 'BANK')
       .reduce((s, a) => s + engine.accountBalance(store, a.id), 0)
   );
 
-  const lowStock = store.products.filter((p) => p.stock <= (p.minStock ?? 5));
+  // Services carry no stock; composite/combo calculate producible/buyable quantity from raw materials.
+  const products = store.products || [];
+  const recipes = store.recipes || [];
+  const evaluated = products.map((p) => ({
+    product: p,
+    status: calculateProductStock(p, products, recipes)
+  }));
+  const lowStock = evaluated.filter((e) => !e.status.isService && e.status.isLow);
+
+  const todaysTotal = r2(todays.reduce((s, o) => s + (Number(o.total) || 0), 0));
+  const allTimeTotal = r2(orders.reduce((s, o) => s + (Number(o.total) || 0), 0));
 
   res.json({
     success: true,
     data: {
-      todaysSales: r2(todays.reduce((s, o) => s + o.total, 0)),
+      todaysSales: todaysTotal,
       todaysBills: todays.length,
-      monthlySales: r2(monthly.reduce((s, o) => s + o.total, 0)),
+      monthlySales: r2(monthly.reduce((s, o) => s + (Number(o.total) || 0), 0)),
       monthlyBills: monthly.length,
-      averageBillValue: todays.length ? r2(todays.reduce((s, o) => s + o.total, 0) / todays.length) : 0,
+      // Two distinct figures: what today's bills averaged, and what every bill
+      // ever raised has averaged. Conflating them into one field made the
+      // "Average Bill" tile silently show today's number under an "all time"
+      // label whenever there had been at least one sale today.
+      todaysAverageBillValue: todays.length ? r2(todaysTotal / todays.length) : 0,
+      averageBillValue: orders.length ? r2(allTimeTotal / orders.length) : 0,
 
       totalSalesCount: orders.length,
-      totalRevenue: r2(orders.reduce((s, o) => s + o.total, 0)),
-      totalStockItems: r2(store.products.reduce((s, p) => s + p.stock, 0)),
-      stockValue: Math.round(store.products.reduce((s, p) => s + p.stock * p.purchasePrice, 0)),
+      totalRevenue: r2(orders.reduce((s, o) => s + (Number(o.total) || 0), 0)),
+      totalStockItems: r2((store.products || []).reduce((s, p) => s + (Number(p.stock) || 0), 0)),
+      stockValue: Math.round((store.products || []).reduce((s, p) => s + (Number(p.stock) || 0) * (Number(p.purchasePrice || p.costPrice || p.price) || 0), 0)),
       lowStockCount: lowStock.length,
-      lowStockItems: lowStock.slice(0, 10).map((p) => ({ id: p.id, name: p.name, stock: p.stock, minStock: p.minStock, unit: p.unit })),
-      totalExpenses: r2((store.expenses || []).reduce((s, e) => s + e.amount, 0)),
+      lowStockItems: lowStock.slice(0, 10).map((e) => ({
+        id: e.product.id,
+        name: e.product.name,
+        stock: e.status.stock,
+        minStock: e.product.minStock,
+        unit: e.product.unit,
+        isComposite: e.status.isComposite,
+        isCombo: e.status.isCombo
+      })),
+      totalExpenses: r2((store.expenses || []).reduce((s, e) => s + (Number(e.amount) || 0), 0)),
 
       cashInHand: cash,
       bankBalance: bank,
@@ -225,20 +256,22 @@ router.get('/reports/stock', (req, res) => {
       (s, o) => s + (o.items || []).filter((i) => i.id === p.id || i.name === p.name).reduce((q, i) => q + Number(i.qty), 0),
       0
     );
+    const statusInfo = calculateProductStock(p, store.products || [], store.recipes || []);
+    const displayStock = statusInfo.isComposite || statusInfo.isCombo ? statusInfo.stock : p.stock;
     return {
       id: p.id,
       name: p.name,
       category: category ? category.name : '—',
       barcode: p.barcode,
       unit: p.unit,
-      stock: p.stock,
+      stock: displayStock,
       minStock: p.minStock,
       purchasePrice: p.purchasePrice,
       price: p.price,
       valueAtCost: r2(p.stock * p.purchasePrice),
       valueAtRetail: r2(p.stock * p.price),
       sold: r2(sold),
-      status: p.stock <= 0 ? 'OUT_OF_STOCK' : p.stock <= (p.minStock ?? 5) ? 'LOW' : 'HEALTHY'
+      status: statusInfo.isService ? 'HEALTHY' : statusInfo.isOut ? 'OUT_OF_STOCK' : statusInfo.isLow ? 'LOW' : 'HEALTHY'
     };
   });
 

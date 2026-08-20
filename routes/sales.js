@@ -7,6 +7,7 @@ const express = require('express');
 const { logStockMovement } = require('../store');
 const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
+const { decorateRecipe } = require('../modules/recipes');
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const r2 = engine.r2;
@@ -20,13 +21,58 @@ const r2 = engine.r2;
 router.get('/init', (req, res) => {
   const store = req.tenantStore;
 
+  const products = (store.products || []).map((p) => {
+    if (!p.isComposite && p.productType !== 'composite') return p;
+    let recipe = (store.recipes || []).find((r) => r.productId === p.id);
+    if (!recipe && Array.isArray(p.recipeItems) && p.recipeItems.length) {
+      recipe = {
+        id: `rec_${p.id}`,
+        productId: p.id,
+        productName: p.name,
+        yieldQty: 1,
+        ingredients: p.recipeItems,
+        notes: p.recipeNotes || ''
+      };
+    }
+    const decorated = recipe ? decorateRecipe(store, recipe) : null;
+    return {
+      ...p,
+      recipeItems: p.recipeItems?.length ? p.recipeItems : (recipe?.ingredients || []),
+      recipe: decorated
+    };
+  });
+
+  const topBilled = {};
+  const recentBilledIds = [];
+  const seenRecent = new Set();
+
+  (store.orders || []).filter((o) => o.status !== 'VOID').forEach((o) => {
+    (o.items || []).forEach((item) => {
+      const key = item.id || item.productId || item.name;
+      if (key && !seenRecent.has(key)) {
+        seenRecent.add(key);
+        recentBilledIds.push(key);
+      }
+      if (!topBilled[key]) {
+        topBilled[key] = { count: 0, qty: 0 };
+      }
+      topBilled[key].count += 1;
+      topBilled[key].qty = Math.round(((topBilled[key].qty || 0) + (Number(item.qty) || 1)) * 1000) / 1000;
+      if (item.name && item.name !== key && !topBilled[item.name]) {
+        topBilled[item.name] = topBilled[key];
+      }
+    });
+  });
+
   res.json({
     success: true,
     tenantDb: req.tenantDbName,
     shop: req.tenant ? { name: req.tenant.name, email: req.tenant.email, plan: req.tenant.plan } : undefined,
     data: {
       categories: store.categories || [],
-      products: store.products || [],
+      products,
+      topBilled,
+      recentBilledIds,
       session: store.session,
       customers: store.customers || [],
       vendors: store.vendors || [],
@@ -147,6 +193,42 @@ function baseQty(product, cartItem) {
 }
 
 /**
+ * Deduct warehouse stock safely. First consumes from shop floor (wh_shop),
+ * and if insufficient, takes the remaining quantity from the main warehouse (wh_main).
+ * Always recalculates total product.stock from warehouses.
+ */
+function deductWarehouseStock(product, qtyToDeduct) {
+  if (!product.warehouses || typeof product.warehouses !== 'object') {
+    product.stock = r2(Number(product.stock || 0) - qtyToDeduct);
+    return;
+  }
+  let remainingToDeduct = qtyToDeduct;
+  if (product.warehouses.wh_shop !== undefined) {
+    const availableShop = Number(product.warehouses.wh_shop || 0);
+    const fromShop = Math.min(Math.max(0, availableShop), remainingToDeduct);
+    product.warehouses.wh_shop = r2(availableShop - fromShop);
+    remainingToDeduct = r2(remainingToDeduct - fromShop);
+  }
+  if (remainingToDeduct > 0) {
+    const mainWh = product.warehouses.wh_main !== undefined ? 'wh_main' : Object.keys(product.warehouses)[0];
+    if (mainWh) {
+      product.warehouses[mainWh] = r2(Number(product.warehouses[mainWh] || 0) - remainingToDeduct);
+    }
+  }
+  product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+}
+
+function restoreWarehouseStock(product, qtyToRestore) {
+  if (!product.warehouses || typeof product.warehouses !== 'object') {
+    product.stock = r2(Number(product.stock || 0) + qtyToRestore);
+    return;
+  }
+  const shopWh = product.warehouses.wh_shop !== undefined ? 'wh_shop' : (Object.keys(product.warehouses)[0] || 'wh_main');
+  product.warehouses[shopWh] = r2(Number(product.warehouses[shopWh] || 0) + qtyToRestore);
+  product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+}
+
+/**
  * Deduct sold quantities. A composite product consumes its recipe ingredients
  * instead of its own (notional) stock, which is what keeps raw-material
  * inventory honest for bakeries and kitchens.
@@ -174,11 +256,7 @@ function deductStock(store, items, orderId, user) {
           shortages.push({ name: raw.name, available: raw.stock });
         }
 
-        raw.stock = Math.max(0, Math.round((Number(raw.stock || 0) - deducted) * 10000) / 10000);
-        if (raw.warehouses) {
-          raw.warehouses['wh_shop'] = Math.max(0, Math.round((Number(raw.warehouses['wh_shop'] || 0) - deducted) * 10000) / 10000);
-          raw.stock = Object.values(raw.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-        }
+        deductWarehouseStock(raw, deducted);
 
         logStockMovement(store, {
           product: raw,
@@ -205,11 +283,7 @@ function deductStock(store, items, orderId, user) {
           shortages.push({ name: comp.name, available: comp.stock });
         }
 
-        comp.stock = Math.max(0, Math.round((Number(comp.stock || 0) - deducted) * 10000) / 10000);
-        if (comp.warehouses) {
-          comp.warehouses['wh_shop'] = Math.max(0, Math.round((Number(comp.warehouses['wh_shop'] || 0) - deducted) * 10000) / 10000);
-          comp.stock = Object.values(comp.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-        }
+        deductWarehouseStock(comp, deducted);
 
         logStockMovement(store, {
           product: comp,
@@ -227,11 +301,7 @@ function deductStock(store, items, orderId, user) {
       shortages.push({ name: product.name, available: product.stock });
     }
 
-    product.stock = r2(product.stock - soldQty);
-    if (product.warehouses) {
-      product.warehouses['wh_shop'] = (product.warehouses['wh_shop'] || 0) - soldQty;
-      product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-    }
+    deductWarehouseStock(product, soldQty);
 
     logStockMovement(store, {
       product,
@@ -250,12 +320,25 @@ router.post('/orders', async (req, res) => {
   const store = req.tenantStore;
   const {
     customerName, customerPhone, customerId, paymentMethod,
-    subtotal, tax, discount, total, items, tableId, splitPayments, notes,
+    subtotal, tax, discount, roundOff, total, items, tableId, splitPayments, notes,
     redeemPoints
   } = req.body;
 
   if (!items || items.length === 0) {
     return res.status(400).json({ success: false, message: 'Cart is empty.' });
+  }
+
+  // A negative or zero quantity (or a negative price) would flip stock deduction
+  // into an addition and quietly shrink or invert the bill total — verified live
+  // against this tenant's data: an unguarded qty:-1 line raised stock instead of
+  // lowering it and posted a -₹10 "COMPLETED" sale. Reject it before anything else
+  // in this request touches stock or the ledger.
+  const badItem = (items || []).find((i) => !(Number(i.qty) > 0) || Number(i.price) < 0);
+  if (badItem) {
+    return res.status(400).json({
+      success: false,
+      message: `Invalid quantity or price for "${badItem.name || badItem.id || 'item'}". Quantity must be greater than zero and price cannot be negative.`
+    });
   }
 
   const billing = store.settings.billing;
@@ -299,13 +382,9 @@ router.post('/orders', async (req, res) => {
   let loyaltyRedeemed = 0;
   let pointsRedeemed = 0;
 
-  if (customer && Number(redeemPoints) > 0) {
-    if (pos.enableLoyalty === false) {
-      return res.status(400).json({ success: false, message: 'Loyalty points are switched off for this shop.' });
-    }
-
-    const available = customer.loyaltyPoints || 0;
+  if (redeemPoints && customer && pos.enableLoyalty !== false) {
     const wanted = Math.floor(Number(redeemPoints));
+    const available = customer.loyaltyPoints || 0;
     const minPoints = Number(pos.loyaltyMinRedeemPoints) || 0;
 
     if (wanted > available) {
@@ -332,6 +411,27 @@ router.post('/orders', async (req, res) => {
 
   const shortages = deductStock(store, items, orderId, actor(req));
 
+  const orderItems = (items || []).map((i) => {
+    const product = store.products.find((p) => p.id === i.id || p.name === i.name);
+    return {
+      id: i.id || `item_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name: i.name || i.printName || 'Item',
+      printName: i.printName || i.name || 'Item',
+      barcode: i.barcode || '',
+      qty: Number(i.qty) || 1,
+      unit: i.unit || i.saleUnit || 'pcs',
+      price: Number(i.price) || 0,
+      taxRate: Number(i.taxRate) || 0,
+      total: Number(i.total) || Math.round((Number(i.qty) || 1) * (Number(i.price) || 0) * 100) / 100,
+      discount: Number(i.discount) || 0,
+      // The quantity actually deducted from stock, in the product's base unit —
+      // e.g. 0.1 for "100 g" of a kg-based product. Costing (COGS) must use this,
+      // not the as-sold `qty`, or a purchase price quoted per base unit gets
+      // multiplied by a sale-unit quantity and wildly overstates cost.
+      baseQty: product ? baseQty(product, i) : (Number(i.qty) || 1)
+    };
+  });
+
   const order = {
     orderId,
     customerId: customer ? customer.id : null,
@@ -342,6 +442,7 @@ router.post('/orders', async (req, res) => {
     subtotal: r2(subtotal),
     tax: r2(tax),
     discount: r2(discount),
+    roundOff: r2(roundOff || 0),
     loyaltyRedeemed,
     pointsRedeemed,
     grossTotal: r2(total),
@@ -352,7 +453,7 @@ router.post('/orders', async (req, res) => {
     sessionId: store.session?.id || null,
     date: new Date().toISOString(),
     status: 'COMPLETED',
-    items
+    items: orderItems
   };
 
   // Points accrue on what was actually paid, not on the value settled with
@@ -418,14 +519,16 @@ router.get('/orders', (req, res) => {
   const store = req.tenantStore;
   const { from, to, q, paymentMethod, limit } = req.query;
 
-  let rows = store.orders;
+  let rows = [...(store.orders || [])];
+  rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
   if (from) rows = rows.filter((o) => engine.dayKey(o.date) >= engine.dayKey(from));
   if (to) rows = rows.filter((o) => engine.dayKey(o.date) <= engine.dayKey(to));
   if (paymentMethod && paymentMethod !== 'ALL') rows = rows.filter((o) => o.paymentMethod === paymentMethod);
   if (q) {
     const needle = String(q).toLowerCase();
     rows = rows.filter(
-      (o) => o.orderId.toLowerCase().includes(needle) || (o.customerName || '').toLowerCase().includes(needle)
+      (o) => (o.orderId || '').toLowerCase().includes(needle) || (o.customerName || '').toLowerCase().includes(needle) || (o.customerPhone || '').includes(needle)
     );
   }
 
@@ -463,12 +566,7 @@ router.post('/orders/:orderId/void', (req, res) => {
         if (!raw) return;
         const reqPerUnit = Number(ing.qty) || 0;
         const returned = Math.round(reqPerUnit * soldQty * 10000) / 10000;
-        raw.stock = Math.round((Number(raw.stock || 0) + returned) * 10000) / 10000;
-        
-        if (raw.warehouses) {
-          raw.warehouses['wh_shop'] = Math.round((Number(raw.warehouses['wh_shop'] || 0) + returned) * 10000) / 10000;
-          raw.stock = Object.values(raw.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-        }
+        restoreWarehouseStock(raw, returned);
 
         logStockMovement(store, {
           product: raw,
@@ -490,12 +588,7 @@ router.post('/orders/:orderId/void', (req, res) => {
         if (!comp) return;
         const compQty = Number(ci.qty || ci.quantity || 1);
         const returned = Math.round(compQty * soldQty * 10000) / 10000;
-        comp.stock = Math.round((Number(comp.stock || 0) + returned) * 10000) / 10000;
-
-        if (comp.warehouses) {
-          comp.warehouses['wh_shop'] = Math.round((Number(comp.warehouses['wh_shop'] || 0) + returned) * 10000) / 10000;
-          comp.stock = Object.values(comp.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-        }
+        restoreWarehouseStock(comp, returned);
 
         logStockMovement(store, {
           product: comp,
@@ -509,11 +602,7 @@ router.post('/orders/:orderId/void', (req, res) => {
       return;
     }
 
-    product.stock = r2(product.stock + soldQty);
-    if (product.warehouses) {
-      product.warehouses['wh_shop'] = (product.warehouses['wh_shop'] || 0) + soldQty;
-      product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
-    }
+    restoreWarehouseStock(product, soldQty);
 
     logStockMovement(store, {
       product,
@@ -848,6 +937,281 @@ router.post('/tables/merge', (req, res) => {
   Object.assign(source, { status: 'FREE', currentBillId: null, occupiedAt: null });
 
   res.json({ success: true, message: `${source.name} merged into ${target.name}.`, data: targetBill });
+});
+
+/* ------------------------------------------------------------------ *
+ * Quotations / Estimates
+ * ------------------------------------------------------------------ */
+
+router.get('/quotations', (req, res) => {
+  const store = req.tenantStore;
+  const { q, status, limit } = req.query;
+
+  let rows = [...(store.quotations || [])];
+  rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+  if (status && status !== 'ALL') rows = rows.filter((qt) => qt.status === status);
+  if (q) {
+    const needle = String(q).toLowerCase();
+    rows = rows.filter(
+      (qt) =>
+        (qt.quotationNo || '').toLowerCase().includes(needle) ||
+        (qt.customerName || '').toLowerCase().includes(needle) ||
+        (qt.customerPhone || '').includes(needle)
+    );
+  }
+
+  res.json({ success: true, data: rows.slice(0, Number(limit) || 500), count: rows.length });
+});
+
+router.get('/quotations/:id', (req, res) => {
+  const store = req.tenantStore;
+  const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id || qt.quotationNo === req.params.id);
+  if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
+
+  res.json({
+    success: true,
+    data: { ...quotation, company: store.settings.company, billing: store.settings.billing }
+  });
+});
+
+router.post('/quotations', (req, res) => {
+  const store = req.tenantStore;
+  const {
+    customerId,
+    customerName,
+    customerPhone,
+    customerGstin,
+    customerAddress,
+    items,
+    subtotal,
+    tax,
+    discount,
+    roundOff,
+    total,
+    validUntil,
+    notes,
+    terms
+  } = req.body;
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: 'Quotation requires at least one item.' });
+  }
+
+  if (!store.quotations) store.quotations = [];
+
+  const billing = store.settings.billing || {};
+  const year = new Date().getFullYear();
+  const nextNo = (store.quotations.length || 0) + 1001;
+  const quotationNo = `QT-${year}-${String(nextNo).padStart(4, '0')}`;
+
+  const quotationItems = items.map((i) => ({
+    id: i.id || `item_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    productId: i.productId || i.id,
+    name: i.name || 'Item',
+    barcode: i.barcode || '',
+    qty: Number(i.qty) || 1,
+    unit: i.unit || 'pcs',
+    price: Number(i.price) || 0,
+    taxRate: Number(i.taxRate) || 0,
+    total: Number(i.total) || Math.round((Number(i.qty) || 1) * (Number(i.price) || 0) * 100) / 100,
+    discount: Number(i.discount) || 0
+  }));
+
+  const calcSubtotal = r2(subtotal !== undefined ? Number(subtotal) : quotationItems.reduce((s, i) => s + (i.total || (i.qty * i.price)), 0));
+  const calcTax = r2(tax !== undefined ? Number(tax) : 0);
+  const calcDiscount = r2(discount !== undefined ? Number(discount) : 0);
+  const calcRoundOff = r2(roundOff || 0);
+  const calcTotal = r2(total !== undefined ? Number(total) : (calcSubtotal + calcTax - calcDiscount + calcRoundOff));
+
+  const validUntilDate = validUntil || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  const quotation = {
+    id: `qt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    quotationNo,
+    customerId: customerId || null,
+    customerName: customerName || 'Walk-in Customer',
+    customerPhone: customerPhone || 'N/A',
+    customerGstin: customerGstin || '',
+    customerAddress: customerAddress || '',
+    date: new Date().toISOString(),
+    validUntil: validUntilDate,
+    items: quotationItems,
+    subtotal: calcSubtotal,
+    tax: calcTax,
+    discount: calcDiscount,
+    roundOff: calcRoundOff,
+    total: calcTotal,
+    notes: notes || '',
+    terms: terms || billing.termsText || 'Prices valid until specified validity date. Subject to stock availability.',
+    status: 'PENDING', // PENDING, ACCEPTED, CONVERTED, REJECTED, EXPIRED
+    convertedOrderId: null,
+    createdBy: actor(req)
+  };
+
+  store.quotations.unshift(quotation);
+
+  res.status(201).json({
+    success: true,
+    message: `Quotation ${quotationNo} created successfully.`,
+    data: { ...quotation, company: store.settings.company, billing: store.settings.billing }
+  });
+});
+
+router.put('/quotations/:id', (req, res) => {
+  const store = req.tenantStore;
+  const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id);
+  if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
+
+  const {
+    customerName, customerPhone, customerGstin, customerAddress,
+    items, subtotal, tax, discount, total, validUntil, notes, terms, status
+  } = req.body;
+
+  if (customerName !== undefined) quotation.customerName = customerName;
+  if (customerPhone !== undefined) quotation.customerPhone = customerPhone;
+  if (customerGstin !== undefined) quotation.customerGstin = customerGstin;
+  if (customerAddress !== undefined) quotation.customerAddress = customerAddress;
+  if (status !== undefined) quotation.status = status;
+  if (validUntil !== undefined) quotation.validUntil = validUntil;
+  if (notes !== undefined) quotation.notes = notes;
+  if (terms !== undefined) quotation.terms = terms;
+
+  if (Array.isArray(items) && items.length > 0) {
+    quotation.items = items.map((i) => ({
+      id: i.id || `item_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      productId: i.productId || i.id,
+      name: i.name || 'Item',
+      barcode: i.barcode || '',
+      qty: Number(i.qty) || 1,
+      unit: i.unit || 'pcs',
+      price: Number(i.price) || 0,
+      taxRate: Number(i.taxRate) || 0,
+      total: Number(i.total) || Math.round((Number(i.qty) || 1) * (Number(i.price) || 0) * 100) / 100,
+      discount: Number(i.discount) || 0
+    }));
+  }
+
+  if (subtotal !== undefined) quotation.subtotal = r2(subtotal);
+  if (tax !== undefined) quotation.tax = r2(tax);
+  if (discount !== undefined) quotation.discount = r2(discount);
+  if (total !== undefined) quotation.total = r2(total);
+
+  quotation.updatedAt = new Date().toISOString();
+
+  res.json({
+    success: true,
+    message: `Quotation ${quotation.quotationNo} updated.`,
+    data: { ...quotation, company: store.settings.company, billing: store.settings.billing }
+  });
+});
+
+router.delete('/quotations/:id', (req, res) => {
+  const store = req.tenantStore;
+  const initialLength = (store.quotations || []).length;
+  store.quotations = (store.quotations || []).filter((qt) => qt.id !== req.params.id && qt.quotationNo !== req.params.id);
+
+  if (store.quotations.length === initialLength) {
+    return res.status(404).json({ success: false, message: 'Quotation not found.' });
+  }
+
+  res.json({ success: true, message: 'Quotation deleted.' });
+});
+
+/** Convert Quotation into a live Tax Invoice with stock movement & double-entry posting */
+router.post('/quotations/:id/convert', async (req, res) => {
+  const store = req.tenantStore;
+  const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id || qt.quotationNo === req.params.id);
+  if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
+
+  if (quotation.status === 'CONVERTED' && quotation.convertedOrderId) {
+    return res.status(400).json({
+      success: false,
+      message: `Quotation ${quotation.quotationNo} is already converted to Invoice #${quotation.convertedOrderId}.`
+    });
+  }
+
+  const paymentMethod = req.body.paymentMethod || 'Cash';
+  const billing = store.settings.billing || {};
+  const orderId = `${billing.invoicePrefix || 'INV'}-${new Date().getFullYear()}-${String(billing.nextInvoiceNo || 1).padStart(4, '0')}`;
+  billing.nextInvoiceNo = (billing.nextInvoiceNo || 1) + 1;
+
+  let customer = null;
+  if (quotation.customerId) customer = store.customers.find((c) => c.id === quotation.customerId);
+  if (!customer && quotation.customerName && quotation.customerName !== 'Walk-in Customer') {
+    customer = store.customers.find((c) => c.name.toLowerCase() === quotation.customerName.toLowerCase());
+  }
+
+  const shortages = deductStock(store, quotation.items, orderId, actor(req));
+
+  const order = {
+    orderId,
+    customerId: customer ? customer.id : quotation.customerId || null,
+    customerName: customer ? customer.name : quotation.customerName || 'Walk-in Customer',
+    customerPhone: customer ? customer.phone : quotation.customerPhone || 'N/A',
+    customerGstin: quotation.customerGstin || '',
+    customerAddress: quotation.customerAddress || '',
+    paymentMethod,
+    subtotal: quotation.subtotal,
+    tax: quotation.tax,
+    discount: quotation.discount,
+    roundOff: quotation.roundOff || 0,
+    loyaltyRedeemed: 0,
+    pointsRedeemed: 0,
+    grossTotal: quotation.total,
+    total: quotation.total,
+    notes: `Converted from Quotation ${quotation.quotationNo}${quotation.notes ? ` · ${quotation.notes}` : ''}`,
+    tableId: null,
+    cashier: actor(req),
+    sessionId: store.session?.id || null,
+    date: new Date().toISOString(),
+    status: 'COMPLETED',
+    items: quotation.items
+  };
+
+  if (String(paymentMethod).toLowerCase() === 'cash' && store.session) {
+    store.session.currentCash = r2(store.session.currentCash + order.total);
+    store.session.cashEntries.push({
+      type: 'IN',
+      amount: order.total,
+      reason: `Sale ${orderId} (from Quotation ${quotation.quotationNo})`,
+      time: order.date
+    });
+  }
+
+  try {
+    const accounting = posting.postSale(store, order, {
+      customer,
+      interState: store.settings.tax?.interState,
+      createdBy: actor(req)
+    });
+    order.voucherNo = accounting.voucher.voucherNo;
+    order.voucherId = accounting.voucher.id;
+    order.cogs = accounting.cogsAmount;
+  } catch (err) {
+    order.accountingError = err.message;
+  }
+
+  if (customer) {
+    const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
+    if (account) customer.outstanding = Math.max(0, engine.accountBalance(store, account.id));
+  }
+
+  store.orders.unshift(order);
+
+  quotation.status = 'CONVERTED';
+  quotation.convertedOrderId = orderId;
+  quotation.convertedAt = new Date().toISOString();
+
+  res.status(201).json({
+    success: true,
+    message: `Quotation ${quotation.quotationNo} successfully converted to Invoice ${orderId}.`,
+    warnings: shortages.length ? shortages.map((s) => `${s.name}: only ${s.available} left`) : [],
+    data: {
+      order: { ...order, company: store.settings.company, billing: store.settings.billing },
+      quotation
+    }
+  });
 });
 
 module.exports = router;

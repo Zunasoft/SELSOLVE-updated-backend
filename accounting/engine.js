@@ -256,7 +256,20 @@ function reverseJournal(store, voucherId, createdBy) {
  * Balances & ledgers
  * ------------------------------------------------------------------ */
 
-const dayKey = (d) => new Date(d).toISOString().slice(0, 10);
+const dayKey = (d) => {
+  if (!d) return '';
+  if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  try {
+    const dt = new Date(d);
+    if (isNaN(dt.getTime())) return String(d).slice(0, 10);
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, '0');
+    const day = String(dt.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  } catch (_) {
+    return String(d).slice(0, 10);
+  }
+};
 
 function inRange(date, from, to) {
   const k = dayKey(date);

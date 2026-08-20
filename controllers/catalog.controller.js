@@ -9,7 +9,7 @@
  * shop's catalogue into one shared collection.
  */
 
-const { logStockMovement, DEFAULT_UNITS, defaultPriceSheets } = require('../store');
+const { logStockMovement, DEFAULT_UNITS, defaultPriceSheets, calculateProductStock } = require('../store');
 const posting = require('../accounting/posting');
 const { setRecipe, removeRecipe, decorateRecipe, recipeFromProductPayload } = require('../modules/recipes');
 
@@ -392,8 +392,18 @@ exports.getProducts = (req, res) => {
   if (status === 'active') rows = rows.filter((p) => p.isActive !== false);
   if (status === 'inactive') rows = rows.filter((p) => p.isActive === false);
 
-  if (lowStock === 'true') rows = rows.filter((p) => p.productType !== 'service' && p.stock <= (p.minStock ?? 5));
-  if (outOfStock === 'true') rows = rows.filter((p) => p.productType !== 'service' && p.stock <= 0);
+  if (lowStock === 'true') {
+    rows = rows.filter((p) => {
+      const status = calculateProductStock(p, store.products || [], store.recipes || []);
+      return !status.isService && status.isLow;
+    });
+  }
+  if (outOfStock === 'true') {
+    rows = rows.filter((p) => {
+      const status = calculateProductStock(p, store.products || [], store.recipes || []);
+      return !status.isService && status.isOut;
+    });
+  }
 
   if (q) {
     const needle = String(q).toLowerCase();
@@ -936,8 +946,14 @@ exports.bulkImportProducts = (req, res) => {
 exports.getInventorySummary = (req, res) => {
   const store = req.tenantStore;
   const products = store.products || [];
-  const lowStock = products.filter((p) => p.productType !== 'service' && p.stock <= (p.minStock ?? 5));
-  const outOfStock = products.filter((p) => p.productType !== 'service' && p.stock <= 0);
+  const recipes = store.recipes || [];
+  const evaluated = products.map((p) => ({
+    product: p,
+    status: calculateProductStock(p, products, recipes)
+  }));
+
+  const lowStock = evaluated.filter((e) => !e.status.isService && e.status.isLow).map((e) => e.product);
+  const outOfStock = evaluated.filter((e) => !e.status.isService && e.status.isOut).map((e) => e.product);
 
   const rawProducts = products.filter((p) => (p.productTypes || [p.productType]).includes('raw'));
   const serviceProducts = products.filter((p) => p.productType === 'service');
@@ -957,10 +973,20 @@ exports.getInventorySummary = (req, res) => {
       stockValueAtRetail: Math.round(products.reduce((s, p) => s + (p.productType === 'service' ? 0 : p.stock * p.price), 0)),
       lowStockCount: lowStock.length,
       outOfStockCount: outOfStock.length,
-      lowStockItems: lowStock
-        .sort((a, b) => a.stock - b.stock)
+      lowStockItems: evaluated
+        .filter((e) => !e.status.isService && e.status.isLow)
+        .sort((a, b) => a.status.stock - b.status.stock)
         .slice(0, 25)
-        .map((p) => ({ id: p.id, name: p.name, regionalName: p.regionalName, stock: p.stock, minStock: p.minStock, unit: p.unit }))
+        .map((e) => ({
+          id: e.product.id,
+          name: e.product.name,
+          regionalName: e.product.regionalName,
+          stock: e.status.stock,
+          minStock: e.product.minStock,
+          unit: e.product.unit,
+          isComposite: e.status.isComposite,
+          isCombo: e.status.isCombo
+        }))
     }
   });
 };
@@ -990,6 +1016,11 @@ exports.adjustStock = (req, res) => {
   }
 
   const delta = product.stock - previous;
+  if (product.warehouses && typeof product.warehouses === 'object') {
+    const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_shop';
+    product.warehouses[whKey] = num(product.warehouses[whKey], 0) + delta;
+    product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + num(val, 0), 0);
+  }
   const movement = logStockMovement(store, {
     product,
     type: 'ADJUSTMENT',

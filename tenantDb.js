@@ -16,18 +16,24 @@ const ARRAY_COLLECTIONS = [
   { key: 'heldBills', collection: 'heldbills', idField: 'id' },
   { key: 'purchases', collection: 'purchases', idField: 'id' },
   { key: 'accounts', collection: 'accounts', idField: 'id' },
-  { key: 'reconciliations', collection: 'reconciliations', idField: 'id' },
-  { key: 'incomes', collection: 'incomes', idField: 'id' },
-  { key: 'expenses', collection: 'expenses', idField: 'id' },
-  { key: 'receipts', collection: 'receipts', idField: 'id' },
-  { key: 'payments', collection: 'payments', idField: 'id' },
-  { key: 'transfers', collection: 'transfers', idField: 'id' },
   { key: 'sessions', collection: 'sessions', idField: 'id' },
+  { key: 'quotations', collection: 'quotations', idField: 'id' },
 
-  // Append-only ledgers: rows are never removed, only added or amended.
+  // Append-only ledgers: nothing in the app ever removes a row from these arrays
+  // (grepped — every write site is push/unshift, never filter/splice), so a
+  // missing row here means "never synced" or "future bug that dropped it in
+  // memory," not "the user deleted it." Without `appendOnly`, the generic diff
+  // in doPersist would read that as a real deletion and `deleteMany` genuine
+  // financial history out of MongoDB.
   { key: 'orders', collection: 'sales', idField: 'orderId', appendOnly: true, sort: { date: -1 } },
   { key: 'journal', collection: 'journal', idField: 'id', appendOnly: true, sort: { date: -1 } },
-  { key: 'stockMovements', collection: 'stockmovements', idField: 'id', appendOnly: true, sort: { timestamp: -1 }, limit: 2000 }
+  { key: 'stockMovements', collection: 'stockmovements', idField: 'id', appendOnly: true, sort: { timestamp: -1 }, limit: 2000 },
+  { key: 'reconciliations', collection: 'reconciliations', idField: 'id', appendOnly: true },
+  { key: 'incomes', collection: 'incomes', idField: 'id', appendOnly: true },
+  { key: 'expenses', collection: 'expenses', idField: 'id', appendOnly: true },
+  { key: 'receipts', collection: 'receipts', idField: 'id', appendOnly: true },
+  { key: 'payments', collection: 'payments', idField: 'id', appendOnly: true },
+  { key: 'transfers', collection: 'transfers', idField: 'id', appendOnly: true }
 ];
 
 /** Singleton values, all kept as one document each in the `meta` collection. */
@@ -214,78 +220,86 @@ const hydrateTenantStore = (dbName, store, tenant) => enqueue(dbName, () => doHy
  * Persistence
  * ------------------------------------------------------------------ */
 
+/**
+ * One request can touch a dozen collections at once — a sale alone writes an
+ * order, a journal voucher, stock movements and the session's cash log in the
+ * same flush. Writing those independently (as this used to) meant a failure on
+ * just one of them (say, the `sales` write hitting a duplicate-key error) could
+ * still leave the others committed: a cash-in entry and an incremented invoice
+ * counter for a sale that was never actually saved. That exact scenario is what
+ * corrupted this tenant's live session ledger before the `sales` index bug was
+ * found. A single Mongo transaction makes the whole flush all-or-nothing: every
+ * collection in this request commits together, or none of them do.
+ */
 async function doPersist(dbName, store) {
   const db = getTenantDb(dbName);
   if (!db) return { persisted: false, reason: 'offline' };
 
   const before = baselines.get(store) || {};
   const after = snapshot(store);
-  const written = {};
 
-  const jobs = ARRAY_COLLECTIONS.map(async (spec) => {
-    try {
-      const prev = before[spec.key] instanceof Map ? before[spec.key] : new Map();
-      const next = after[spec.key] instanceof Map ? after[spec.key] : new Map();
-      const rows = Array.isArray(store[spec.key]) ? store[spec.key] : [];
+  const client = mongoose.connection.getClient();
+  const session = client.startSession();
+  let written = {};
 
-      const operations = [];
-      for (const row of rows) {
-        const id = row?.[spec.idField];
-        if (id === undefined || id === null) continue;
-        const key = String(id);
-        if (prev.get(key) === next.get(key)) continue;
-        operations.push({
-          replaceOne: {
-            filter: { [spec.idField]: id },
-            replacement: stripId(row),
-            upsert: true
-          }
-        });
-      }
+  try {
+    await session.withTransaction(async () => {
+      written = {}; // withTransaction may retry the callback on a transient error — start clean each attempt.
 
-      if (!spec.appendOnly) {
-        const removed = [...prev.keys()].filter((id) => !next.has(id));
-        if (removed.length) operations.push({ deleteMany: { filter: { [spec.idField]: { $in: removed } } } });
-      }
-
-      if (!operations.length) return;
-      await db.collection(spec.collection).bulkWrite(operations, { ordered: false });
-      written[spec.key] = operations.length;
-    } catch (err) {
-      console.warn(`[Tenant DB ${dbName}] bulkWrite warning on "${spec.collection}":`, err.message);
-      // Fallback: Individual item replacement to prevent entire request from failing
-      try {
+      const jobs = ARRAY_COLLECTIONS.map(async (spec) => {
+        const prev = before[spec.key] instanceof Map ? before[spec.key] : new Map();
+        const next = after[spec.key] instanceof Map ? after[spec.key] : new Map();
         const rows = Array.isArray(store[spec.key]) ? store[spec.key] : [];
+
+        const operations = [];
         for (const row of rows) {
           const id = row?.[spec.idField];
           if (id === undefined || id === null) continue;
-          await db.collection(spec.collection).replaceOne(
-            { [spec.idField]: id },
-            stripId(row),
-            { upsert: true }
-          ).catch(() => {});
+          const key = String(id);
+          if (prev.get(key) === next.get(key)) continue;
+          operations.push({
+            replaceOne: {
+              filter: { [spec.idField]: id },
+              replacement: stripId(row),
+              upsert: true
+            }
+          });
         }
-      } catch (fallbackErr) {
-        console.error(`[Tenant DB ${dbName}] Fallback write error on ${spec.collection}:`, fallbackErr.message);
-      }
-    }
-  });
 
-  const metaJobs = META_KEYS.map(async (key) => {
-    try {
-      if (before[key] === after[key]) return;
-      await db
-        .collection(META_COLLECTION)
-        .updateOne({ _key: key }, { $set: { _key: key, value: store[key] ?? null, updatedAt: new Date() } }, { upsert: true });
-      written[key] = 1;
-    } catch (err) {
-      console.warn(`[Tenant DB ${dbName}] Error saving meta key "${key}":`, err.message);
-    }
-  });
+        if (!spec.appendOnly) {
+          const removed = [...prev.keys()].filter((id) => !next.has(id));
+          if (removed.length) operations.push({ deleteMany: { filter: { [spec.idField]: { $in: removed } } } });
+        }
 
-  await Promise.all([...jobs, ...metaJobs]);
-  baselines.set(store, after);
-  return { persisted: true, written };
+        if (!operations.length) return;
+        await db.collection(spec.collection).bulkWrite(operations, { ordered: false, session });
+        written[spec.key] = operations.length;
+      });
+
+      const metaJobs = META_KEYS.map(async (key) => {
+        if (before[key] === after[key]) return;
+        await db
+          .collection(META_COLLECTION)
+          .updateOne(
+            { _key: key },
+            { $set: { _key: key, value: store[key] ?? null, updatedAt: new Date() } },
+            { upsert: true, session }
+          );
+        written[key] = 1;
+      });
+
+      await Promise.all([...jobs, ...metaJobs]);
+    });
+
+    baselines.set(store, after);
+    return { persisted: true, written };
+  } catch (err) {
+    // Nothing from this flush was committed — the transaction aborted as a whole.
+    console.error(`[Tenant DB ${dbName}] Transactional persist failed, nothing committed:`, err.message);
+    return { persisted: false, reason: err.message };
+  } finally {
+    await session.endSession();
+  }
 }
 
 /**

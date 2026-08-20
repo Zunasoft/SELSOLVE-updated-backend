@@ -271,6 +271,7 @@ function emptyStore(overrides = {}) {
 
     // trading
     orders: [],
+    quotations: overrides.quotations || [],
     purchases: overrides.purchases || [],
     stockMovements: [],
     heldBills: [],
@@ -409,6 +410,76 @@ function getTenantStore(dbName) {
   return newTenantStore();
 }
 
+/**
+ * Calculates effective available stock for standard, composite, and combo products.
+ * Composite and combo items calculate their producible/buyable quantity from raw materials.
+ * Low stock alerts trigger only when available stock (or producible count) is <= minStock.
+ */
+function calculateProductStock(product, allProducts = [], recipes = []) {
+  if (!product || product.productType === 'service') {
+    return { stock: Infinity, isService: true, isLow: false, isOut: false, effectiveStock: 0 };
+  }
+
+  const isComposite = product.isComposite || product.productType === 'composite';
+  const isCombo = product.productType === 'combo';
+  const minStock = Number(product.minStock ?? 5);
+
+  if (isComposite) {
+    const recipe = (recipes || []).find((r) => r.productId === product.id);
+    const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
+    if (!ingredients.length) {
+      return { stock: 0, isComposite: true, isLow: true, isOut: true, effectiveStock: 0 };
+    }
+    let maxCanMake = Infinity;
+    for (const ing of ingredients) {
+      const raw = allProducts.find((p) => p.id === ing.productId);
+      const reqQty = Number(ing.qty) || 1;
+      const rawStock = raw ? Math.max(0, Number(raw.stock || 0)) : 0;
+      const canMake = Math.floor(rawStock / reqQty);
+      if (canMake < maxCanMake) maxCanMake = canMake;
+    }
+    const producible = maxCanMake === Infinity ? 0 : maxCanMake;
+    return {
+      stock: producible,
+      effectiveStock: producible,
+      isComposite: true,
+      isLow: producible <= minStock,
+      isOut: producible <= 0
+    };
+  }
+
+  if (isCombo) {
+    const comboItems = product.comboItems || [];
+    if (!comboItems.length) {
+      return { stock: 0, isCombo: true, isLow: true, isOut: true, effectiveStock: 0 };
+    }
+    let maxCanMake = Infinity;
+    for (const item of comboItems) {
+      const raw = allProducts.find((p) => p.id === item.productId);
+      const reqQty = Number(item.qty) || 1;
+      const rawStock = raw ? Math.max(0, Number(raw.stock || 0)) : 0;
+      const canMake = Math.floor(rawStock / reqQty);
+      if (canMake < maxCanMake) maxCanMake = canMake;
+    }
+    const comboBuyable = maxCanMake === Infinity ? 0 : maxCanMake;
+    return {
+      stock: comboBuyable,
+      effectiveStock: comboBuyable,
+      isCombo: true,
+      isLow: comboBuyable <= minStock,
+      isOut: comboBuyable <= 0
+    };
+  }
+
+  const stk = Number(product.stock || 0);
+  return {
+    stock: stk,
+    effectiveStock: stk,
+    isLow: stk <= minStock,
+    isOut: stk <= 0
+  };
+}
+
 module.exports = {
   ROLE_PERMISSIONS,
   MODULE_KEYS,
@@ -419,6 +490,7 @@ module.exports = {
   DEFAULT_CUSTOMER_GROUPS,
   getTenantStore,
   newTenantStore,
+  calculateProductStock,
   logStockMovement,
   emptyStore,
   genericStore,
