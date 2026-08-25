@@ -261,6 +261,7 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     updatedAt: new Date().toISOString()
   };
 }
+exports.shapeProduct = shapeProduct;
 
 /* ------------------------------- Units Controllers ------------------------------- */
 
@@ -343,8 +344,8 @@ exports.getCategories = (req, res) => {
   });
 };
 
-exports.createCategory = async (req, res) => {
-  const { name, icon, description, kotPrinter } = req.body;
+exports.createCategory = (req, res) => {
+  const { name, icon, description, kotPrinter, color } = req.body;
   if (!name) return res.status(400).json({ success: false, message: 'Category name is required.' });
 
   const category = {
@@ -353,6 +354,7 @@ exports.createCategory = async (req, res) => {
     icon: icon || '📦',
     description: description || '',
     kotPrinter: kotPrinter || '',
+    color: color || '',
     createdAt: new Date().toISOString()
   };
   req.tenantStore.categories.push(category);

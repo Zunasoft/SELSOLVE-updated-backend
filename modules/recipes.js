@@ -58,7 +58,9 @@ function buildRecipe(store, product, payload = {}) {
     throw new Error('That recipe is circular — one of the raw materials is itself made from this product.');
   }
 
+  const yieldQty = Number(payload.yieldQty) > 0 ? Number(payload.yieldQty) : 1;
   const batchCost = ingredients.reduce((sum, i) => sum + i.cost * i.qty, 0);
+  const unitCost = r2(batchCost / yieldQty);
 
   const existing = (store.recipes || []).find((r) => r.productId === product.id);
 
@@ -66,10 +68,9 @@ function buildRecipe(store, product, payload = {}) {
     id: existing?.id || `rec_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
     productId: product.id,
     productName: product.name,
-    yieldQty: 1,
+    yieldQty,
     ingredients,
-    // Cost of one sellable unit — 1:1 with batch cost (no yield multiplier).
-    unitCost: r2(batchCost),
+    unitCost,
     batchCost: r2(batchCost),
     notes: payload.notes || existing?.notes || '',
     createdAt: existing?.createdAt || new Date().toISOString(),
@@ -97,7 +98,7 @@ function setRecipe(store, product, payload) {
   // Mirrored onto the product so a single GET /products call is enough to render
   // the recipe back into the edit form.
   product.recipeItems = recipe.ingredients;
-  product.recipeYieldQty = 1;
+  product.recipeYieldQty = recipe.yieldQty;
   product.recipeUnitCost = recipe.unitCost;
   // A composite is costed from its ingredients, never from a typed-in figure.
   product.purchasePrice = recipe.unitCost;
@@ -125,23 +126,23 @@ function decorateRecipe(store, recipe) {
     };
   });
 
+  const yieldQty = Number(recipe.yieldQty) > 0 ? Number(recipe.yieldQty) : 1;
   const batchCost = ingredients.reduce((sum, i) => sum + (i.cost || 0) * i.qty, 0);
-  const unitCost = r2(batchCost);
+  const unitCost = r2(batchCost / yieldQty);
 
-  // How many sellable units the raw materials on hand can actually produce —
-  // strict 1:1 ratio with listed ingredients.
-  const producible = ingredients.length
-    ? Math.floor(
-        Math.min(
-          ...ingredients.map((i) => (i.qty > 0 ? i.available / i.qty : 0))
-        )
+  // How many sellable units the raw materials on hand can actually produce
+  const producibleBatches = ingredients.length
+    ? Math.min(
+        ...ingredients.map((i) => (i.qty > 0 ? i.available / i.qty : 0))
       )
     : 0;
+  const producible = Math.floor(producibleBatches * yieldQty);
 
   const sellingPrice = product ? product.price : 0;
 
   return {
     ...recipe,
+    yieldQty,
     ingredients,
     unitCost,
     batchCost: r2(batchCost),

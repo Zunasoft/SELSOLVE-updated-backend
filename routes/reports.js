@@ -288,7 +288,7 @@ router.get('/reports/stock', (req, res) => {
 
 router.get('/reports/purchases', (req, res) => {
   const store = req.tenantStore;
-  const rows = (store.purchases || []).filter((p) => inWindow(p.date, req.query.from, req.query.to));
+  const rows = (store.purchases || []).filter((p) => p.status !== 'VOID' && inWindow(p.date, req.query.from, req.query.to));
 
   const byVendor = {};
   rows.forEach((p) => {
@@ -370,7 +370,7 @@ router.get('/reports/vendors/payables', (req, res) => {
     .partyOutstanding(store, 'VENDOR', opts)
     .map((row) => {
       const vendor = (store.vendors || []).find((v) => v.id === row.partyId) || {};
-      const invoices = (store.purchases || []).filter((p) => p.vendorId === row.partyId);
+      const invoices = (store.purchases || []).filter((p) => p.vendorId === row.partyId && p.status !== 'VOID');
       const lastInvoice = invoices[0];
 
       return {
@@ -586,7 +586,7 @@ router.get('/reports/export/:report', (req, res) => {
       })),
     purchases: () =>
       (store.purchases || [])
-        .filter((p) => inWindow(p.date, req.query.from, req.query.to))
+        .filter((p) => p.status !== 'VOID' && inWindow(p.date, req.query.from, req.query.to))
         .map((p) => ({
           Date: dayKey(p.date),
           Invoice: p.invoiceNo,

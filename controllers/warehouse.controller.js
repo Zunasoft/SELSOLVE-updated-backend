@@ -43,7 +43,7 @@ exports.getWarehouses = (req, res) => {
   res.json({ success: true, data });
 };
 
-exports.createWarehouse = async (req, res) => {
+exports.createWarehouse = (req, res) => {
   const store = req.tenantStore;
   const warehouses = ensureWarehouses(store);
   const { name, code, location } = req.body;
@@ -64,7 +64,7 @@ exports.createWarehouse = async (req, res) => {
   res.status(201).json({ success: true, message: 'Warehouse created.', data: warehouse });
 };
 
-exports.updateWarehouse = async (req, res) => {
+exports.updateWarehouse = (req, res) => {
   const store = req.tenantStore;
   const warehouses = ensureWarehouses(store);
   const wh = warehouses.find((w) => w.id === req.params.id);
@@ -79,7 +79,7 @@ exports.updateWarehouse = async (req, res) => {
   res.json({ success: true, message: 'Warehouse updated.', data: wh });
 };
 
-exports.deleteWarehouse = async (req, res) => {
+exports.deleteWarehouse = (req, res) => {
   const store = req.tenantStore;
   const warehouses = ensureWarehouses(store);
 
@@ -114,7 +114,7 @@ exports.deleteWarehouse = async (req, res) => {
   res.json({ success: true, message: 'Warehouse deleted.' });
 };
 
-exports.transferStock = async (req, res) => {
+exports.transferStock = (req, res) => {
   const store = req.tenantStore;
   ensureWarehouses(store);
 

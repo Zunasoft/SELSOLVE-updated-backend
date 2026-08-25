@@ -95,11 +95,16 @@ const resolveTenantDb = async (req, res, next) => {
   req.tenantDbName = tenant.dbName;
   req.user = claims;
 
+  const isMutating = MUTATING.has(req.method);
+
   try {
     // A fresh working set per request, filled from the tenant's own database.
     // Reusing one across requests would mean a value written by an earlier
     // request on this instance could be read back without touching MongoDB.
-    req.tenantStore = await hydrateTenantStore(tenant.dbName, newTenantStore(), tenant);
+    // The baseline fingerprint is only needed when this request will also
+    // flush (below) — skipping it on a plain GET avoids hashing every row of
+    // every collection for a diff nothing will ever read.
+    req.tenantStore = await hydrateTenantStore(tenant.dbName, newTenantStore(), tenant, isMutating);
   } catch (err) {
     console.error(`[Tenant hydrate error ${tenant.dbName}]:`, err.message);
     return deny(res, 503, 'TENANT_DB_UNAVAILABLE', 'Could not reach your shop database. Please try again in a moment.');
@@ -107,7 +112,7 @@ const resolveTenantDb = async (req, res, next) => {
 
   // Persist before the response goes out, so a read that follows a write always
   // sees the write — including when the next request lands on another instance.
-  if (MUTATING.has(req.method)) {
+  if (isMutating) {
     let flush;
     const runFlush = () => persistTenantStore(tenant.dbName, req.tenantStore);
     const flushOnce = () => (flush = flush || runFlush());

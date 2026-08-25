@@ -155,6 +155,7 @@ function defaultSettings() {
     billing: {
       invoicePrefix: 'INV',
       nextInvoiceNo: 1001,
+      nextQuotationNo: 1001,
       taxInclusive: true,
       defaultTaxRate: 0,
       applyCess: false,

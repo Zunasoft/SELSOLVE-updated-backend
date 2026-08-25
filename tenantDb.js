@@ -136,7 +136,7 @@ async function readMeta(db) {
   return meta;
 }
 
-async function doHydrate(dbName, store, tenant) {
+async function doHydrate(dbName, store, tenant, trackBaseline = true) {
   const db = getTenantDb(dbName);
   if (!db) {
     // Never fall back to the blank defaults: an empty catalogue served as if it
@@ -176,7 +176,12 @@ async function doHydrate(dbName, store, tenant) {
 
   await adoptLegacyData(db, store, meta);
 
-  baselines.set(store, snapshot(store));
+  // The baseline is only ever read by `doPersist`'s diff against a later
+  // write on this same store — a GET request never calls persist, so
+  // fingerprinting every row here (MD5 of JSON.stringify, across every
+  // collection) would be pure overhead on the read path, and reads are most
+  // of this app's traffic. Skipping it is why `trackBaseline` exists.
+  if (trackBaseline) baselines.set(store, snapshot(store));
   return store;
 }
 
@@ -214,7 +219,8 @@ async function adoptLegacyData(db, store, meta) {
  * `tenant` is the master-database record, used only if the shop's database has
  * to be provisioned on the spot.
  */
-const hydrateTenantStore = (dbName, store, tenant) => enqueue(dbName, () => doHydrate(dbName, store, tenant));
+const hydrateTenantStore = (dbName, store, tenant, trackBaseline = true) =>
+  enqueue(dbName, () => doHydrate(dbName, store, tenant, trackBaseline));
 
 /* ------------------------------------------------------------------ *
  * Persistence

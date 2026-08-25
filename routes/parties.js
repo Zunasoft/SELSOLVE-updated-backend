@@ -9,6 +9,7 @@ const { logStockMovement, DEFAULT_CUSTOMER_GROUPS } = require('../store');
 const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
 const { savePartyToDb, deletePartyFromDb } = require('../tenantProvisioner');
+const { shapeProduct } = require('../controllers/catalog.controller');
 
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
@@ -50,62 +51,141 @@ router.get('/customers', (req, res) => {
 });
 
 router.post('/customers', async (req, res) => {
-  const store = req.tenantStore;
-  const { name, phone, email, address, group, creditLimit, openingBalance } = req.body;
-  if (!name) return res.status(400).json({ success: false, message: 'Customer name is required.' });
+  try {
+    const store = req.tenantStore;
+    const {
+      name,
+      phone,
+      email,
+      address,
+      group,
+      creditLimit,
+      openingBalance,
+      openingAdvance,
+      advanceBalance,
+      loyaltyPoints,
+      gstin,
+      pan,
+      priceSheetId,
+      state,
+      stateCode
+    } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Customer name is required.' });
 
-  const customer = {
-    id: `c_${Date.now()}`,
-    name,
-    phone: phone || '',
-    email: email || '',
-    address: address || '',
-    group: group || 'Retail',
-    creditLimit: Number(creditLimit) || 0,
-    outstanding: 0,
-    loyaltyPoints: 0,
-    createdAt: new Date().toISOString()
-  };
-  store.customers.push(customer);
-  await savePartyToDb(req.tenantDbName, { ...customer, type: 'customer' });
-
-  const account = engine.ensurePartyAccount(store, customer, 'CUSTOMER');
-  if (Number(openingBalance)) {
-    posting.postOpeningBalance(store, {
-      accountId: account.id,
-      amount: openingBalance,
-      side: 'DR',
-      createdBy: actor(req)
-    });
-    customer.outstanding = Number(openingBalance);
+    const customer = {
+      id: `c_${Date.now()}`,
+      name,
+      phone: phone || '',
+      email: email || '',
+      address: address || '',
+      group: group || 'Retail',
+      creditLimit: Number(creditLimit) || 0,
+      gstin: gstin || '',
+      pan: pan || '',
+      state: state || '',
+      stateCode: stateCode || '',
+      priceSheetId: priceSheetId || null,
+      outstanding: 0,
+      advance: 0,
+      loyaltyPoints: Number(loyaltyPoints) || 0,
+      createdAt: new Date().toISOString()
+    };
+    store.customers.push(customer);
     await savePartyToDb(req.tenantDbName, { ...customer, type: 'customer' });
-  }
 
-  res.status(201).json({ success: true, data: { ...customer, accountId: account.id } });
+    const account = engine.ensurePartyAccount(store, customer, 'CUSTOMER');
+    if (Number(openingBalance)) {
+      posting.postOpeningBalance(store, {
+        accountId: account.id,
+        amount: openingBalance,
+        side: 'DR',
+        createdBy: actor(req)
+      });
+      customer.outstanding = Number(openingBalance);
+      await savePartyToDb(req.tenantDbName, { ...customer, type: 'customer' });
+    } else if (Number(openingAdvance) || Number(advanceBalance)) {
+      const advAmount = Number(openingAdvance || advanceBalance);
+      posting.postOpeningBalance(store, {
+        accountId: account.id,
+        amount: advAmount,
+        side: 'CR',
+        createdBy: actor(req)
+      });
+      customer.advance = advAmount;
+      await savePartyToDb(req.tenantDbName, { ...customer, type: 'customer' });
+    }
+
+    res.status(201).json({ success: true, data: { ...customer, accountId: account.id } });
+  } catch (err) {
+    console.error('[POST /customers]', err);
+    res.status(500).json({ success: false, message: 'Could not save the customer. Please try again.' });
+  }
 });
 
 router.put('/customers/:id', async (req, res) => {
-  const store = req.tenantStore;
-  const customer = store.customers.find((c) => c.id === req.params.id);
-  if (!customer) return res.status(404).json({ success: false, message: 'Customer not found.' });
+  try {
+    const store = req.tenantStore;
+    const customer = store.customers.find((c) => c.id === req.params.id);
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found.' });
 
-  // Whitelisted so the edit form's shared field set (it also carries vendor-only
-  // keys like `outstandingPayable`/`changeReason` in its state object) can never
-  // leak stray properties onto the customer record or clobber its field types.
-  const { name, phone, email, address, group, creditLimit, gstin } = req.body;
-  if (name !== undefined) customer.name = name;
-  if (phone !== undefined) customer.phone = phone;
-  if (email !== undefined) customer.email = email;
-  if (address !== undefined) customer.address = address;
-  if (group !== undefined) customer.group = group;
-  if (creditLimit !== undefined) customer.creditLimit = Number(creditLimit) || 0;
-  if (gstin !== undefined) customer.gstin = gstin;
-  await savePartyToDb(req.tenantDbName, { ...customer, type: 'customer' });
+    const {
+      name,
+      phone,
+      email,
+      address,
+      group,
+      creditLimit,
+      gstin,
+      pan,
+      priceSheetId,
+      state,
+      stateCode,
+      loyaltyPoints,
+      advanceBalance,
+      openingAdvance
+    } = req.body;
 
-  const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
-  if (account) account.name = customer.name;
+    if (name !== undefined) customer.name = name;
+    if (phone !== undefined) customer.phone = phone;
+    if (email !== undefined) customer.email = email;
+    if (address !== undefined) customer.address = address;
+    if (group !== undefined) customer.group = group;
+    if (creditLimit !== undefined) customer.creditLimit = Number(creditLimit) || 0;
+    if (gstin !== undefined) customer.gstin = gstin;
+    if (pan !== undefined) customer.pan = pan;
+    if (state !== undefined) customer.state = state;
+    if (stateCode !== undefined) customer.stateCode = stateCode;
+    if (priceSheetId !== undefined) customer.priceSheetId = priceSheetId || null;
+    if (loyaltyPoints !== undefined) customer.loyaltyPoints = Number(loyaltyPoints) || 0;
 
-  res.json({ success: true, data: customer });
+    const account = engine.ensurePartyAccount(store, customer, 'CUSTOMER');
+    if (account) account.name = customer.name;
+
+    const targetAdvance = advanceBalance !== undefined ? advanceBalance : openingAdvance;
+    if (targetAdvance !== undefined && targetAdvance !== null && targetAdvance !== '') {
+      const currentLedgerBal = ledgerBalance(store, customer.id, 'CUSTOMER');
+      const currentAdvance = Math.max(0, -currentLedgerBal);
+      const newAdvance = Math.max(0, Number(targetAdvance) || 0);
+      const diff = newAdvance - currentAdvance;
+
+      if (Math.abs(diff) > 0.001) {
+        posting.postOpeningBalance(store, {
+          accountId: account.id,
+          amount: Math.abs(diff),
+          side: diff > 0 ? 'CR' : 'DR',
+          createdBy: actor(req)
+        });
+        customer.advance = newAdvance;
+      }
+    }
+
+    await savePartyToDb(req.tenantDbName, { ...customer, type: 'customer' });
+
+    res.json({ success: true, data: customer });
+  } catch (err) {
+    console.error('[PUT /customers/:id]', err);
+    res.status(500).json({ success: false, message: 'Could not update the customer. Please try again.' });
+  }
 });
 
 router.delete('/customers/:id', (req, res) => {
@@ -320,7 +400,7 @@ router.get('/vendors', (req, res) => {
   const store = req.tenantStore;
   const rows = (store.vendors || []).map((v) => {
     const balance = ledgerBalance(store, v.id, 'VENDOR');
-    const vendorPurchases = (store.purchases || []).filter((p) => p.vendorId === v.id);
+    const vendorPurchases = (store.purchases || []).filter((p) => p.vendorId === v.id && p.status !== 'VOID');
     return {
       ...v,
       outstandingPayable: Math.max(0, balance),
@@ -333,39 +413,46 @@ router.get('/vendors', (req, res) => {
 });
 
 router.post('/vendors', async (req, res) => {
-  const store = req.tenantStore;
-  const { name, phone, email, gstin, address, outstandingPayable } = req.body;
-  if (!name) return res.status(400).json({ success: false, message: 'Vendor name is required.' });
+  try {
+    const store = req.tenantStore;
+    const { name, phone, email, gstin, pan, address, outstandingPayable } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Vendor name is required.' });
 
-  const vendor = {
-    id: `v_${Date.now()}`,
-    name,
-    phone: phone || '',
-    email: email || '',
-    gstin: gstin || '',
-    address: address || '',
-    outstandingPayable: 0,
-    createdAt: new Date().toISOString()
-  };
-  store.vendors.push(vendor);
-  await savePartyToDb(req.tenantDbName, { ...vendor, type: 'vendor' });
-
-  const account = engine.ensurePartyAccount(store, vendor, 'VENDOR');
-  if (Number(outstandingPayable)) {
-    posting.postOpeningBalance(store, {
-      accountId: account.id,
-      amount: outstandingPayable,
-      side: 'CR',
-      createdBy: actor(req)
-    });
-    vendor.outstandingPayable = Number(outstandingPayable);
+    const vendor = {
+      id: `v_${Date.now()}`,
+      name,
+      phone: phone || '',
+      email: email || '',
+      gstin: gstin || '',
+      pan: pan || '',
+      address: address || '',
+      outstandingPayable: 0,
+      createdAt: new Date().toISOString()
+    };
+    store.vendors.push(vendor);
     await savePartyToDb(req.tenantDbName, { ...vendor, type: 'vendor' });
-  }
 
-  res.status(201).json({ success: true, data: { ...vendor, accountId: account.id } });
+    const account = engine.ensurePartyAccount(store, vendor, 'VENDOR');
+    if (Number(outstandingPayable)) {
+      posting.postOpeningBalance(store, {
+        accountId: account.id,
+        amount: outstandingPayable,
+        side: 'CR',
+        createdBy: actor(req)
+      });
+      vendor.outstandingPayable = Number(outstandingPayable);
+      await savePartyToDb(req.tenantDbName, { ...vendor, type: 'vendor' });
+    }
+
+    res.status(201).json({ success: true, data: { ...vendor, accountId: account.id } });
+  } catch (err) {
+    console.error('[POST /vendors]', err);
+    res.status(500).json({ success: false, message: 'Could not save the vendor. Please try again.' });
+  }
 });
 
 router.put('/vendors/:id', async (req, res) => {
+  try {
   const store = req.tenantStore;
   const vendor = store.vendors.find((v) => v.id === req.params.id);
   if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found.' });
@@ -375,6 +462,7 @@ router.put('/vendors/:id', async (req, res) => {
     phone,
     email,
     gstin,
+    pan,
     address,
     category,
     contactPerson,
@@ -399,6 +487,7 @@ router.put('/vendors/:id', async (req, res) => {
   compareAndTrack('phone', 'Phone Number', phone, vendor.phone);
   compareAndTrack('email', 'Email Address', email, vendor.email);
   compareAndTrack('gstin', 'GSTIN', gstin, vendor.gstin);
+  compareAndTrack('pan', 'PAN', pan, vendor.pan);
   compareAndTrack('address', 'Address', address, vendor.address);
   compareAndTrack('category', 'Category', category, vendor.category);
   compareAndTrack('contactPerson', 'Contact Person', contactPerson, vendor.contactPerson);
@@ -409,6 +498,7 @@ router.put('/vendors/:id', async (req, res) => {
   if (phone !== undefined) vendor.phone = phone;
   if (email !== undefined) vendor.email = email;
   if (gstin !== undefined) vendor.gstin = gstin;
+  if (pan !== undefined) vendor.pan = pan;
   if (address !== undefined) vendor.address = address;
   if (category !== undefined) vendor.category = category;
   if (contactPerson !== undefined) vendor.contactPerson = contactPerson;
@@ -456,6 +546,10 @@ router.put('/vendors/:id', async (req, res) => {
   if (account) account.name = vendor.name;
 
   res.json({ success: true, message: 'Vendor details updated successfully.', data: vendor });
+  } catch (err) {
+    console.error('[PUT /vendors/:id]', err);
+    res.status(500).json({ success: false, message: 'Could not update the vendor. Please try again.' });
+  }
 });
 
 router.get('/vendors/:id/history', (req, res) => {
@@ -515,13 +609,15 @@ router.get('/purchases', (req, res) => {
   if (from) rows = rows.filter((p) => engine.dayKey(p.date) >= engine.dayKey(from));
   if (to) rows = rows.filter((p) => engine.dayKey(p.date) <= engine.dayKey(to));
 
+  const active = rows.filter((p) => p.status !== 'VOID');
+
   res.json({
     success: true,
     data: rows,
     summary: {
-      count: rows.length,
-      total: r2(rows.reduce((s, p) => s + (Number(p.totalAmount) || 0), 0)),
-      unpaid: r2(rows.filter((p) => p.paymentStatus !== 'PAID').reduce((s, p) => s + (Number(p.totalAmount) || 0), 0))
+      count: active.length,
+      total: r2(active.reduce((s, p) => s + (Number(p.totalAmount) || 0), 0)),
+      unpaid: r2(active.filter((p) => p.paymentStatus !== 'PAID').reduce((s, p) => s + (Number(p.totalAmount) || 0), 0))
     }
   });
 });
@@ -555,6 +651,18 @@ router.post('/purchases', (req, res) => {
     }
   }
 
+  if (vendor && invoiceNo && String(invoiceNo).trim()) {
+    const duplicate = (store.purchases || []).some(
+      (p) => p.vendorId === vendor.id && p.status !== 'VOID' && String(p.invoiceNo).trim().toLowerCase() === String(invoiceNo).trim().toLowerCase()
+    );
+    if (duplicate) {
+      return res.status(409).json({
+        success: false,
+        message: `Invoice ${invoiceNo} is already recorded for ${vendor.name}. Check the purchase list before re-entering it.`
+      });
+    }
+  }
+
   const lines = Array.isArray(items) ? items : [];
   const subtotal = lines.length
     ? r2(lines.reduce((s, i) => s + Number(i.qty) * Number(i.rate), 0))
@@ -581,8 +689,36 @@ router.post('/purchases', (req, res) => {
     date: date || new Date().toISOString()
   };
 
+  const createdProducts = [];
   lines.forEach((line) => {
-    const product = store.products.find((p) => p.id === line.productId || p.name === line.name);
+    let product = store.products.find(
+      (p) => p.id === line.productId || (line.name && p.name.toLowerCase() === String(line.name).toLowerCase())
+    );
+
+    // Receiving stock for something that isn't in the catalogue yet used to just
+    // silently drop the line — no stock, no product, nothing on the invoice or
+    // in billing. Create it instead, so a purchase always lands somewhere.
+    if (!product && line.name) {
+      const rate = Number(line.rate) || 0;
+      product = shapeProduct(
+        store,
+        {
+          name: line.name,
+          unit: line.unit || 'pcs',
+          hsn: line.hsn || '',
+          taxRate: Number(line.taxRate) || 0,
+          purchasePrice: rate,
+          price: rate > 0 ? Math.round(rate / 0.7) : 0,
+          stock: 0
+        },
+        null,
+        actor(req)
+      );
+      store.products.unshift(product);
+      createdProducts.push(product);
+      line.productId = product.id;
+    }
+
     if (!product) return;
     const qty = Number(line.qty);
     product.stock = r2(Number(product.stock || 0) + qty);
@@ -619,7 +755,76 @@ router.post('/purchases', (req, res) => {
   }
 
   store.purchases.unshift(purchase);
-  res.status(201).json({ success: true, message: 'Vendor purchase recorded.', data: purchase });
+
+  const message = createdProducts.length
+    ? `Vendor purchase recorded. ${createdProducts.length} new product(s) added to the catalogue: ${createdProducts.map((p) => p.name).join(', ')}.`
+    : 'Vendor purchase recorded.';
+
+  res.status(201).json({
+    success: true,
+    message,
+    data: purchase,
+    createdProducts
+  });
+});
+
+/**
+ * Void a purchase invoice: pulls the received stock back out, reverses the
+ * posted accounting voucher, and recomputes the vendor's payable — mirrors
+ * how `/orders/:orderId/void` treats a sales bill. Purchases are never hard
+ * deleted once posted, since that would silently break stock history and
+ * the vendor ledger; voiding keeps a visible, reversible audit trail.
+ */
+router.post('/purchases/:id/void', (req, res) => {
+  const store = req.tenantStore;
+  const purchase = (store.purchases || []).find((p) => p.id === req.params.id);
+  if (!purchase) return res.status(404).json({ success: false, message: 'Purchase not found.' });
+  if (purchase.status === 'VOID') {
+    return res.status(400).json({ success: false, message: 'This purchase is already voided.' });
+  }
+
+  (purchase.items || []).forEach((line) => {
+    const product = store.products.find((p) => p.id === line.productId);
+    if (!product) return;
+    const qty = Number(line.qty) || 0;
+    product.stock = r2(Number(product.stock || 0) - qty);
+    if (product.warehouses && typeof product.warehouses === 'object') {
+      const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+      product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - qty);
+      product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+    }
+    logStockMovement(store, {
+      product,
+      type: 'RETURN',
+      qtyChange: -qty,
+      reason: `Void of purchase ${purchase.invoiceNo}`,
+      refId: purchase.id,
+      user: actor(req)
+    });
+  });
+
+  const reversed = [];
+  (store.journal || [])
+    .filter((v) => v.refId === purchase.id && !v.isReversed && !v.reversalOf)
+    .forEach((v) => {
+      try {
+        reversed.push(engine.reverseJournal(store, v.id, actor(req)).voucherNo);
+      } catch (err) {
+        /* already reversed — nothing to undo */
+      }
+    });
+
+  if (purchase.vendorId) {
+    const vendor = store.vendors.find((v) => v.id === purchase.vendorId);
+    const account = (store.accounts || []).find((a) => a.partyId === purchase.vendorId && a.partyType === 'VENDOR');
+    if (vendor && account) vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
+  }
+
+  purchase.status = 'VOID';
+  purchase.voidedBy = actor(req);
+  purchase.voidedAt = new Date().toISOString();
+
+  res.json({ success: true, message: `Purchase ${purchase.invoiceNo} voided.`, data: { purchase, reversed } });
 });
 
 /**
@@ -669,7 +874,7 @@ router.post('/vendors/:id/pay', (req, res) => {
   let remaining = record.amount + r2(discount);
   const settled = [];
   (store.purchases || [])
-    .filter((p) => p.vendorId === vendor.id && p.paymentStatus !== 'PAID')
+    .filter((p) => p.vendorId === vendor.id && p.paymentStatus !== 'PAID' && p.status !== 'VOID')
     .sort((a, b) => new Date(a.date) - new Date(b.date))
     .forEach((purchase) => {
       if (remaining <= 0.009) return;

@@ -58,6 +58,23 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_zunasoft_2026
 connectMasterDB().catch(() => {});
 verifyMailer();
 
+/**
+ * Safety net for any request handler that rejects (or throws inside an
+ * `async` handler) without being caught. Node terminates the whole process
+ * on an unhandled rejection by default since v15 — so one bad request
+ * (a flaky DB write, a null field from a malformed payload) would otherwise
+ * take the server down for every tenant, not just fail the one request that
+ * hit it. This logs it and keeps the process alive; the offending request
+ * still hangs until the client's own timeout, which is why every route
+ * should still catch its own errors — this is the last resort, not the fix.
+ */
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]', err);
+});
+
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);

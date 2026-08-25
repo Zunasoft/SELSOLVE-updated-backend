@@ -74,7 +74,15 @@ router.get('/init', (req, res) => {
       topBilled,
       recentBilledIds,
       session: store.session,
-      customers: store.customers || [],
+      customers: (store.customers || []).map((c) => {
+        const account = (store.accounts || []).find((a) => a.partyId === c.id && a.partyType === 'CUSTOMER');
+        const balance = account ? engine.accountBalance(store, account.id) : Number(c.outstanding || 0);
+        return {
+          ...c,
+          outstanding: Math.max(0, balance),
+          advance: Math.max(0, -balance)
+        };
+      }),
       vendors: store.vendors || [],
       heldBills: store.heldBills || [],
       tables: store.tables || [],
@@ -198,34 +206,56 @@ function baseQty(product, cartItem) {
  * Always recalculates total product.stock from warehouses.
  */
 function deductWarehouseStock(product, qtyToDeduct) {
-  if (!product.warehouses || typeof product.warehouses !== 'object') {
-    product.stock = r2(Number(product.stock || 0) - qtyToDeduct);
-    return;
-  }
-  let remainingToDeduct = qtyToDeduct;
-  if (product.warehouses.wh_shop !== undefined) {
-    const availableShop = Number(product.warehouses.wh_shop || 0);
-    const fromShop = Math.min(Math.max(0, availableShop), remainingToDeduct);
-    product.warehouses.wh_shop = r2(availableShop - fromShop);
-    remainingToDeduct = r2(remainingToDeduct - fromShop);
-  }
-  if (remainingToDeduct > 0) {
-    const mainWh = product.warehouses.wh_main !== undefined ? 'wh_main' : Object.keys(product.warehouses)[0];
-    if (mainWh) {
-      product.warehouses[mainWh] = r2(Number(product.warehouses[mainWh] || 0) - remainingToDeduct);
+  const deduct = Number(qtyToDeduct) || 0;
+  if (deduct <= 0) return;
+
+  const currentStock = Number(product.stock || 0);
+  product.stock = r2(currentStock - deduct);
+
+  if (product.warehouses && typeof product.warehouses === 'object' && Object.keys(product.warehouses).length > 0) {
+    let remainingToDeduct = deduct;
+    if (product.warehouses.wh_shop !== undefined) {
+      const availableShop = Number(product.warehouses.wh_shop || 0);
+      const fromShop = Math.min(Math.max(0, availableShop), remainingToDeduct);
+      product.warehouses.wh_shop = r2(availableShop - fromShop);
+      remainingToDeduct = r2(remainingToDeduct - fromShop);
     }
+    if (remainingToDeduct > 0) {
+      const mainWh = product.warehouses.wh_main !== undefined ? 'wh_main' : Object.keys(product.warehouses)[0];
+      if (mainWh) {
+        product.warehouses[mainWh] = r2(Number(product.warehouses[mainWh] || 0) - remainingToDeduct);
+      }
+    }
+    product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
   }
-  product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
 }
 
 function restoreWarehouseStock(product, qtyToRestore) {
-  if (!product.warehouses || typeof product.warehouses !== 'object') {
-    product.stock = r2(Number(product.stock || 0) + qtyToRestore);
-    return;
+  const restore = Number(qtyToRestore) || 0;
+  if (restore <= 0) return;
+
+  const currentStock = Number(product.stock || 0);
+  product.stock = r2(currentStock + restore);
+
+  if (product.warehouses && typeof product.warehouses === 'object' && Object.keys(product.warehouses).length > 0) {
+    const shopWh = product.warehouses.wh_shop !== undefined ? 'wh_shop' : (Object.keys(product.warehouses)[0] || 'wh_main');
+    product.warehouses[shopWh] = r2(Number(product.warehouses[shopWh] || 0) + restore);
+    product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
   }
-  const shopWh = product.warehouses.wh_shop !== undefined ? 'wh_shop' : (Object.keys(product.warehouses)[0] || 'wh_main');
-  product.warehouses[shopWh] = r2(Number(product.warehouses[shopWh] || 0) + qtyToRestore);
-  product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+}
+
+function findProductInStore(store, item) {
+  if (!item || !Array.isArray(store.products)) return null;
+  const itemId = item.id || item.productId;
+  const itemBarcode = item.barcode ? String(item.barcode).trim() : '';
+  const itemName = item.name ? String(item.name).trim().toLowerCase() : '';
+
+  return store.products.find((p) => {
+    if (itemId && (p.id === itemId || p._id === itemId)) return true;
+    if (itemBarcode && (p.barcode === itemBarcode || (Array.isArray(p.barcodes) && p.barcodes.includes(itemBarcode)))) return true;
+    if (itemName && p.name && p.name.trim().toLowerCase() === itemName) return true;
+    return false;
+  });
 }
 
 /**
@@ -237,7 +267,7 @@ function deductStock(store, items, orderId, user) {
   const shortages = [];
 
   items.forEach((cartItem) => {
-    const product = store.products.find((p) => p.id === cartItem.id || p.name === cartItem.name);
+    const product = findProductInStore(store, cartItem);
     if (!product) return;
 
     const soldQty = baseQty(product, cartItem);
@@ -246,10 +276,11 @@ function deductStock(store, items, orderId, user) {
     const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
 
     if (isComposite && ingredients.length > 0) {
+      const yieldQty = Number(recipe?.yieldQty) || Number(product.recipeYieldQty) || 1;
       ingredients.forEach((ing) => {
-        const raw = store.products.find((p) => p.id === ing.productId);
+        const raw = store.products.find((p) => p.id === ing.productId || (p.name && ing.name && p.name.trim().toLowerCase() === ing.name.trim().toLowerCase()));
         if (!raw) return;
-        const reqPerUnit = Number(ing.qty) || 0;
+        const reqPerUnit = (Number(ing.qty) || 0) / yieldQty;
         const deducted = Math.round(reqPerUnit * soldQty * 10000) / 10000;
 
         if (raw.stock < deducted) {
@@ -317,11 +348,15 @@ function deductStock(store, items, orderId, user) {
 }
 
 router.post('/orders', async (req, res) => {
+  try {
   const store = req.tenantStore;
   const {
-    customerName, customerPhone, customerId, paymentMethod,
+    customerName, customerPhone, customerId, customerGstin, customerPan, customerAddress,
+    customerState, customerStateCode, paymentMethod,
     subtotal, tax, discount, roundOff, total, items, tableId, splitPayments, notes,
-    redeemPoints
+    redeemPoints, redeemAdvanceAmount, dueDate, placeOfSupply, vendorCode, dispatchFrom, dispatchDate,
+    shipToName, shipToAddress, vehicleNo, shipBy, transporterName,
+    buyerRef, buyerRefDate, buyerOrderNo, buyerOrderDate, dispatchDocNo, termsOfDelivery, paymentTerms
   } = req.body;
 
   if (!items || items.length === 0) {
@@ -407,12 +442,22 @@ router.post('/orders', async (req, res) => {
     customer.loyaltyPoints = available - pointsRedeemed;
   }
 
-  const payableTotal = r2(Number(total) - loyaltyRedeemed);
+  /* ---------------------- Customer Advance / Store Credit ---------------------- */
+  let advanceRedeemed = 0;
+  if (customer && Number(redeemAdvanceAmount) > 0) {
+    const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
+    const ledgerBal = account ? engine.accountBalance(store, account.id) : 0;
+    const availableAdvance = Math.max(0, -ledgerBal) || Number(customer.advance || 0);
+    const maxApplicable = Math.max(0, r2(Number(total) - loyaltyRedeemed));
+    advanceRedeemed = Math.min(r2(Number(redeemAdvanceAmount)), maxApplicable, r2(availableAdvance));
+  }
+
+  const payableTotal = r2(Math.max(0, Number(total) - loyaltyRedeemed - advanceRedeemed));
 
   const shortages = deductStock(store, items, orderId, actor(req));
 
   const orderItems = (items || []).map((i) => {
-    const product = store.products.find((p) => p.id === i.id || p.name === i.name);
+    const product = findProductInStore(store, i);
     return {
       id: i.id || `item_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       name: i.name || i.printName || 'Item',
@@ -424,6 +469,7 @@ router.post('/orders', async (req, res) => {
       taxRate: Number(i.taxRate) || 0,
       total: Number(i.total) || Math.round((Number(i.qty) || 1) * (Number(i.price) || 0) * 100) / 100,
       discount: Number(i.discount) || 0,
+      hsn: i.hsn || (product ? product.hsn : '') || '',
       // The quantity actually deducted from stock, in the product's base unit —
       // e.g. 0.1 for "100 g" of a kg-based product. Costing (COGS) must use this,
       // not the as-sold `qty`, or a purchase price quoted per base unit gets
@@ -437,7 +483,29 @@ router.post('/orders', async (req, res) => {
     customerId: customer ? customer.id : null,
     customerName: customer ? customer.name : customerName || 'Walk-in Customer',
     customerPhone: customer ? customer.phone : customerPhone || 'N/A',
-    paymentMethod: paymentMethod || 'Cash',
+    customerGstin: customerGstin || (customer ? customer.gstin : '') || '',
+    customerPan: customerPan || (customer ? customer.pan : '') || '',
+    customerAddress: customerAddress || (customer ? customer.address : '') || '',
+    customerState: customerState || (customer ? customer.state : '') || '',
+    customerStateCode: customerStateCode || (customer ? customer.stateCode : '') || '',
+    dueDate: dueDate || null,
+    placeOfSupply: placeOfSupply || '',
+    vendorCode: vendorCode || '',
+    dispatchFrom: dispatchFrom || '',
+    dispatchDate: dispatchDate || null,
+    shipToName: shipToName || '',
+    shipToAddress: shipToAddress || '',
+    vehicleNo: vehicleNo || '',
+    shipBy: shipBy || '',
+    transporterName: transporterName || '',
+    buyerRef: buyerRef || '',
+    buyerRefDate: buyerRefDate || null,
+    buyerOrderNo: buyerOrderNo || '',
+    buyerOrderDate: buyerOrderDate || null,
+    dispatchDocNo: dispatchDocNo || '',
+    termsOfDelivery: termsOfDelivery || '',
+    paymentTerms: paymentTerms || '',
+    paymentMethod: payableTotal === 0 && advanceRedeemed > 0 ? 'Advance / Store Credit' : paymentMethod || 'Cash',
     splitPayments: Array.isArray(splitPayments) ? splitPayments : null,
     subtotal: r2(subtotal),
     tax: r2(tax),
@@ -445,6 +513,8 @@ router.post('/orders', async (req, res) => {
     roundOff: r2(roundOff || 0),
     loyaltyRedeemed,
     pointsRedeemed,
+    advanceRedeemed,
+    advanceBalance: customer ? Math.max(0, (Number(customer.advance) || 0) - advanceRedeemed) : 0,
     grossTotal: r2(total),
     total: payableTotal,
     notes: notes || '',
@@ -465,7 +535,7 @@ router.post('/orders', async (req, res) => {
     order.loyaltyBalance = customer.loyaltyPoints;
   }
 
-  if (String(paymentMethod).toLowerCase() === 'cash' && store.session) {
+  if (String(order.paymentMethod).toLowerCase() === 'cash' && store.session && order.total > 0) {
     store.session.currentCash = r2(store.session.currentCash + order.total);
     store.session.cashEntries.push({
       type: 'IN',
@@ -494,7 +564,12 @@ router.post('/orders', async (req, res) => {
     const account = (store.accounts || []).find(
       (a) => a.partyId === customer.id && a.partyType === 'CUSTOMER'
     );
-    if (account) customer.outstanding = Math.max(0, engine.accountBalance(store, account.id));
+    if (account) {
+      const currentBal = engine.accountBalance(store, account.id);
+      customer.outstanding = Math.max(0, currentBal);
+      customer.advance = Math.max(0, -currentBal);
+      order.advanceBalance = customer.advance;
+    }
   }
 
   // The invoice, the stock it moved and the vouchers it posted are all part of
@@ -513,6 +588,10 @@ router.post('/orders', async (req, res) => {
     warnings: shortages.length ? shortages.map((s) => `${s.name}: only ${s.available} left`) : [],
     data: { ...order, company: store.settings.company, billing: store.settings.billing }
   });
+  } catch (err) {
+    console.error('[POST /orders]', err);
+    res.status(500).json({ success: false, message: 'Could not complete checkout. Please try again.' });
+  }
 });
 
 router.get('/orders', (req, res) => {
@@ -552,7 +631,7 @@ router.post('/orders/:orderId/void', (req, res) => {
   }
 
   order.items.forEach((item) => {
-    const product = store.products.find((p) => p.id === item.id || p.name === item.name);
+    const product = findProductInStore(store, item);
     if (!product) return;
 
     const soldQty = baseQty(product, item);
@@ -561,10 +640,11 @@ router.post('/orders/:orderId/void', (req, res) => {
     const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
 
     if (isComposite && ingredients.length > 0) {
+      const yieldQty = Number(recipe?.yieldQty) || Number(product.recipeYieldQty) || 1;
       ingredients.forEach((ing) => {
-        const raw = store.products.find((p) => p.id === ing.productId);
+        const raw = store.products.find((p) => p.id === ing.productId || (p.name && ing.name && p.name.trim().toLowerCase() === ing.name.trim().toLowerCase()));
         if (!raw) return;
-        const reqPerUnit = Number(ing.qty) || 0;
+        const reqPerUnit = (Number(ing.qty) || 0) / yieldQty;
         const returned = Math.round(reqPerUnit * soldQty * 10000) / 10000;
         restoreWarehouseStock(raw, returned);
 
@@ -1002,7 +1082,12 @@ router.post('/quotations', (req, res) => {
 
   const billing = store.settings.billing || {};
   const year = new Date().getFullYear();
-  const nextNo = (store.quotations.length || 0) + 1001;
+  // A count of the live array collides once any quotation is deleted (its slot's
+  // number gets reissued to the next one created) — verified live: create 3, delete
+  // #2, create another, and the new one reuses #2's number. A monotonic counter
+  // persisted on settings, mirroring invoice numbering, can't go backwards.
+  const nextNo = Number(billing.nextQuotationNo) || 1001;
+  billing.nextQuotationNo = nextNo + 1;
   const quotationNo = `QT-${year}-${String(nextNo).padStart(4, '0')}`;
 
   const quotationItems = items.map((i) => ({
@@ -1010,6 +1095,7 @@ router.post('/quotations', (req, res) => {
     productId: i.productId || i.id,
     name: i.name || 'Item',
     barcode: i.barcode || '',
+    hsn: i.hsn || '',
     qty: Number(i.qty) || 1,
     unit: i.unit || 'pcs',
     price: Number(i.price) || 0,
@@ -1063,6 +1149,16 @@ router.put('/quotations/:id', (req, res) => {
   const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id);
   if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
 
+  // A converted quotation's numbers were already carried onto a real, posted
+  // invoice — editing them afterward would silently desync the two records with
+  // nothing to signal the mismatch, so the quotation is frozen once converted.
+  if (quotation.status === 'CONVERTED') {
+    return res.status(400).json({
+      success: false,
+      message: `Quotation ${quotation.quotationNo} is already converted to Invoice #${quotation.convertedOrderId} and can no longer be edited.`
+    });
+  }
+
   const {
     customerName, customerPhone, customerGstin, customerAddress,
     items, subtotal, tax, discount, total, validUntil, notes, terms, status
@@ -1083,6 +1179,7 @@ router.put('/quotations/:id', (req, res) => {
       productId: i.productId || i.id,
       name: i.name || 'Item',
       barcode: i.barcode || '',
+      hsn: i.hsn || '',
       qty: Number(i.qty) || 1,
       unit: i.unit || 'pcs',
       price: Number(i.price) || 0,
@@ -1108,18 +1205,27 @@ router.put('/quotations/:id', (req, res) => {
 
 router.delete('/quotations/:id', (req, res) => {
   const store = req.tenantStore;
-  const initialLength = (store.quotations || []).length;
-  store.quotations = (store.quotations || []).filter((qt) => qt.id !== req.params.id && qt.quotationNo !== req.params.id);
+  const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id || qt.quotationNo === req.params.id);
+  if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
 
-  if (store.quotations.length === initialLength) {
-    return res.status(404).json({ success: false, message: 'Quotation not found.' });
+  // Once converted, the quotation is the audit trail back to a real posted
+  // invoice (see the PUT guard above) — deleting it would sever that trail while
+  // leaving the invoice's "Converted from Quotation ..." note pointing at nothing.
+  if (quotation.status === 'CONVERTED') {
+    return res.status(400).json({
+      success: false,
+      message: `Quotation ${quotation.quotationNo} is already converted to Invoice #${quotation.convertedOrderId} and can no longer be deleted.`
+    });
   }
+
+  store.quotations = (store.quotations || []).filter((qt) => qt.id !== req.params.id && qt.quotationNo !== req.params.id);
 
   res.json({ success: true, message: 'Quotation deleted.' });
 });
 
 /** Convert Quotation into a live Tax Invoice with stock movement & double-entry posting */
 router.post('/quotations/:id/convert', async (req, res) => {
+  try {
   const store = req.tenantStore;
   const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id || qt.quotationNo === req.params.id);
   if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
@@ -1212,6 +1318,10 @@ router.post('/quotations/:id/convert', async (req, res) => {
       quotation
     }
   });
+  } catch (err) {
+    console.error('[POST /quotations/:id/convert]', err);
+    res.status(500).json({ success: false, message: 'Could not convert this quotation. Please try again.' });
+  }
 });
 
 module.exports = router;

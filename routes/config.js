@@ -49,20 +49,25 @@ router.get('/settings', (req, res) => {
 
 /** Section-wise merge so one screen can save without clobbering the others. */
 router.put('/settings/:section', async (req, res) => {
-  const store = req.tenantStore;
-  const section = req.params.section;
+  try {
+    const store = req.tenantStore;
+    const section = req.params.section;
 
-  if (!store.settings[section]) {
-    return res.status(404).json({ success: false, message: `Unknown settings section "${section}".` });
+    if (!store.settings[section]) {
+      return res.status(404).json({ success: false, message: `Unknown settings section "${section}".` });
+    }
+
+    store.settings[section] = { ...store.settings[section], ...req.body };
+    await saveSettingsToDb(req.tenantDbName, store.settings);
+    res.json({
+      success: true,
+      message: `${section.charAt(0).toUpperCase() + section.slice(1)} settings saved.`,
+      data: store.settings[section]
+    });
+  } catch (err) {
+    console.error('[PUT /settings/:section]', err);
+    res.status(500).json({ success: false, message: 'Could not save settings. Please try again.' });
   }
-
-  store.settings[section] = { ...store.settings[section], ...req.body };
-  await saveSettingsToDb(req.tenantDbName, store.settings);
-  res.json({
-    success: true,
-    message: `${section.charAt(0).toUpperCase() + section.slice(1)} settings saved.`,
-    data: store.settings[section]
-  });
 });
 
 /* --------------------------------- hardware --------------------------------- */

@@ -65,25 +65,50 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
   const discount = r2(order.discount);
   const tax = r2(order.tax);
   const total = r2(order.total);
-  const rounding = r2(total - (subtotal - discount + tax));
+  const advanceRedeemed = r2(order.advanceRedeemed || 0);
+  const loyaltyRedeemed = r2(order.loyaltyRedeemed || 0);
+  const effectiveSettled = r2(total + advanceRedeemed + loyaltyRedeemed);
+  const rounding = r2(effectiveSettled - (subtotal - discount + tax));
 
-  let debitAccount;
   let partyId = null;
-
-  if (isCreditSale(order.paymentMethod) && customer) {
-    const partyAccount = ensurePartyAccount(store, customer, 'CUSTOMER');
-    debitAccount = partyAccount;
+  if (customer && (isCreditSale(order.paymentMethod) || advanceRedeemed > 0)) {
     partyId = customer.id;
-  } else {
-    debitAccount = settlementAccount(store, order.paymentMethod, order.settlementAccountId);
   }
 
   const lines = [
-    { accountId: debitAccount.id, debit: total, partyId, narration: `Invoice ${order.orderId}` },
-    { accountId: bySystemKey(store, 'DISCOUNT_ALLOWED')?.id, debit: discount },
+    { accountId: bySystemKey(store, 'DISCOUNT_ALLOWED')?.id, debit: r2(discount + loyaltyRedeemed) },
     { accountId: bySystemKey(store, 'SALES')?.id, credit: subtotal },
     ...gstLines(store, tax, { interState, input: false })
   ];
+
+  if (advanceRedeemed > 0 && customer) {
+    const partyAccount = ensurePartyAccount(store, customer, 'CUSTOMER');
+    lines.unshift({
+      accountId: partyAccount.id,
+      debit: advanceRedeemed,
+      partyId: customer.id,
+      narration: `Advance adjusted against Invoice ${order.orderId}`
+    });
+  }
+
+  if (total > 0) {
+    let debitAccount;
+    let linePartyId = null;
+    if (isCreditSale(order.paymentMethod) && customer) {
+      const partyAccount = ensurePartyAccount(store, customer, 'CUSTOMER');
+      debitAccount = partyAccount;
+      linePartyId = customer.id;
+      partyId = customer.id;
+    } else {
+      debitAccount = settlementAccount(store, order.paymentMethod, order.settlementAccountId);
+    }
+    lines.unshift({
+      accountId: debitAccount.id,
+      debit: total,
+      partyId: linePartyId,
+      narration: `Invoice ${order.orderId}`
+    });
+  }
 
   const roundingAcc = bySystemKey(store, 'ROUNDING_OFF');
   if (roundingAcc && rounding !== 0) {
