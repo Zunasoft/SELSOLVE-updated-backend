@@ -590,11 +590,15 @@ router.post('/receipts', (req, res) => {
     record.voucherNo = voucher.voucherNo;
     store.receipts.unshift(record);
 
-    // Keep the legacy POS field aligned with the ledger.
+    // Keep the legacy POS fields aligned with the ledger — an overpayment can
+    // push the balance negative (a real advance), so both sides must be
+    // resynced together or `customer.advance` is left stale at its old value.
     const account = (store.accounts || []).find(
       (a) => a.partyId === customer.id && a.partyType === 'CUSTOMER'
     );
-    customer.outstanding = Math.max(0, accountBalance(store, account.id));
+    const currentBal = accountBalance(store, account.id);
+    customer.outstanding = Math.max(0, currentBal);
+    customer.advance = Math.max(0, -currentBal);
 
     res.status(201).json({
       success: true,

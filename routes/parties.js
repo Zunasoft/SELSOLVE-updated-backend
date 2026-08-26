@@ -141,6 +141,7 @@ router.put('/customers/:id', async (req, res) => {
       state,
       stateCode,
       loyaltyPoints,
+      outstandingReceivable,
       advanceBalance,
       openingAdvance
     } = req.body;
@@ -161,21 +162,34 @@ router.put('/customers/:id', async (req, res) => {
     const account = engine.ensurePartyAccount(store, customer, 'CUSTOMER');
     if (account) account.name = customer.name;
 
+    // Receivable and advance are opposite sides of the one sub-ledger balance
+    // (owed BY the customer vs. owed TO them), so both fields target the same
+    // account and are combined into one net figure rather than posted separately
+    // — posting them independently against a stale "current side only" reading
+    // used to land on the wrong balance whenever the customer already carried
+    // some amount on the other side (e.g. setting advance while a receivable
+    // was outstanding silently left a leftover receivable behind).
     const targetAdvance = advanceBalance !== undefined ? advanceBalance : openingAdvance;
-    if (targetAdvance !== undefined && targetAdvance !== null && targetAdvance !== '') {
+    const hasReceivableInput = outstandingReceivable !== undefined && outstandingReceivable !== null && outstandingReceivable !== '';
+    const hasAdvanceInput = targetAdvance !== undefined && targetAdvance !== null && targetAdvance !== '';
+
+    if (hasReceivableInput || hasAdvanceInput) {
+      const receivablePart = hasReceivableInput ? Number(outstandingReceivable) || 0 : 0;
+      const advancePart = hasAdvanceInput ? Number(targetAdvance) || 0 : 0;
+      const targetBalance = receivablePart - advancePart;
+
       const currentLedgerBal = ledgerBalance(store, customer.id, 'CUSTOMER');
-      const currentAdvance = Math.max(0, -currentLedgerBal);
-      const newAdvance = Math.max(0, Number(targetAdvance) || 0);
-      const diff = newAdvance - currentAdvance;
+      const diff = targetBalance - currentLedgerBal;
 
       if (Math.abs(diff) > 0.001) {
         posting.postOpeningBalance(store, {
           accountId: account.id,
           amount: Math.abs(diff),
-          side: diff > 0 ? 'CR' : 'DR',
+          side: diff > 0 ? 'DR' : 'CR',
           createdBy: actor(req)
         });
-        customer.advance = newAdvance;
+        customer.outstanding = Math.max(0, targetBalance);
+        customer.advance = Math.max(0, -targetBalance);
       }
     }
 
@@ -506,19 +520,24 @@ router.put('/vendors/:id', async (req, res) => {
 
   const account = engine.ensurePartyAccount(store, vendor, 'VENDOR');
 
-  // Handle editable Amount Payable adjustment
+  // Handle editable Amount Payable adjustment. The target is the account's net
+  // ledger balance, read fresh here rather than off `vendor.outstandingPayable`
+  // — that stored field is clamped to zero (Math.max(0, ...)) everywhere else
+  // it's written, so if the vendor ever carried an advance-paid (negative)
+  // balance, diffing against the clamped field posted the wrong amount and the
+  // vendor never actually landed on the payable figure that was typed in.
   if (outstandingPayable !== undefined && outstandingPayable !== null && outstandingPayable !== '') {
     const newPayable = Number(outstandingPayable) || 0;
-    const currentPayable = Number(vendor.outstandingPayable || 0);
+    const currentLedgerBal = ledgerBalance(store, vendor.id, 'VENDOR');
+    const diff = newPayable - currentLedgerBal;
 
-    if (Math.abs(newPayable - currentPayable) > 0.001) {
+    if (Math.abs(diff) > 0.001) {
       changedFields.push({
         field: 'Amount Payable',
-        old: `₹${currentPayable.toLocaleString('en-IN')}`,
+        old: `₹${Math.max(0, currentLedgerBal).toLocaleString('en-IN')}`,
         new: `₹${newPayable.toLocaleString('en-IN')}`
       });
 
-      const diff = newPayable - currentPayable;
       posting.postOpeningBalance(store, {
         accountId: account.id,
         amount: Math.abs(diff),

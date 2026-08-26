@@ -7,7 +7,6 @@ const express = require('express');
 const { ROLE_PERMISSIONS, ASSIGNABLE_ROLES, PERMISSION_KEYS, MODULE_KEYS, effectivePermissions } = require('../store');
 const { FEATURE_CATALOG, resolveTenantFeatures } = require('../modules/features');
 const { setRecipe, removeRecipe, decorateRecipe } = require('../modules/recipes');
-const { saveSettingsToDb } = require('../tenantProvisioner');
 
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
@@ -57,8 +56,13 @@ router.put('/settings/:section', async (req, res) => {
       return res.status(404).json({ success: false, message: `Unknown settings section "${section}".` });
     }
 
+    // Mutating req.tenantStore.settings is enough — the tenant middleware
+    // flushes it transactionally (queued per tenant) at the end of this
+    // request. A direct saveSettingsToDb() call here used to write immediately
+    // and unqueued, racing that flush: two concurrent PUTs to different
+    // sections could each read/write the whole settings object and clobber
+    // each other's change.
     store.settings[section] = { ...store.settings[section], ...req.body };
-    await saveSettingsToDb(req.tenantDbName, store.settings);
     res.json({
       success: true,
       message: `${section.charAt(0).toUpperCase() + section.slice(1)} settings saved.`,

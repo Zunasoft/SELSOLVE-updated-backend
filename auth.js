@@ -13,8 +13,7 @@ const jwt = require('jsonwebtoken');
 const { models, addAuditLog, ensureMasterDB, requireMasterDB, getOtpExpiryMinutes } = require('./db');
 const { permissionsFor } = require('./modules/users');
 const { sendOtpEmail, isSmtpConfigured } = require('./mailer');
-
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_zunasoft_2026';
+const { JWT_SECRET } = require('./config/config');
 const SESSION_TTL = process.env.ADMIN_SESSION_TTL || '12h';
 
 const MAX_VERIFY_ATTEMPTS = 5;

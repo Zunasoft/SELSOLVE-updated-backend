@@ -447,14 +447,62 @@ router.post('/orders', async (req, res) => {
   if (customer && Number(redeemAdvanceAmount) > 0) {
     const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
     const ledgerBal = account ? engine.accountBalance(store, account.id) : 0;
-    const availableAdvance = Math.max(0, -ledgerBal) || Number(customer.advance || 0);
+    // Trust the ledger balance alone — falling back to `customer.advance` here
+    // meant a stale/desynced stored field (e.g. after a void that never resynced
+    // it) could let a sale redeem an advance that no longer actually exists on
+    // the account, under-collecting cash for the difference.
+    const availableAdvance = Math.max(0, -ledgerBal);
     const maxApplicable = Math.max(0, r2(Number(total) - loyaltyRedeemed));
     advanceRedeemed = Math.min(r2(Number(redeemAdvanceAmount)), maxApplicable, r2(availableAdvance));
   }
 
   const payableTotal = r2(Math.max(0, Number(total) - loyaltyRedeemed - advanceRedeemed));
 
-  const shortages = deductStock(store, items, orderId, actor(req));
+  const requestedStatus = String(req.body.status || '').toUpperCase();
+  const isDraft = requestedStatus === 'DRAFT';
+  const isExplicitUnpaid = requestedStatus === 'UNPAID' || requestedStatus === 'PENDING';
+
+  // Partial payment or custom initial payment resolution
+  let initialPaid = 0;
+  if (isDraft || isExplicitUnpaid) {
+    initialPaid = 0;
+  } else if (req.body.paidAmount !== undefined || req.body.amountPaid !== undefined) {
+    initialPaid = Math.min(payableTotal, Math.max(0, r2(Number(req.body.paidAmount ?? req.body.amountPaid ?? 0))));
+  } else if (requestedStatus === 'PARTIALLY_PAID' || requestedStatus === 'PARTIAL') {
+    initialPaid = Math.min(payableTotal, Math.max(0, r2(Number(req.body.paidAmount ?? req.body.amountPaid ?? 0))));
+  } else if (posting.isCreditSale(paymentMethod)) {
+    // A Credit (Udhar) checkout with no explicit paidAmount/status means nothing
+    // was collected upfront — falling through to "default is full payment" here
+    // marked every plain credit sale PAID/balanceDue:0 the moment it was created,
+    // so the customer's real receivable was permanently hidden from the invoice.
+    initialPaid = 0;
+  } else {
+    // Default checkout is full payment
+    initialPaid = payableTotal;
+  }
+
+  let finalStatus;
+  let paymentStatus;
+  if (isDraft) {
+    finalStatus = 'DRAFT';
+    paymentStatus = 'DRAFT';
+  } else if (initialPaid >= payableTotal) {
+    finalStatus = 'PAID';
+    paymentStatus = 'PAID';
+  } else if (initialPaid > 0) {
+    finalStatus = 'PARTIALLY_PAID';
+    paymentStatus = 'PARTIALLY_PAID';
+  } else {
+    finalStatus = 'UNPAID';
+    paymentStatus = 'UNPAID';
+  }
+
+  const balanceDue = isDraft ? payableTotal : r2(Math.max(0, payableTotal - initialPaid));
+
+  let shortages = [];
+  if (!isDraft) {
+    shortages = deductStock(store, items, orderId, actor(req));
+  }
 
   const orderItems = (items || []).map((i) => {
     const product = findProductInStore(store, i);
@@ -470,14 +518,11 @@ router.post('/orders', async (req, res) => {
       total: Number(i.total) || Math.round((Number(i.qty) || 1) * (Number(i.price) || 0) * 100) / 100,
       discount: Number(i.discount) || 0,
       hsn: i.hsn || (product ? product.hsn : '') || '',
-      // The quantity actually deducted from stock, in the product's base unit —
-      // e.g. 0.1 for "100 g" of a kg-based product. Costing (COGS) must use this,
-      // not the as-sold `qty`, or a purchase price quoted per base unit gets
-      // multiplied by a sale-unit quantity and wildly overstates cost.
       baseQty: product ? baseQty(product, i) : (Number(i.qty) || 1)
     };
   });
 
+  const now = new Date().toISOString();
   const order = {
     orderId,
     customerId: customer ? customer.id : null,
@@ -506,6 +551,7 @@ router.post('/orders', async (req, res) => {
     termsOfDelivery: termsOfDelivery || '',
     paymentTerms: paymentTerms || '',
     paymentMethod: payableTotal === 0 && advanceRedeemed > 0 ? 'Advance / Store Credit' : paymentMethod || 'Cash',
+    paymentRef: req.body.paymentRef || '',
     splitPayments: Array.isArray(splitPayments) ? splitPayments : null,
     subtotal: r2(subtotal),
     tax: r2(tax),
@@ -517,50 +563,66 @@ router.post('/orders', async (req, res) => {
     advanceBalance: customer ? Math.max(0, (Number(customer.advance) || 0) - advanceRedeemed) : 0,
     grossTotal: r2(total),
     total: payableTotal,
+    paidAmount: initialPaid,
+    balanceDue: balanceDue,
+    payments: initialPaid > 0 ? [
+      {
+        id: `pay_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        amount: initialPaid,
+        paymentMethod: payableTotal === 0 && advanceRedeemed > 0 ? 'Advance / Store Credit' : paymentMethod || 'Cash',
+        paymentRef: req.body.paymentRef || '',
+        paidAt: now,
+        receivedBy: actor(req),
+        notes: req.body.paymentNotes || req.body.notes || 'Initial payment'
+      }
+    ] : [],
     notes: notes || '',
     tableId: tableId || null,
     cashier: actor(req),
     sessionId: store.session?.id || null,
-    date: new Date().toISOString(),
-    status: 'COMPLETED',
+    date: now,
+    status: finalStatus,
+    paymentStatus,
+    paidAt: initialPaid >= payableTotal && payableTotal > 0 ? now : null,
     items: orderItems
   };
 
-  // Points accrue on what was actually paid, not on the value settled with
-  // points — otherwise redeeming would keep topping the balance back up.
-  if (customer && pos.enableLoyalty !== false) {
-    const earned = Math.floor((order.total / 100) * (pos.loyaltyPointsPerHundred || 1));
+  // Points accrue on what was actually paid
+  if (!isDraft && customer && pos.enableLoyalty !== false) {
+    const earned = Math.floor((initialPaid / 100) * (pos.loyaltyPointsPerHundred || 1));
     customer.loyaltyPoints = (customer.loyaltyPoints || 0) + earned;
     order.loyaltyEarned = earned;
     order.loyaltyBalance = customer.loyaltyPoints;
   }
 
-  if (String(order.paymentMethod).toLowerCase() === 'cash' && store.session && order.total > 0) {
-    store.session.currentCash = r2(store.session.currentCash + order.total);
+  if (!isDraft && initialPaid > 0 && String(order.paymentMethod).toLowerCase() === 'cash' && store.session) {
+    store.session.currentCash = r2(store.session.currentCash + initialPaid);
     store.session.cashEntries.push({
       type: 'IN',
-      amount: order.total,
+      amount: initialPaid,
       reason: `Sale ${orderId}`,
       time: order.date
     });
   }
 
-  // Double-entry posting — the single source of truth for the accounts module.
+  // Double-entry posting
   let accounting = null;
-  try {
-    accounting = posting.postSale(store, order, {
-      customer,
-      interState: store.settings.tax.interState,
-      createdBy: actor(req)
-    });
-    order.voucherNo = accounting.voucher.voucherNo;
-    order.voucherId = accounting.voucher.id;
-    order.cogs = accounting.cogsAmount;
-  } catch (err) {
-    order.accountingError = err.message;
+  if (!isDraft) {
+    try {
+      accounting = posting.postSale(store, order, {
+        customer,
+        interState: store.settings.tax.interState,
+        createdBy: actor(req)
+      });
+      order.voucherNo = accounting?.voucher?.voucherNo || null;
+      order.voucherId = accounting?.voucher?.id || null;
+      order.cogs = accounting?.cogsAmount || 0;
+    } catch (err) {
+      order.accountingError = err.message;
+    }
   }
 
-  if (customer) {
+  if (customer && !isDraft) {
     const account = (store.accounts || []).find(
       (a) => a.partyId === customer.id && a.partyType === 'CUSTOMER'
     );
@@ -572,9 +634,6 @@ router.post('/orders', async (req, res) => {
     }
   }
 
-  // The invoice, the stock it moved and the vouchers it posted are all part of
-  // this tenant's store, which the tenant middleware flushes to the tenant's own
-  // database before this response is sent.
   store.orders.unshift(order);
 
   if (tableId) {
@@ -584,7 +643,13 @@ router.post('/orders', async (req, res) => {
 
   res.status(201).json({
     success: true,
-    message: 'Sale checkout completed successfully.',
+    message: isDraft
+      ? `Draft invoice ${orderId} saved.`
+      : finalStatus === 'PARTIALLY_PAID'
+      ? `Invoice ${orderId} created with partial payment of ₹${initialPaid}. Balance due: ₹${balanceDue}.`
+      : isExplicitUnpaid
+      ? `Invoice ${orderId} issued (Unpaid).`
+      : 'Sale checkout completed successfully.',
     warnings: shortages.length ? shortages.map((s) => `${s.name}: only ${s.available} left`) : [],
     data: { ...order, company: store.settings.company, billing: store.settings.billing }
   });
@@ -596,11 +661,18 @@ router.post('/orders', async (req, res) => {
 
 router.get('/orders', (req, res) => {
   const store = req.tenantStore;
-  const { from, to, q, paymentMethod, limit } = req.query;
+  const { from, to, q, paymentMethod, status, limit } = req.query;
 
   let rows = [...(store.orders || [])];
   rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
 
+  if (status && status !== 'ALL') {
+    if (status === 'UNPAID') {
+      rows = rows.filter((o) => o.status === 'UNPAID' || o.paymentStatus === 'UNPAID' || o.status === 'PARTIALLY_PAID' || o.paymentStatus === 'PARTIALLY_PAID');
+    } else {
+      rows = rows.filter((o) => o.status === status || o.paymentStatus === status);
+    }
+  }
   if (from) rows = rows.filter((o) => engine.dayKey(o.date) >= engine.dayKey(from));
   if (to) rows = rows.filter((o) => engine.dayKey(o.date) <= engine.dayKey(to));
   if (paymentMethod && paymentMethod !== 'ALL') rows = rows.filter((o) => o.paymentMethod === paymentMethod);
@@ -611,7 +683,7 @@ router.get('/orders', (req, res) => {
     );
   }
 
-  res.json({ success: true, data: rows.slice(0, Number(limit) || 200), count: rows.length });
+  res.json({ success: true, data: rows.slice(0, Number(limit) || 500), count: rows.length });
 });
 
 router.get('/orders/:orderId', (req, res) => {
@@ -619,6 +691,428 @@ router.get('/orders/:orderId', (req, res) => {
   const order = store.orders.find((o) => o.orderId === req.params.orderId);
   if (!order) return res.status(404).json({ success: false, message: 'Invoice not found.' });
   res.json({ success: true, data: { ...order, company: store.settings.company, billing: store.settings.billing } });
+});
+
+/** Mark an unpaid/partial invoice as Paid / Record Full or Partial Payment */
+router.post('/orders/:orderId/pay', async (req, res) => {
+  const store = req.tenantStore;
+  const order = (store.orders || []).find((o) => o.orderId === req.params.orderId);
+  if (!order) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+  if (order.status === 'VOID') return res.status(400).json({ success: false, message: 'Cannot record payment for a voided invoice.' });
+  if (order.status === 'DRAFT') return res.status(400).json({ success: false, message: 'Draft invoice must be issued before recording payments.' });
+
+  const total = Number(order.total) || 0;
+  const currentPaid = Number(order.paidAmount !== undefined ? order.paidAmount : (order.status === 'PAID' ? total : 0));
+  const currentDue = r2(order.balanceDue !== undefined ? Number(order.balanceDue) : Math.max(0, total - currentPaid));
+
+  if (currentDue <= 0 && (order.status === 'PAID' || order.paymentStatus === 'PAID')) {
+    return res.status(400).json({ success: false, message: 'Invoice is already fully paid.' });
+  }
+
+  const { amount, amountPaid, paidAmount, paymentMethod, paymentRef, notes } = req.body;
+  const requestedAmt = Number(amount ?? amountPaid ?? paidAmount ?? currentDue);
+  if (isNaN(requestedAmt) || requestedAmt <= 0) {
+    return res.status(400).json({ success: false, message: 'Payment amount must be greater than zero.' });
+  }
+
+  const payAmt = Math.min(currentDue, r2(requestedAmt));
+  const newPaidTotal = r2(currentPaid + payAmt);
+  const newDue = r2(Math.max(0, total - newPaidTotal));
+  const method = paymentMethod || order.paymentMethod || 'Cash';
+  const now = new Date().toISOString();
+
+  order.paidAmount = newPaidTotal;
+  order.balanceDue = newDue;
+  if (newDue <= 0) {
+    order.status = 'PAID';
+    order.paymentStatus = 'PAID';
+    order.paidAt = now;
+  } else {
+    order.status = 'PARTIALLY_PAID';
+    order.paymentStatus = 'PARTIALLY_PAID';
+  }
+
+  if (method) order.paymentMethod = method;
+  if (paymentRef) order.paymentRef = paymentRef;
+  if (notes) order.paymentNotes = notes;
+
+  if (!Array.isArray(order.payments)) {
+    order.payments = currentPaid > 0 ? [{
+      id: `pay_prev_${order.orderId}`,
+      amount: currentPaid,
+      paymentMethod: order.paymentMethod || 'Cash',
+      paymentRef: order.paymentRef || '',
+      paidAt: order.paidAt || order.date,
+      receivedBy: order.cashier || 'Cashier',
+      notes: 'Previous payment'
+    }] : [];
+  }
+
+  order.payments.push({
+    id: `pay_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    amount: payAmt,
+    paymentMethod: method,
+    paymentRef: paymentRef || '',
+    notes: notes || '',
+    paidAt: now,
+    receivedBy: actor(req)
+  });
+
+  // Add cash to active drawer session if cash payment
+  if (String(method).toLowerCase() === 'cash' && store.session && payAmt > 0) {
+    store.session.currentCash = r2(store.session.currentCash + payAmt);
+    store.session.cashEntries.push({
+      type: 'IN',
+      amount: payAmt,
+      reason: `Payment for Invoice ${order.orderId}`,
+      time: now
+    });
+  }
+
+  // Post the money actually collected to the books — Cash/Bank up, the
+  // customer's receivable down by the same amount — and resync the cached
+  // outstanding/advance fields off the resulting ledger balance. Without this
+  // the sale voucher's original AR debit was never reduced, so `/pay` moved
+  // the invoice to PAID on screen while the customer's udhar balance stayed
+  // stuck at the pre-payment figure forever.
+  if (order.customerId) {
+    const customer = (store.customers || []).find((c) => c.id === order.customerId);
+    if (customer) {
+      try {
+        posting.postReceipt(
+          store,
+          {
+            id: order.orderId,
+            amount: payAmt,
+            discount: 0,
+            paymentMode: method,
+            date: now,
+            notes: `Payment for Invoice ${order.orderId}`
+          },
+          { customer, createdBy: actor(req) }
+        );
+      } catch (err) {
+        order.accountingError = err.message;
+      }
+      const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
+      if (account) {
+        const currentBal = engine.accountBalance(store, account.id);
+        customer.outstanding = Math.max(0, currentBal);
+        customer.advance = Math.max(0, -currentBal);
+      }
+    }
+  }
+
+  const isFull = newDue <= 0;
+  res.json({
+    success: true,
+    message: isFull
+      ? `Payment of ₹${payAmt} recorded. Invoice #${order.orderId} is now fully PAID.`
+      : `Partial payment of ₹${payAmt} recorded. Remaining balance: ₹${newDue}.`,
+    data: { ...order, company: store.settings.company, billing: store.settings.billing }
+  });
+});
+
+/** Issue / Confirm a Draft Invoice (Full, Partial, or Unpaid) */
+router.post('/orders/:orderId/issue', async (req, res) => {
+  const store = req.tenantStore;
+  const order = (store.orders || []).find((o) => o.orderId === req.params.orderId);
+  if (!order) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+  if (order.status !== 'DRAFT') {
+    return res.status(400).json({ success: false, message: 'Invoice is already issued.' });
+  }
+
+  // Same guard as POST /orders — a draft can be edited via PUT before being
+  // issued, so re-check its (possibly since-edited) items here too, right
+  // before stock is deducted.
+  const badItem = (order.items || []).find((i) => !(Number(i.qty) > 0) || Number(i.price) < 0);
+  if (badItem) {
+    return res.status(400).json({
+      success: false,
+      message: `Invalid quantity or price for "${badItem.name || badItem.id || 'item'}". Quantity must be greater than zero and price cannot be negative.`
+    });
+  }
+
+  const targetStatus = String(req.body.status || '').toUpperCase();
+  const paymentMethod = req.body.paymentMethod || order.paymentMethod || 'Cash';
+  const paymentRef = req.body.paymentRef || '';
+  const now = new Date().toISOString();
+
+  let initialPaid = 0;
+  let finalStatus;
+  let paymentStatus;
+
+  if (targetStatus === 'PAID') {
+    initialPaid = order.total;
+    finalStatus = 'PAID';
+    paymentStatus = 'PAID';
+  } else if (targetStatus === 'PARTIALLY_PAID' || targetStatus === 'PARTIAL') {
+    initialPaid = Math.min(order.total, Math.max(0, r2(Number(req.body.paidAmount ?? req.body.amountPaid ?? 0))));
+    if (initialPaid >= order.total) {
+      finalStatus = 'PAID';
+      paymentStatus = 'PAID';
+    } else if (initialPaid > 0) {
+      finalStatus = 'PARTIALLY_PAID';
+      paymentStatus = 'PARTIALLY_PAID';
+    } else {
+      finalStatus = 'UNPAID';
+      paymentStatus = 'UNPAID';
+    }
+  } else {
+    initialPaid = 0;
+    finalStatus = 'UNPAID';
+    paymentStatus = 'UNPAID';
+  }
+
+  const shortages = deductStock(store, order.items, order.orderId, actor(req));
+
+  order.status = finalStatus;
+  order.paymentStatus = paymentStatus;
+  order.paymentMethod = paymentMethod;
+  order.paymentRef = paymentRef;
+  order.paidAmount = initialPaid;
+  order.balanceDue = r2(Math.max(0, order.total - initialPaid));
+  order.issuedAt = now;
+
+  if (initialPaid > 0) {
+    order.paidAt = initialPaid >= order.total ? now : null;
+    order.payments = [
+      {
+        id: `pay_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        amount: initialPaid,
+        paymentMethod,
+        paymentRef,
+        paidAt: now,
+        receivedBy: actor(req),
+        notes: 'Initial payment upon issuance'
+      }
+    ];
+    if (String(paymentMethod).toLowerCase() === 'cash' && store.session) {
+      store.session.currentCash = r2(store.session.currentCash + initialPaid);
+      store.session.cashEntries.push({
+        type: 'IN',
+        amount: initialPaid,
+        reason: `Payment for Invoice ${order.orderId}`,
+        time: now
+      });
+    }
+  } else {
+    order.payments = [];
+  }
+
+  let customer = null;
+  if (order.customerId) customer = (store.customers || []).find((c) => c.id === order.customerId);
+  try {
+    const accounting = posting.postSale(store, order, {
+      customer,
+      interState: store.settings.tax.interState,
+      createdBy: actor(req)
+    });
+    order.voucherNo = accounting?.voucher?.voucherNo || null;
+    order.voucherId = accounting?.voucher?.id || null;
+    order.cogs = accounting?.cogsAmount || 0;
+  } catch (err) {
+    order.accountingError = err.message;
+  }
+
+  res.json({
+    success: true,
+    message: `Draft Invoice #${order.orderId} successfully issued as ${finalStatus}!`,
+    warnings: shortages.length ? shortages.map((s) => `${s.name}: only ${s.available} left`) : [],
+    data: { ...order, company: store.settings.company, billing: store.settings.billing }
+  });
+});
+
+/** Update a Draft Invoice */
+router.put('/orders/:orderId', (req, res) => {
+  const store = req.tenantStore;
+  const order = (store.orders || []).find((o) => o.orderId === req.params.orderId);
+  if (!order) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+  if (order.status !== 'DRAFT') {
+    return res.status(400).json({ success: false, message: 'Only Draft invoices can be modified. Finalized invoices must be voided.' });
+  }
+
+  const {
+    customerName, customerPhone, customerId, customerGstin, customerPan, customerAddress,
+    customerState, customerStateCode, paymentMethod,
+    subtotal, tax, discount, roundOff, total, items, notes, dueDate
+  } = req.body;
+
+  // Same guard as POST /orders — a draft edited here with a bogus qty/price
+  // would carry it straight through to /issue's stock deduction unchecked.
+  if (Array.isArray(items) && items.length > 0) {
+    const badItem = items.find((i) => !(Number(i.qty) > 0) || Number(i.price) < 0);
+    if (badItem) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid quantity or price for "${badItem.name || badItem.id || 'item'}". Quantity must be greater than zero and price cannot be negative.`
+      });
+    }
+  }
+
+  if (customerName !== undefined) order.customerName = customerName;
+  if (customerPhone !== undefined) order.customerPhone = customerPhone;
+  if (customerId !== undefined) order.customerId = customerId;
+  if (customerGstin !== undefined) order.customerGstin = customerGstin;
+  if (customerPan !== undefined) order.customerPan = customerPan;
+  if (customerAddress !== undefined) order.customerAddress = customerAddress;
+  if (customerState !== undefined) order.customerState = customerState;
+  if (customerStateCode !== undefined) order.customerStateCode = customerStateCode;
+  if (paymentMethod !== undefined) order.paymentMethod = paymentMethod;
+  if (notes !== undefined) order.notes = notes;
+  if (dueDate !== undefined) order.dueDate = dueDate;
+  if (subtotal !== undefined) order.subtotal = r2(subtotal);
+  if (tax !== undefined) order.tax = r2(tax);
+  if (discount !== undefined) order.discount = r2(discount);
+  if (roundOff !== undefined) order.roundOff = r2(roundOff);
+  if (total !== undefined) order.total = r2(total);
+
+  if (Array.isArray(items) && items.length > 0) {
+    order.items = items.map((i) => {
+      const product = findProductInStore(store, i);
+      return {
+        id: i.id || `item_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        productId: i.productId || i.id,
+        name: i.name,
+        barcode: i.barcode || '',
+        hsn: i.hsn || '',
+        qty: Number(i.qty) || 1,
+        unit: i.unit || 'pcs',
+        price: Number(i.price) || 0,
+        taxRate: Number(i.taxRate) || 0,
+        discount: Number(i.discount) || 0,
+        total: Number(i.total) || 0,
+        baseQty: product ? baseQty(product, i) : (Number(i.qty) || 1)
+      };
+    });
+  }
+
+  res.json({
+    success: true,
+    message: `Draft Invoice #${order.orderId} updated.`,
+    data: { ...order, company: store.settings.company, billing: store.settings.billing }
+  });
+});
+
+/** Delete an Invoice (Draft, Unpaid, or Voided) */
+router.delete('/orders/:orderId', (req, res) => {
+  const store = req.tenantStore;
+  const idx = (store.orders || []).findIndex((o) => o.orderId === req.params.orderId);
+  if (idx < 0) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+  const order = store.orders[idx];
+
+  // If already issued (UNPAID, PARTIALLY_PAID, PAID, or VOID), unwind stock, accounting, and session drawer
+  if (order.status !== 'DRAFT') {
+    if (order.status !== 'VOID') {
+      // 1. Restore stock
+      (order.items || []).forEach((item) => {
+        const product = findProductInStore(store, item);
+        if (!product) return;
+
+        const soldQty = baseQty(product, item);
+        const isComposite = product.isComposite || product.productType === 'composite';
+        const recipe = (store.recipes || []).find((r) => r.productId === product.id);
+        const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
+
+        if (isComposite && ingredients.length > 0) {
+          const yieldQty = Number(recipe?.yieldQty) || Number(product.recipeYieldQty) || 1;
+          ingredients.forEach((ing) => {
+            const raw = store.products.find((p) => p.id === ing.productId || (p.name && ing.name && p.name.trim().toLowerCase() === ing.name.trim().toLowerCase()));
+            if (!raw) return;
+            const reqPerUnit = (Number(ing.qty) || 0) / yieldQty;
+            const returned = Math.round(reqPerUnit * soldQty * 10000) / 10000;
+            restoreWarehouseStock(raw, returned);
+
+            logStockMovement(store, {
+              product: raw,
+              type: 'RETURN',
+              qtyChange: returned,
+              reason: `Deleted Invoice ${order.orderId} (Restored from ${product.name})`,
+              refId: order.orderId,
+              user: actor(req)
+            });
+          });
+          return;
+        }
+
+        const isCombo = product.isCombo || product.productType === 'combo';
+        const comboItems = product.comboItems || product.bundleItems || [];
+        if (isCombo && comboItems.length > 0) {
+          comboItems.forEach((ci) => {
+            const comp = store.products.find((p) => p.id === ci.productId || p.id === ci.id);
+            if (!comp) return;
+            const compQty = Number(ci.qty || ci.quantity || 1);
+            const returned = Math.round(compQty * soldQty * 10000) / 10000;
+            restoreWarehouseStock(comp, returned);
+
+            logStockMovement(store, {
+              product: comp,
+              type: 'RETURN',
+              qtyChange: returned,
+              reason: `Deleted Invoice ${order.orderId} (Restored from combo ${product.name})`,
+              refId: order.orderId,
+              user: actor(req)
+            });
+          });
+          return;
+        }
+
+        restoreWarehouseStock(product, soldQty);
+
+        logStockMovement(store, {
+          product,
+          type: 'RETURN',
+          qtyChange: soldQty,
+          reason: `Deleted Invoice ${order.orderId}`,
+          refId: order.orderId,
+          user: actor(req)
+        });
+      });
+
+      // 2. Reverse accounting journal vouchers
+      (store.journal || [])
+        .filter((v) => v.refId === order.orderId && !v.isReversed && !v.reversalOf)
+        .forEach((v) => {
+          try {
+            engine.reverseJournal(store, v.id, actor(req));
+          } catch (err) {
+            /* already reversed */
+          }
+        });
+
+      // 3. Deduct any cash received from active session drawer
+      const paidCash = (order.payments || [])
+        .filter((p) => String(p.paymentMethod).toLowerCase() === 'cash')
+        .reduce((sum, p) => sum + (Number(p.amount) || 0), 0) || (order.paymentMethod === 'Cash' ? Number(order.paidAmount || 0) : 0);
+
+      if (paidCash > 0 && store.session) {
+        store.session.currentCash = r2(store.session.currentCash - paidCash);
+        store.session.cashEntries.push({
+          type: 'OUT',
+          amount: paidCash,
+          reason: `Delete Invoice ${order.orderId}`,
+          time: new Date().toISOString()
+        });
+      }
+
+      // 4. Unwind customer loyalty and resync customer accounts
+      const customer = (store.customers || []).find((c) => c.id === order.customerId);
+      if (customer) {
+        const balance = (customer.loyaltyPoints || 0) - (order.loyaltyEarned || 0) + (order.pointsRedeemed || 0);
+        customer.loyaltyPoints = Math.max(0, balance);
+
+        const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
+        if (account) {
+          const currentBal = engine.accountBalance(store, account.id);
+          customer.outstanding = Math.max(0, currentBal);
+          customer.advance = Math.max(0, -currentBal);
+        }
+      }
+    }
+  }
+
+  store.orders.splice(idx, 1);
+  res.json({ success: true, message: `Invoice #${order.orderId} deleted and inventory stock restored.` });
 });
 
 /** Void a completed bill: restore stock and reverse every related voucher. */
@@ -721,6 +1215,18 @@ router.post('/orders/:orderId/void', (req, res) => {
   if (customer) {
     const balance = (customer.loyaltyPoints || 0) - (order.loyaltyEarned || 0) + (order.pointsRedeemed || 0);
     customer.loyaltyPoints = Math.max(0, balance);
+
+    // The journal reversal above already moved the ledger back to where it was
+    // before this sale; resync the cached outstanding/advance fields to match —
+    // otherwise they keep showing the pre-void figures (mirrors the resync
+    // /purchases/:id/void already does for vendor.outstandingPayable), and a
+    // later sale's advance-redemption check trusts these fields going stale.
+    const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
+    if (account) {
+      const currentBal = engine.accountBalance(store, account.id);
+      customer.outstanding = Math.max(0, currentBal);
+      customer.advance = Math.max(0, -currentBal);
+    }
   }
 
   order.status = 'VOID';
@@ -818,7 +1324,7 @@ router.post('/session/close', (req, res) => {
 
 router.post('/session/cash-entry', (req, res) => {
   const store = req.tenantStore;
-  const { type, amount, reason, person, purpose, classification, expenseCategory, accountId, vendorId } = req.body;
+  const { type, amount, reason, person, phone, address, purpose, classification, expenseCategory, accountId, vendorId, customerId, partyType } = req.body;
   const value = Number(amount);
   if (!value) return res.status(400).json({ success: false, message: 'Amount is required.' });
   if (!store.session || store.session.status !== 'open') {
@@ -827,7 +1333,6 @@ router.post('/session/cash-entry', (req, res) => {
 
   const isUnofficial = classification === 'UNOFFICIAL';
   const isExpense = classification === 'EXPENSE' || type === 'EXPENSE';
-  const isVendorRepay = classification === 'VENDOR_REPAY' || Boolean(vendorId);
   const effectiveType = isExpense ? 'OUT' : (type === 'IN' ? 'IN' : 'OUT');
 
   store.session.currentCash = r2(
@@ -836,19 +1341,41 @@ router.post('/session/cash-entry', (req, res) => {
       : store.session.currentCash - value
   );
 
+  let customerObj = null;
+  if (customerId || partyType === 'CUSTOMER') {
+    customerObj = (store.customers || []).find((c) => c.id === customerId || (c.name && person && c.name.toLowerCase() === person.toLowerCase())) || null;
+  }
+
   let vendorObj = null;
-  if (isVendorRepay) {
+  if (vendorId || classification === 'VENDOR_REPAY' || partyType === 'VENDOR') {
     vendorObj = (store.vendors || []).find((v) => v.id === vendorId || (v.name && person && v.name.toLowerCase() === person.toLowerCase())) || null;
   }
+
+  const resolvedPerson = customerObj ? customerObj.name : (vendorObj ? vendorObj.name : person) || '';
+  const resolvedPartyType = customerObj ? 'CUSTOMER' : (vendorObj ? 'VENDOR' : (partyType || 'OTHER'));
+  const resolvedPhone = customerObj ? (customerObj.phone || '') : (vendorObj ? (vendorObj.phone || '') : (phone || ''));
+  const resolvedAddress = customerObj ? (customerObj.address || '') : (vendorObj ? (vendorObj.address || '') : (address || ''));
 
   const entry = {
     id: `ce_${Date.now()}`,
     type: effectiveType,
     amount: value,
-    classification: isExpense ? 'EXPENSE' : isVendorRepay ? 'VENDOR_REPAY' : isUnofficial ? 'UNOFFICIAL' : 'OFFICIAL',
-    person: (vendorObj ? vendorObj.name : person) || '',
+    classification: isExpense
+      ? 'EXPENSE'
+      : customerObj
+      ? 'CUSTOMER_ENTRY'
+      : vendorObj
+      ? (effectiveType === 'IN' ? 'VENDOR_REPAY' : 'VENDOR_PAYMENT')
+      : isUnofficial
+      ? 'UNOFFICIAL'
+      : 'OFFICIAL',
+    partyType: resolvedPartyType,
+    person: resolvedPerson,
+    phone: resolvedPhone,
+    address: resolvedAddress,
+    customerId: customerObj ? customerObj.id : null,
     vendorId: vendorObj ? vendorObj.id : null,
-    purpose: purpose || reason || (isExpense ? 'Internal business expense' : isVendorRepay ? 'Vendor Debt Repayment / Refund' : `Cash ${effectiveType}`),
+    purpose: purpose || reason || (isExpense ? 'Internal business expense' : customerObj ? `Customer ${effectiveType === 'IN' ? 'Receipt' : 'Refund'}` : vendorObj ? `Vendor ${effectiveType === 'IN' ? 'Repayment/Refund' : 'Payment'}` : `Cash ${effectiveType}`),
     expenseCategory: expenseCategory || (isExpense ? 'General' : null),
     reason: reason || purpose || `Cash ${effectiveType}`,
     time: new Date().toISOString(),
@@ -858,11 +1385,30 @@ router.post('/session/cash-entry', (req, res) => {
   store.session.cashEntries.push(entry);
 
   let voucherNo = null;
-  // Official fund transfers, vendor repayments, or expenses post to double-entry ledger
+  // Official fund transfers, vendor settlements, customer receipts, or expenses post to double-entry ledger
   if (!isUnofficial) {
     try {
       const cash = engine.bySystemKey(store, 'CASH');
-      if (isVendorRepay && vendorObj) {
+      if (customerObj && effectiveType === 'IN') {
+        // Customer Paying Into Drawer (Receipt / Settlement)
+        const voucher = posting.postReceipt(
+          store,
+          {
+            id: `rec_${Date.now()}`,
+            date: new Date().toISOString(),
+            amount: value,
+            discount: 0,
+            paymentMode: 'Cash',
+            notes: `${entry.purpose} (Customer: ${customerObj.name})`
+          },
+          { customer: customerObj, createdBy: actor(req) }
+        );
+        voucherNo = voucher.voucherNo;
+        if (customerObj.outstanding !== undefined) {
+          customerObj.outstanding = r2((customerObj.outstanding || 0) - value);
+        }
+      } else if (vendorObj && effectiveType === 'IN') {
+        // Vendor Repayment / Refund Into Drawer
         const voucher = posting.postVendorRefund(store, {
           amount: value,
           vendor: vendorObj,
@@ -870,6 +1416,24 @@ router.post('/session/cash-entry', (req, res) => {
           createdBy: actor(req)
         });
         voucherNo = voucher.voucherNo;
+      } else if (vendorObj && effectiveType === 'OUT') {
+        // Vendor Cash Payout From Drawer
+        const voucher = posting.postPayment(
+          store,
+          {
+            id: `pay_${Date.now()}`,
+            date: new Date().toISOString(),
+            amount: value,
+            discount: 0,
+            paymentMode: 'Cash',
+            notes: `${entry.purpose} (Vendor: ${vendorObj.name})`
+          },
+          { vendor: vendorObj, createdBy: actor(req) }
+        );
+        voucherNo = voucher.voucherNo;
+        if (vendorObj.outstanding !== undefined) {
+          vendorObj.outstanding = r2((vendorObj.outstanding || 0) - value);
+        }
       } else if (isExpense) {
         const expenseAcc = (store.accounts || []).find((a) => a.type === 'EXPENSE') || { id: 'acc_gen_expense' };
         const voucher = posting.postDirectExpense(
@@ -1271,7 +1835,16 @@ router.post('/quotations/:id/convert', async (req, res) => {
     cashier: actor(req),
     sessionId: store.session?.id || null,
     date: new Date().toISOString(),
+    // A quotation conversion has no partial/credit option in the UI — it's
+    // always settled in full at conversion time (see the cash-drawer credit
+    // below). Without paidAmount/balanceDue/paymentStatus, the invoice list's
+    // paid/due derivation (which reads those fields, not `status`) treated
+    // every converted invoice as fully UNPAID.
     status: 'COMPLETED',
+    paymentStatus: 'PAID',
+    paidAmount: quotation.total,
+    balanceDue: 0,
+    paidAt: new Date().toISOString(),
     items: quotation.items
   };
 

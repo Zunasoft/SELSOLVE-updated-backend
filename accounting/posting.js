@@ -91,23 +91,43 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
     });
   }
 
+  // Split the settlement between what was actually collected (Cash/Bank) and
+  // what's still owed (customer AR) — order.paidAmount/balanceDue drive this,
+  // not just paymentMethod, so a "Partial Payment" sale (paymentMethod =
+  // 'Cash' for the upfront portion, with a real balance left over) no longer
+  // books the *entire* total to Cash while leaving the unpaid remainder off
+  // the books entirely. When paidAmount isn't set on the order (e.g. the
+  // legacy quotation-convert path, which is always settled in full at
+  // conversion), this falls back to treating it as fully collected.
   if (total > 0) {
-    let debitAccount;
-    let linePartyId = null;
-    if (isCreditSale(order.paymentMethod) && customer) {
-      const partyAccount = ensurePartyAccount(store, customer, 'CUSTOMER');
-      debitAccount = partyAccount;
-      linePartyId = customer.id;
-      partyId = customer.id;
-    } else {
-      debitAccount = settlementAccount(store, order.paymentMethod, order.settlementAccountId);
+    const paidPortion = r2(Math.max(0, Math.min(total, Number(order.paidAmount ?? total))));
+    let duePortion = r2(Math.max(0, total - paidPortion));
+    if (duePortion > 0 && !customer) {
+      // No party to carry the receivable on — fold it back into the
+      // settlement line rather than silently dropping it from the books.
+      duePortion = 0;
     }
-    lines.unshift({
-      accountId: debitAccount.id,
-      debit: total,
-      partyId: linePartyId,
-      narration: `Invoice ${order.orderId}`
-    });
+    const settledPortion = r2(total - duePortion);
+
+    if (duePortion > 0) {
+      const partyAccount = ensurePartyAccount(store, customer, 'CUSTOMER');
+      partyId = customer.id;
+      lines.unshift({
+        accountId: partyAccount.id,
+        debit: duePortion,
+        partyId: customer.id,
+        narration: `Invoice ${order.orderId} — balance due`
+      });
+    }
+
+    if (settledPortion > 0) {
+      const debitAccount = settlementAccount(store, order.paymentMethod, order.settlementAccountId);
+      lines.unshift({
+        accountId: debitAccount.id,
+        debit: settledPortion,
+        narration: `Invoice ${order.orderId}`
+      });
+    }
   }
 
   const roundingAcc = bySystemKey(store, 'ROUNDING_OFF');

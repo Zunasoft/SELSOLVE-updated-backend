@@ -50,7 +50,7 @@ const apiRoutes = require('./routes');
 
 const app = express();
 const PORT = process.env.PORT || config.PORT || 5001;
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_zunasoft_2026';
+const JWT_SECRET = config.JWT_SECRET;
 
 // Warm the master connection at boot. Requests do not depend on this having
 // finished — each one calls ensureMasterDB() itself — but a warm instance
@@ -563,6 +563,7 @@ app.put(
 
 const TENANT_OTP_SCOPE = 'tenant';
 const MAX_OTP_ATTEMPTS = 5;
+const TENANT_OTP_RESEND_COOLDOWN_MS = 30 * 1000;
 
 const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
 const hashOtp = (otp) => crypto.createHash('sha256').update(String(otp)).digest('hex');
@@ -594,6 +595,21 @@ const sendTenantOtp = handler(async (req, res) => {
     return res.status(403).json({
       success: false,
       message: 'This shop subscription is currently deactivated. Please contact Super Admin.'
+    });
+  }
+
+  // Unlike the Super Admin console login, this endpoint used to have no resend
+  // cooldown at all — anyone could spam it for any registered shop email,
+  // mail-bombing the tenant owner and burning SMTP quota/reputation.
+  const existingOtp = await models.Otp.findOne({ email, scope: TENANT_OTP_SCOPE }).lean();
+  if (existingOtp && Date.now() - new Date(existingOtp.issuedAt).getTime() < TENANT_OTP_RESEND_COOLDOWN_MS) {
+    const waitSeconds = Math.ceil(
+      (TENANT_OTP_RESEND_COOLDOWN_MS - (Date.now() - new Date(existingOtp.issuedAt).getTime())) / 1000
+    );
+    return res.status(429).json({
+      success: false,
+      message: `An OTP was just sent. Please wait ${waitSeconds}s before requesting another.`,
+      retryAfterSeconds: waitSeconds
     });
   }
 
