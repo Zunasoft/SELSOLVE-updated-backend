@@ -31,6 +31,12 @@ const DEFAULT_COA = [
   ['1110', 'Cash in Hand', 'ASSET', true, '1100', 'CASH_GROUP'],
   ['1111', 'Main Cash Counter', 'ASSET', false, '1110', 'CASH'],
   ['1120', 'Bank Accounts', 'ASSET', true, '1100', 'BANK_GROUP'],
+  // Without a leaf account here, `settlementAccount()` in posting.js falls
+  // back to Cash for every non-cash payment (UPI, card, bank transfer) until
+  // a shop manually adds a bank account via Banks -> Add Bank Account —
+  // silently overstating cash-in-hand and understating bank balance for any
+  // sale/purchase/expense recorded before that first manual setup step.
+  ['1121', 'Primary Bank Account', 'ASSET', false, '1120', 'BANK'],
   ['1130', 'Accounts Receivable', 'ASSET', true, '1100', 'AR'],
   ['1140', 'Stock in Hand (Inventory)', 'ASSET', false, '1100', 'INVENTORY'],
   ['1150', 'GST Input Credit', 'ASSET', true, '1100', 'GST_INPUT'],

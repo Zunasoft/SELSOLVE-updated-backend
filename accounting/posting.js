@@ -21,10 +21,11 @@ function splitGst(amount, interState = false) {
   return { cgst: half, sgst: r2(total - half), igst: 0, total };
 }
 
-function gstLines(store, amount, { interState = false, input = false } = {}) {
+function gstLines(store, amount, { interState = false, input = false, reverse = false } = {}) {
   const { cgst, sgst, igst } = splitGst(amount, interState);
   const suffix = input ? '_INPUT' : '_OUTPUT';
-  const side = input ? 'debit' : 'credit';
+  let side = input ? 'debit' : 'credit';
+  if (reverse) side = side === 'debit' ? 'credit' : 'debit';
   return [
     { accountId: bySystemKey(store, `CGST${suffix}`)?.id, [side]: cgst },
     { accountId: bySystemKey(store, `SGST${suffix}`)?.id, [side]: sgst },
@@ -184,6 +185,75 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
   return { voucher, cogsVoucher, cogsAmount };
 }
 
+/**
+ * Sales return / credit note — goods a customer sent back, reversing the
+ * exact accounting a sale would have booked for that value (mirrors
+ * `postPurchaseReturn` on the other side of the ledger).
+ *   Dr Sales                   taxable value reversed
+ *   Dr GST Payable             tax collected reversed
+ *      Cr Customer / Cash      value credited back (reduces receivable, or
+ *                              refunded from the till for a walk-in sale)
+ */
+function postSalesReturn(store, creditNote, { customer, interState = false, createdBy } = {}) {
+  const taxable = r2(creditNote.subtotal);
+  const tax = r2(creditNote.tax);
+  const total = r2(creditNote.totalAmount ?? taxable + tax);
+
+  let creditAccount;
+  let partyId = null;
+  if (customer) {
+    const partyAccount = ensurePartyAccount(store, customer, 'CUSTOMER');
+    creditAccount = partyAccount;
+    partyId = customer.id;
+  } else {
+    creditAccount = settlementAccount(store, 'Cash');
+  }
+
+  const lines = [
+    { accountId: bySystemKey(store, 'SALES')?.id, debit: taxable },
+    ...gstLines(store, tax, { interState, input: false, reverse: true }),
+    {
+      accountId: creditAccount.id,
+      credit: total,
+      partyId,
+      narration: `Return against ${creditNote.orderId || 'invoice'}`
+    }
+  ];
+
+  const voucher = postJournal(store, {
+    type: 'SALES_RETURN',
+    date: creditNote.date,
+    narration: `Credit note ${creditNote.id} — ${creditNote.customerName || 'Customer'} (${creditNote.reason || 'Return'})`,
+    refType: 'CREDIT_NOTE',
+    refId: creditNote.id,
+    partyId,
+    createdBy,
+    lines: lines.filter((l) => l.accountId)
+  });
+
+  // Inventory value comes back in step with the sale's own COGS voucher.
+  const cogsAmount = r2(
+    (creditNote.items || []).reduce((sum, l) => sum + Number(l.costPrice || 0) * Number(l.baseQty ?? l.qty ?? 0), 0)
+  );
+  let cogsVoucher = null;
+  if (cogsAmount > 0) {
+    cogsVoucher = postJournal(store, {
+      type: 'SALES_RETURN',
+      date: creditNote.date,
+      narration: `Cost reversal for credit note ${creditNote.id}`,
+      refType: 'CREDIT_NOTE_COGS',
+      refId: creditNote.id,
+      createdBy,
+      lines: [
+        { accountId: bySystemKey(store, 'INVENTORY')?.id, debit: cogsAmount },
+        { accountId: bySystemKey(store, 'COGS')?.id, credit: cogsAmount }
+      ].filter((l) => l.accountId)
+    });
+  }
+
+  return { voucher, cogsVoucher, cogsAmount };
+}
+
 /* ------------------------------------------------------------------ *
  * Purchases
  * ------------------------------------------------------------------ */
@@ -198,27 +268,30 @@ function postPurchase(store, purchase, { vendor, interState = false, createdBy }
   const taxable = r2(purchase.subtotal ?? purchase.totalAmount);
   const tax = r2(purchase.tax);
   const total = r2(purchase.totalAmount ?? taxable + tax);
+  const paid = r2(purchase.paidAmount !== undefined ? purchase.paidAmount : (purchase.paymentStatus === 'PAID' ? total : 0));
+  const due = r2(Math.max(0, total - paid));
 
-  let creditAccount;
   let partyId = null;
+  const lines = [
+    { accountId: bySystemKey(store, 'INVENTORY')?.id, debit: taxable },
+    ...gstLines(store, tax, { interState, input: true })
+  ];
 
-  if (purchase.paymentStatus === 'PAID') {
-    creditAccount = settlementAccount(store, purchase.paymentMode, purchase.settlementAccountId);
-  } else if (vendor) {
+  if (paid > 0) {
+    const payAcc = settlementAccount(store, purchase.paymentMode, purchase.settlementAccountId);
+    lines.push({ accountId: payAcc.id, credit: paid, narration: `Purchase ${purchase.invoiceNo} (Paid)` });
+  }
+
+  if (due > 0 && vendor) {
     const partyAccount = ensurePartyAccount(store, vendor, 'VENDOR');
-    creditAccount = partyAccount;
     partyId = vendor.id;
-  } else {
-    creditAccount = settlementAccount(store, 'Cash');
+    lines.push({ accountId: partyAccount.id, credit: due, partyId, narration: `Purchase ${purchase.invoiceNo} (Payable)` });
+  } else if (due > 0) {
+    const payAcc = settlementAccount(store, 'Cash');
+    lines.push({ accountId: payAcc.id, credit: due, narration: `Purchase ${purchase.invoiceNo}` });
   }
 
   const rounding = r2(total - (taxable + tax));
-  const lines = [
-    { accountId: bySystemKey(store, 'INVENTORY')?.id, debit: taxable },
-    ...gstLines(store, tax, { interState, input: true }),
-    { accountId: creditAccount.id, credit: total, partyId, narration: `Purchase ${purchase.invoiceNo}` }
-  ];
-
   const roundingAcc = bySystemKey(store, 'ROUNDING_OFF');
   if (roundingAcc && rounding !== 0) {
     lines.push(
@@ -237,6 +310,72 @@ function postPurchase(store, purchase, { vendor, interState = false, createdBy }
     partyId,
     createdBy,
     lines: lines.filter((l) => l.accountId)
+  });
+}
+
+/**
+ * Vendor credit / purchase return — goods sent back to a supplier, reversing
+ * the exact accounting a purchase would have booked for that value.
+ *   Dr Vendor                  value credited (reduces what we owe)
+ *      Cr Stock in Hand        taxable value reversed
+ *      Cr GST Input Credit     tax credit reversed
+ */
+function postPurchaseReturn(store, vendorCredit, { vendor, interState = false, createdBy } = {}) {
+  const taxable = r2(vendorCredit.subtotal);
+  const tax = r2(vendorCredit.tax);
+  const total = r2(vendorCredit.totalAmount ?? taxable + tax);
+
+  const partyAccount = ensurePartyAccount(store, vendor, 'VENDOR');
+
+  const lines = [
+    {
+      accountId: partyAccount.id,
+      debit: total,
+      partyId: vendor.id,
+      narration: `Return against ${vendorCredit.purchaseInvoiceNo || 'purchase'}`
+    },
+    { accountId: bySystemKey(store, 'INVENTORY')?.id, credit: taxable },
+    ...gstLines(store, tax, { interState, input: true, reverse: true })
+  ];
+
+  return postJournal(store, {
+    type: 'PURCHASE_RETURN',
+    date: vendorCredit.date,
+    narration: `Vendor credit ${vendorCredit.id} — ${vendorCredit.vendorName || 'Vendor'} (${vendorCredit.reason || 'Return'})`,
+    refType: 'VENDOR_CREDIT',
+    refId: vendorCredit.id,
+    partyId: vendor.id,
+    createdBy,
+    lines: lines.filter((l) => l.accountId)
+  });
+}
+
+/**
+ * Landed cost — freight, customs, handling, etc. incurred on a purchase.
+ * Capitalised straight into inventory (it's already been allocated across
+ * the receiving lines' per-unit cost by the caller) rather than expensed,
+ * matching standard landed-cost accounting treatment.
+ *   Dr Stock in Hand          amount
+ *      Cr Cash / Bank         paid immediately (freight is rarely on credit)
+ */
+function postLandedCost(store, purchase, { amount, settlementAccountId, paymentMode, createdBy } = {}) {
+  const value = r2(amount);
+  if (value <= 0) return null;
+
+  const creditAccount = settlementAccount(store, paymentMode, settlementAccountId);
+
+  return postJournal(store, {
+    type: 'STOCK',
+    date: purchase.date,
+    narration: `Landed cost (freight/handling) for purchase ${purchase.invoiceNo}`,
+    refType: 'LANDED_COST',
+    refId: purchase.id,
+    paymentMode,
+    createdBy,
+    lines: [
+      { accountId: bySystemKey(store, 'INVENTORY')?.id, debit: value },
+      { accountId: creditAccount.id, credit: value }
+    ].filter((l) => l.accountId)
   });
 }
 
@@ -402,6 +541,35 @@ function postVendorRefund(store, { amount, vendor, notes, createdBy } = {}) {
   });
 }
 
+/**
+ * Applies a vendor payment against that vendor's oldest unpaid/partial purchase invoices.
+ * Matches both by vendorId and vendorName for robust alignment.
+ */
+function applyVendorPaymentToPurchases(store, vendor, amount, discount = 0) {
+  let remaining = r2(Number(amount || 0) + Number(discount || 0));
+  const settled = [];
+  const vendorNameLower = vendor?.name ? String(vendor.name).trim().toLowerCase() : '';
+
+  (store.purchases || [])
+    .filter((p) => {
+      const idMatch = vendor?.id && p.vendorId === vendor.id;
+      const nameMatch = vendorNameLower && p.vendorName && String(p.vendorName).trim().toLowerCase() === vendorNameLower;
+      return (idMatch || nameMatch) && p.paymentStatus !== 'PAID' && p.status !== 'VOID';
+    })
+    .sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0))
+    .forEach((purchase) => {
+      if (remaining <= 0.009) return;
+      const due = r2((Number(purchase.totalAmount) || 0) - (Number(purchase.paidAmount) || 0));
+      const applied = Math.min(due, remaining);
+      purchase.paidAmount = r2((Number(purchase.paidAmount) || 0) + applied);
+      purchase.paymentStatus = purchase.paidAmount >= (Number(purchase.totalAmount) || 0) - 0.009 ? 'PAID' : 'PARTIAL';
+      remaining = r2(remaining - applied);
+      settled.push({ invoiceNo: purchase.invoiceNo, applied, status: purchase.paymentStatus });
+    });
+
+  return settled;
+}
+
 /** Fund transfer between two cash/bank ledgers (contra voucher). */
 function postFundTransfer(store, transfer, { createdBy } = {}) {
   const amount = r2(transfer.amount);
@@ -496,11 +664,15 @@ module.exports = {
   settlementAccount,
   isCreditSale,
   postSale,
+  postSalesReturn,
   postPurchase,
+  postPurchaseReturn,
+  postLandedCost,
   postExpense,
   postIncome,
   postReceipt,
   postPayment,
+  applyVendorPaymentToPurchases,
   postVendorRefund,
   postFundTransfer,
   postOpeningBalance,

@@ -35,5 +35,8 @@ router.post('/products/bulk-import', catalog.bulkImportProducts);
 router.get('/inventory/summary', catalog.getInventorySummary);
 router.post('/inventory/adjust', catalog.adjustStock);
 router.get('/inventory/movements', catalog.getStockMovements);
+router.post('/inventory/batches/writeoff', catalog.writeOffBatch);
+router.post('/inventory/batches/return', catalog.returnBatchToSupplier);
+router.get('/inventory/batches/sales-report', catalog.getBatchSalesReport);
 
 module.exports = router;

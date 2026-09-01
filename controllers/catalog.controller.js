@@ -12,6 +12,7 @@
 const { logStockMovement, DEFAULT_UNITS, defaultPriceSheets, calculateProductStock } = require('../store');
 const posting = require('../accounting/posting');
 const { setRecipe, removeRecipe, decorateRecipe, recipeFromProductPayload } = require('../modules/recipes');
+const { shapeBatches, writeOffBatch } = require('./batches');
 
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const num = (v, fallback = 0) => {
@@ -49,8 +50,9 @@ function shapeAltUnits(payload, existing, baseUnit) {
     .map((u) => ({
       unit: String(u.unit).toLowerCase(),
       factor: Number(u.factor),
-      // Blank price means "base price × factor", which is the common case.
+      // Blank price/mrp means "base price/mrp × factor", which is the common case.
       price: u.price === undefined || u.price === '' ? null : Number(u.price),
+      mrp: u.mrp === undefined || u.mrp === '' ? null : Number(u.mrp),
       barcode: u.barcode ? String(u.barcode).trim() : '',
       isDefaultSaleUnit: Boolean(u.isDefaultSaleUnit)
     }));
@@ -203,6 +205,41 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     stock = Object.values(payload.warehouses).reduce((sum, v) => sum + num(v, 0), 0);
   }
 
+  const trackBatches = payload.trackBatches !== undefined ? Boolean(payload.trackBatches) : Boolean(existing?.trackBatches);
+  let batches = shapeBatches(payload, existing);
+
+  // Turning batch tracking on for a product that already has stock and no
+  // batches supplied yet: fold the existing stock into one "Opening Stock"
+  // batch so nothing is lost, rather than starting the product at zero.
+  if (trackBatches && !existing?.trackBatches && !Array.isArray(payload.batches) && batches.length === 0 && stock > 0) {
+    batches = [{
+      id: `batch_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+      batchNo: 'OPENING-STOCK',
+      mfgDate: null,
+      expiryDate: null,
+      qty: stock,
+      costPrice: purchasePrice,
+      sellPrice: null,
+      refPurchaseId: null,
+      warehouseId: (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main',
+      source: 'opening',
+      createdAt: new Date().toISOString()
+    }];
+  }
+
+  // A batch-tracked product's stock is never edited directly — it's always
+  // the sum of what's actually in its batches.
+  if (trackBatches) {
+    stock = Math.round(batches.reduce((sum, b) => sum + (Number(b.qty) || 0), 0) * 10000) / 10000;
+    const defaultWh = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+    const whMap = {};
+    batches.forEach((b) => {
+      const whId = b.warehouseId || defaultWh;
+      whMap[whId] = Math.round(((whMap[whId] || 0) + (Number(b.qty) || 0)) * 10000) / 10000;
+    });
+    warehouses = whMap;
+  }
+
   const productTypes = shapeProductTypes(payload, existing);
   const productType = productTypes[0];
 
@@ -246,6 +283,14 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     stock: productType === 'service' ? 9999 : stock,
     minStock: num(payload.minStock, existing?.minStock ?? 5),
     warehouses,
+    trackBatches,
+    batches,
+    // Per-product override for the near-expiry alert window (days). Blank/null
+    // means "use the store default" — a store's default might be 30 days,
+    // but eggs at a 14-day shelf life need their own much shorter number.
+    nearExpiryDays: payload.nearExpiryDays === '' || payload.nearExpiryDays === undefined
+      ? (existing?.nearExpiryDays ?? null)
+      : (Number(payload.nearExpiryDays) || null),
     imageUrl: payload.imageUrl ?? existing?.imageUrl ?? '',
     requiresWeight: payload.requiresWeight !== undefined ? Boolean(payload.requiresWeight) : Boolean(existing?.requiresWeight),
     taxRate: num(payload.taxRate, existing?.taxRate ?? 0),
@@ -254,6 +299,7 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     customSubUnitName: payload.customSubUnitName ?? existing?.customSubUnitName ?? '',
     customSubUnitFactor: num(payload.customSubUnitFactor, existing?.customSubUnitFactor ?? 0),
     customSubUnitPrice: num(payload.customSubUnitPrice, existing?.customSubUnitPrice ?? 0),
+    customSubUnitMrp: num(payload.customSubUnitMrp, existing?.customSubUnitMrp ?? 0),
     customSubUnitBarcode: payload.customSubUnitBarcode ?? existing?.customSubUnitBarcode ?? '',
     enableMinorUnit: payload.enableMinorUnit !== undefined ? Boolean(payload.enableMinorUnit) : Boolean(existing?.enableMinorUnit),
     isActive: payload.isActive !== undefined ? Boolean(payload.isActive) : existing?.isActive ?? true,
@@ -1047,6 +1093,150 @@ exports.adjustStock = (req, res) => {
     success: true,
     message: `Stock adjusted from ${previous} to ${product.stock} ${product.unit}.`,
     data: { product, movement, voucherNo: voucher ? voucher.voucherNo : null }
+  });
+};
+
+/** Writes off a quantity from one batch (expired/damaged/etc.) and logs it like any other stock adjustment. */
+exports.writeOffBatch = (req, res) => {
+  const store = req.tenantStore;
+  const { productId, batchId, quantity, reason } = req.body;
+
+  const product = (store.products || []).find((p) => p.id === productId);
+  if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+  if (!product.trackBatches) {
+    return res.status(400).json({ success: false, message: 'This product is not batch-tracked.' });
+  }
+
+  let record;
+  try {
+    record = writeOffBatch(product, batchId, Number(quantity), reason, actor(req));
+  } catch (err) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+
+  const movement = logStockMovement(store, {
+    product,
+    type: 'WRITE_OFF',
+    qtyChange: -record.qty,
+    reason: `Batch ${record.batchNo} written off: ${record.reason}`,
+    user: actor(req)
+  });
+
+  let voucher = null;
+  try {
+    voucher = posting.postStockAdjustment(
+      store,
+      {
+        id: movement.id,
+        productName: product.name,
+        reason: `Batch write-off (${record.reason}): ${product.name} / ${record.batchNo}`,
+        value: record.costValue,
+        date: movement.date
+      },
+      { createdBy: actor(req) }
+    );
+  } catch (err) {
+    // Accounting posting is best-effort — the stock write-off itself already succeeded.
+  }
+
+  if (!Array.isArray(store.batchWriteOffs)) store.batchWriteOffs = [];
+  store.batchWriteOffs.unshift(record);
+
+  res.json({
+    success: true,
+    message: `Wrote off ${record.qty} ${product.unit} from batch ${record.batchNo}.`,
+    data: { product, movement, writeOff: record, voucherNo: voucher ? voucher.voucherNo : null }
+  });
+};
+
+/**
+ * Aggregates, per batch, how much has actually sold and for how much — built
+ * from `batchesSold` already recorded on each sale line (see routes/sales.js
+ * `deductStock`). A line's revenue is spread across the batch(es) it drew
+ * from in proportion to base-unit quantity, so alt-unit/sub-unit sales
+ * (boxes, grams, etc.) still attribute correctly.
+ */
+exports.getBatchSalesReport = (req, res) => {
+  const store = req.tenantStore;
+  const agg = {};
+
+  (store.orders || []).forEach((order) => {
+    if (order.status === 'DRAFT' || order.status === 'VOID') return;
+    (order.items || []).forEach((item) => {
+      if (!Array.isArray(item.batchesSold) || !item.batchesSold.length) return;
+      const baseQtyTotal = Number(item.baseQty) || Number(item.qty) || 0;
+      const perBaseRevenue = baseQtyTotal > 0 ? (Number(item.total) || 0) / baseQtyTotal : 0;
+
+      item.batchesSold.forEach((bs) => {
+        const key = bs.batchId;
+        if (!agg[key]) {
+          const product = store.products.find((p) => p.id === item.id);
+          agg[key] = {
+            batchId: bs.batchId,
+            batchNo: bs.batchNo,
+            productId: item.id,
+            productName: item.name,
+            unit: (product && product.unit) || item.unit || 'pcs',
+            qtySold: 0,
+            revenue: 0,
+            orderCount: 0
+          };
+        }
+        agg[key].qtySold = Math.round((agg[key].qtySold + Number(bs.qty)) * 10000) / 10000;
+        agg[key].revenue = Math.round((agg[key].revenue + Number(bs.qty) * perBaseRevenue) * 100) / 100;
+        agg[key].orderCount += 1;
+      });
+    });
+  });
+
+  res.json({ success: true, data: Object.values(agg).sort((a, b) => b.revenue - a.revenue) });
+};
+
+/**
+ * Returns stock from a batch back to the supplier it was received from
+ * (traced via the batch's originating purchase). This only corrects stock —
+ * it deliberately does NOT touch accounting, since guessing the right
+ * debit/credit direction for a partial return risks silently corrupting the
+ * vendor ledger; adjust the vendor's payable manually via Purchases/Payments
+ * if this return should reduce what's owed to them.
+ */
+exports.returnBatchToSupplier = (req, res) => {
+  const store = req.tenantStore;
+  const { productId, batchId, quantity, reason } = req.body;
+
+  const product = (store.products || []).find((p) => p.id === productId);
+  if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+  if (!product.trackBatches) {
+    return res.status(400).json({ success: false, message: 'This product is not batch-tracked.' });
+  }
+
+  const batch = (product.batches || []).find((b) => b.id === batchId);
+  if (!batch) return res.status(404).json({ success: false, message: 'Batch not found.' });
+
+  const qty = Number(quantity);
+  if (!(qty > 0) || qty > Number(batch.qty)) {
+    return res.status(400).json({ success: false, message: `Enter a quantity between 0 and ${batch.qty}.` });
+  }
+
+  const purchase = batch.refPurchaseId ? (store.purchases || []).find((p) => p.id === batch.refPurchaseId) : null;
+  const vendor = purchase?.vendorId ? (store.vendors || []).find((v) => v.id === purchase.vendorId) : null;
+
+  batch.qty = Math.round((Number(batch.qty) - qty) * 10000) / 10000;
+  product.stock = Math.round((product.batches || []).reduce((sum, b) => sum + (Number(b.qty) || 0), 0) * 10000) / 10000;
+
+  const movement = logStockMovement(store, {
+    product,
+    type: 'RETURN',
+    qtyChange: -qty,
+    reason: `Returned to supplier${vendor ? ` (${vendor.name})` : ''} — Batch ${batch.batchNo}: ${reason || 'Purchase Return'}`,
+    refId: purchase ? purchase.id : null,
+    user: actor(req)
+  });
+
+  res.json({
+    success: true,
+    message: `Returned ${qty} ${product.unit} of batch ${batch.batchNo} to supplier${vendor ? ` (${vendor.name})` : ''}. Adjust the vendor's payable manually if this reduces what's owed to them.`,
+    data: { product, movement, vendor: vendor ? { id: vendor.id, name: vendor.name } : null }
   });
 };
 

@@ -10,6 +10,8 @@ const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
 const { savePartyToDb, deletePartyFromDb } = require('../tenantProvisioner');
 const { shapeProduct } = require('../controllers/catalog.controller');
+const { addBatch, voidPurchaseBatches, writeOffBatch } = require('../controllers/batches');
+const { baseQty } = require('../controllers/unitConversion');
 
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
@@ -254,11 +256,15 @@ router.get('/customers/:id/loyalty', (req, res) => {
       customerId: customer.id,
       name: customer.name,
       points,
-      redeemValuePerPoint: Number(pos.loyaltyRedeemValue) || 0,
-      pointsPerHundred: Number(pos.loyaltyPointsPerHundred) || 0,
+      redeemValuePerPoint: Number(pos.loyaltyRedeemValue) || 0.5,
+      spendAmount: Number(pos.loyaltySpendAmount) || 100,
+      pointsPerSpend: Number(pos.loyaltyPointsPerSpend ?? pos.loyaltyPointsPerHundred) || 1,
+      pointsPerHundred: Number(pos.loyaltyPointsPerHundred ?? pos.loyaltyPointsPerSpend) || 1,
+      minSpendToEarn: Number(pos.loyaltyMinSpendToEarn) || 0,
       minRedeemPoints: minPoints,
+      maxRedeemPercent: Number(pos.loyaltyMaxRedeemPercent) || 100,
       redeemable: points >= minPoints,
-      maxRedeemableAmount: r2(points * (Number(pos.loyaltyRedeemValue) || 0)),
+      maxRedeemableAmount: r2(points * (Number(pos.loyaltyRedeemValue) || 0.5)),
       enabled: pos.enableLoyalty !== false
     }
   });
@@ -628,7 +634,13 @@ router.get('/purchases', (req, res) => {
   if (from) rows = rows.filter((p) => engine.dayKey(p.date) >= engine.dayKey(from));
   if (to) rows = rows.filter((p) => engine.dayKey(p.date) <= engine.dayKey(to));
 
+  const today = engine.dayKey(new Date());
+  const isOverdue = (p) =>
+    p.status !== 'VOID' && p.paymentStatus !== 'PAID' && !!p.dueDate && engine.dayKey(p.dueDate) < today;
+  rows = rows.map((p) => ({ ...p, isOverdue: isOverdue(p) }));
+
   const active = rows.filter((p) => p.status !== 'VOID');
+  const overdue = active.filter((p) => p.isOverdue);
 
   res.json({
     success: true,
@@ -636,7 +648,9 @@ router.get('/purchases', (req, res) => {
     summary: {
       count: active.length,
       total: r2(active.reduce((s, p) => s + (Number(p.totalAmount) || 0), 0)),
-      unpaid: r2(active.filter((p) => p.paymentStatus !== 'PAID').reduce((s, p) => s + (Number(p.totalAmount) || 0), 0))
+      unpaid: r2(active.filter((p) => p.paymentStatus !== 'PAID').reduce((s, p) => s + (Number(p.totalAmount) || 0) - (Number(p.paidAmount) || 0), 0)),
+      overdueCount: overdue.length,
+      overdueAmount: r2(overdue.reduce((s, p) => s + (Number(p.totalAmount) || 0) - (Number(p.paidAmount) || 0), 0))
     }
   });
 });
@@ -649,7 +663,8 @@ router.post('/purchases', (req, res) => {
   const store = req.tenantStore;
   const {
     vendorId, vendorName, invoiceNo, items, totalAmount,
-    paymentStatus, paymentMode, settlementAccountId, notes, date
+    paymentStatus, paymentMode, settlementAccountId, notes, date,
+    dueDate, poId, additionalCharges, landedCostPaymentMode, landedCostSettlementAccountId
   } = req.body;
 
   let vendor = vendorId ? store.vendors.find((v) => v.id === vendorId) : null;
@@ -682,6 +697,23 @@ router.post('/purchases', (req, res) => {
     }
   }
 
+  // Receiving against a purchase order — validated up front so a bad/expired
+  // poId fails loudly instead of silently creating an unlinked purchase.
+  let purchaseOrder = null;
+  if (poId) {
+    purchaseOrder = (store.purchaseOrders || []).find((p) => p.id === poId);
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
+    if (purchaseOrder.status === 'CANCELLED') {
+      return res.status(400).json({ success: false, message: `Purchase order ${purchaseOrder.poNumber} was cancelled.` });
+    }
+    if (purchaseOrder.status === 'RECEIVED') {
+      return res.status(400).json({ success: false, message: `Purchase order ${purchaseOrder.poNumber} has already been fully received.` });
+    }
+    if (vendor && purchaseOrder.vendorId !== vendor.id) {
+      return res.status(400).json({ success: false, message: `Vendor does not match purchase order ${purchaseOrder.poNumber}.` });
+    }
+  }
+
   const lines = Array.isArray(items) ? items : [];
   const subtotal = lines.length
     ? r2(lines.reduce((s, i) => s + Number(i.qty) * Number(i.rate), 0))
@@ -691,21 +723,57 @@ router.post('/purchases', (req, res) => {
     : r2(req.body.tax);
   const total = totalAmount !== undefined ? r2(totalAmount) : r2(subtotal + tax);
 
+  const chargeLines = (Array.isArray(additionalCharges) ? additionalCharges : []).filter((c) => Number(c.amount) > 0);
+  const totalAdditionalCharges = r2(chargeLines.reduce((s, c) => s + Number(c.amount || 0), 0));
+
+  const paid = req.body.paidAmount !== undefined
+    ? Math.min(total, Math.max(0, r2(req.body.paidAmount)))
+    : (paymentStatus === 'PAID' ? total : 0);
+  const status = paid >= total ? 'PAID' : paid > 0 ? 'PARTIAL' : (paymentStatus || 'UNPAID');
+
   const purchase = {
     id: `pur_${Date.now()}`,
     vendorId: vendor ? vendor.id : null,
     vendorName: vendor ? vendor.name : vendorName || 'Cash Purchase',
+    vendorPhone: req.body.vendorPhone || vendor?.phone || '',
+    vendorGstin: req.body.vendorGstin || vendor?.gstin || '',
+    vendorPan: req.body.vendorPan || vendor?.pan || '',
+    vendorAddress: req.body.vendorAddress || vendor?.address || '',
+    vendorState: req.body.vendorState || vendor?.state || '',
+    vendorStateCode: req.body.vendorStateCode || vendor?.stateCode || '',
     invoiceNo: invoiceNo || `PUR-${Math.floor(1000 + Math.random() * 9000)}`,
     items: lines,
     subtotal,
+    discount: r2(req.body.discount || 0),
     tax,
+    roundOff: r2(req.body.roundOff || 0),
     totalAmount: total,
-    paymentStatus: paymentStatus || 'UNPAID',
+    additionalCharges: chargeLines.map((c) => ({ label: c.label || 'Other', amount: r2(c.amount) })),
+    totalAdditionalCharges,
+    paidAmount: paid,
+    paymentStatus: status,
     paymentMode: paymentMode || 'Cash',
+    paymentRef: req.body.paymentRef || '',
     settlementAccountId: settlementAccountId || null,
+    placeOfSupply: req.body.placeOfSupply || '',
+    dispatchFrom: req.body.dispatchFrom || '',
+    dispatchDate: req.body.dispatchDate || null,
+    shipToName: req.body.shipToName || '',
+    shipToAddress: req.body.shipToAddress || '',
+    vehicleNo: req.body.vehicleNo || '',
+    shipBy: req.body.shipBy || '',
+    transporterName: req.body.transporterName || '',
+    dispatchDocNo: req.body.dispatchDocNo || '',
+    buyerOrderNo: req.body.buyerOrderNo || '',
+    buyerOrderDate: req.body.buyerOrderDate || null,
+    termsOfDelivery: req.body.termsOfDelivery || '',
+    paymentTerms: req.body.paymentTerms || '',
     notes: notes || '',
     receivedBy: actor(req),
-    date: date || new Date().toISOString()
+    date: date || new Date().toISOString(),
+    dueDate: dueDate || null,
+    poId: purchaseOrder ? purchaseOrder.id : null,
+    poNumber: purchaseOrder ? purchaseOrder.poNumber : null
   };
 
   const createdProducts = [];
@@ -739,14 +807,76 @@ router.post('/purchases', (req, res) => {
     }
 
     if (!product) return;
-    const qty = Number(line.qty);
-    product.stock = r2(Number(product.stock || 0) + qty);
-    if (product.warehouses && typeof product.warehouses === 'object') {
+    // A purchase line entered in a different unit than the product's base
+    // unit (e.g. receiving "2 bags" of a product tracked in kg) needs the
+    // same conversion sales already apply, otherwise stock silently drifts —
+    // "2" would get added instead of "50".
+    const qty = baseQty(product, { unit: line.unit, qty: Number(line.qty) });
+
+    // Cost is stored per BASE unit everywhere it's consumed (batch costPrice,
+    // COGS, margin reports all multiply it against a base-unit quantity), so
+    // `line.rate` — quoted per the line's own unit (₹/bag, ₹/box, …) — has to
+    // be converted the same way `qty` just was, not stored as-is. Any landed
+    // cost allocated to this line is folded in here too, so the stored cost
+    // is the item's true fully-loaded per-base-unit price from day one.
+    const lineValue = Number(line.qty) * Number(line.rate || 0);
+    const allocatedCharge =
+      totalAdditionalCharges > 0
+        ? subtotal > 0
+          ? r2(totalAdditionalCharges * (lineValue / subtotal))
+          : r2(totalAdditionalCharges / lines.length)
+        : 0;
+    const costPerBaseUnit = qty > 0 ? r2((lineValue + allocatedCharge) / qty) : Number(line.rate) || 0;
+
+    if (product.trackBatches) {
       const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
-      product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) + qty);
-      product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      if (Array.isArray(line.batches) && line.batches.length > 0) {
+        line.batches.forEach((b) => {
+          const bQty = baseQty(product, { unit: line.unit, qty: Number(b.qty || 0) });
+          if (bQty <= 0) return;
+          const batch = addBatch(product, {
+            batchNo: b.batchNo,
+            mfgDate: b.mfgDate,
+            expiryDate: b.expiryDate,
+            qty: bQty,
+            costPrice: costPerBaseUnit,
+            sellPrice: b.sellPrice !== undefined && b.sellPrice !== '' ? b.sellPrice : line.sellPrice,
+            refPurchaseId: purchase.id,
+            warehouseId: b.warehouseId || line.warehouseId || whKey
+          });
+          b.batchId = batch.id;
+          b.batchNo = batch.batchNo;
+        });
+        if (line.batches[0]) {
+          line.batchId = line.batches[0].batchId;
+          line.batchNo = line.batches[0].batchNo;
+        }
+      } else {
+        const batch = addBatch(product, {
+          batchNo: line.batchNo,
+          mfgDate: line.mfgDate,
+          expiryDate: line.expiryDate,
+          qty,
+          costPrice: costPerBaseUnit,
+          sellPrice: line.sellPrice,
+          refPurchaseId: purchase.id,
+          warehouseId: line.warehouseId || whKey
+        });
+        line.batchId = batch.id;
+        line.batchNo = batch.batchNo;
+      }
+    } else {
+      product.stock = r2(Number(product.stock || 0) + qty);
+      if (product.warehouses && typeof product.warehouses === 'object') {
+        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) + qty);
+        product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      }
+      if (line.sellPrice !== undefined && line.sellPrice !== '' && Number(line.sellPrice) > 0) {
+        product.price = Number(line.sellPrice);
+      }
     }
-    if (Number(line.rate)) product.purchasePrice = Number(line.rate);
+    if (costPerBaseUnit) product.purchasePrice = costPerBaseUnit;
     logStockMovement(store, {
       product,
       type: 'PURCHASE',
@@ -768,9 +898,44 @@ router.post('/purchases', (req, res) => {
     purchase.accountingError = err.message;
   }
 
+  if (totalAdditionalCharges > 0) {
+    try {
+      const landedVoucher = posting.postLandedCost(store, purchase, {
+        amount: totalAdditionalCharges,
+        paymentMode: landedCostPaymentMode || 'Cash',
+        settlementAccountId: landedCostSettlementAccountId || null,
+        createdBy: actor(req)
+      });
+      if (landedVoucher) {
+        purchase.landedCostVoucherId = landedVoucher.id;
+        purchase.landedCostVoucherNo = landedVoucher.voucherNo;
+      }
+    } catch (err) {
+      purchase.landedCostAccountingError = err.message;
+    }
+  }
+
   if (vendor) {
     const account = (store.accounts || []).find((a) => a.partyId === vendor.id && a.partyType === 'VENDOR');
     if (account) vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
+  }
+
+  // Mark off what this bill actually received against the purchase order —
+  // by product, not by line index, so receiving fewer/more lines than the PO
+  // still reconciles correctly line-by-line.
+  if (purchaseOrder) {
+    lines.forEach((line) => {
+      const poLine = purchaseOrder.items.find((pl) => pl.productId === line.productId);
+      if (!poLine) return;
+      const product = store.products.find((p) => p.id === line.productId);
+      const receivedQty = product ? baseQty(product, { unit: line.unit, qty: Number(line.qty) }) : Number(line.qty) || 0;
+      poLine.receivedQty = r2((poLine.receivedQty || 0) + receivedQty);
+    });
+    const allReceived = purchaseOrder.items.every((l) => l.receivedQty >= l.orderedQty - 0.009);
+    const anyReceived = purchaseOrder.items.some((l) => l.receivedQty > 0.009);
+    purchaseOrder.status = allReceived ? 'RECEIVED' : anyReceived ? 'PARTIALLY_RECEIVED' : purchaseOrder.status;
+    if (!Array.isArray(purchaseOrder.purchaseIds)) purchaseOrder.purchaseIds = [];
+    purchaseOrder.purchaseIds.push(purchase.id);
   }
 
   store.purchases.unshift(purchase);
@@ -805,12 +970,18 @@ router.post('/purchases/:id/void', (req, res) => {
   (purchase.items || []).forEach((line) => {
     const product = store.products.find((p) => p.id === line.productId);
     if (!product) return;
-    const qty = Number(line.qty) || 0;
-    product.stock = r2(Number(product.stock || 0) - qty);
-    if (product.warehouses && typeof product.warehouses === 'object') {
-      const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
-      product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - qty);
-      product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+    // Reverse the same converted quantity that was actually added on receipt.
+    const qty = baseQty(product, { unit: line.unit, qty: Number(line.qty) || 0 });
+
+    if (product.trackBatches) {
+      voidPurchaseBatches(product, purchase.id);
+    } else {
+      product.stock = r2(Number(product.stock || 0) - qty);
+      if (product.warehouses && typeof product.warehouses === 'object') {
+        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - qty);
+        product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      }
     }
     logStockMovement(store, {
       product,
@@ -829,7 +1000,13 @@ router.post('/purchases/:id/void', (req, res) => {
       try {
         reversed.push(engine.reverseJournal(store, v.id, actor(req)).voucherNo);
       } catch (err) {
-        /* already reversed — nothing to undo */
+        // "Already reversed" is expected when another voucher in this same
+        // chain already reversed it — anything else is a real failure that
+        // would otherwise leave stock restored but the ledger un-reversed
+        // with no trace anywhere.
+        if (err.message !== 'Voucher has already been reversed.') {
+          console.error(`[Void purchase ${purchase.id}] Failed to reverse voucher ${v.id}:`, err.message);
+        }
       }
     });
 
@@ -890,20 +1067,9 @@ router.post('/vendors/:id/pay', (req, res) => {
   if (!Array.isArray(store.payments)) store.payments = [];
   store.payments.unshift(record);
 
-  let remaining = record.amount + r2(discount);
-  const settled = [];
-  (store.purchases || [])
-    .filter((p) => p.vendorId === vendor.id && p.paymentStatus !== 'PAID' && p.status !== 'VOID')
-    .sort((a, b) => new Date(a.date) - new Date(b.date))
-    .forEach((purchase) => {
-      if (remaining <= 0.009) return;
-      const due = r2(purchase.totalAmount - (purchase.paidAmount || 0));
-      const applied = Math.min(due, remaining);
-      purchase.paidAmount = r2((purchase.paidAmount || 0) + applied);
-      purchase.paymentStatus = purchase.paidAmount >= purchase.totalAmount - 0.009 ? 'PAID' : 'PARTIAL';
-      remaining = r2(remaining - applied);
-      settled.push({ invoiceNo: purchase.invoiceNo, applied, status: purchase.paymentStatus });
-    });
+  const settled = posting.applyVendorPaymentToPurchases(store, vendor, record.amount, discount);
+  const totalApplied = settled.reduce((sum, s) => sum + (Number(s.applied) || 0), 0);
+  const unapplied = r2(Math.max(0, (record.amount + r2(discount)) - totalApplied));
 
   // Cash leaving the counter drawer is also a drawer movement.
   if (String(record.paymentMode).toLowerCase() === 'cash' && store.session?.status === 'open') {
@@ -918,7 +1084,11 @@ router.post('/vendors/:id/pay', (req, res) => {
   }
 
   const account = (store.accounts || []).find((a) => a.partyId === vendor.id && a.partyType === 'VENDOR');
-  if (account) vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
+  if (account) {
+    vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
+  } else {
+    vendor.outstandingPayable = Math.max(0, (Number(vendor.outstandingPayable) || 0) - record.amount);
+  }
 
   res.status(201).json({
     success: true,
@@ -926,10 +1096,434 @@ router.post('/vendors/:id/pay', (req, res) => {
     data: {
       payment: record,
       settled,
-      unapplied: r2(remaining),
+      unapplied,
       outstandingPayable: vendor.outstandingPayable
     }
   });
+});
+
+/** Payments Made — every vendor payment recorded, independent of the ledger view. */
+router.get('/vendors/payments', (req, res) => {
+  const store = req.tenantStore;
+  const { vendorId, from, to } = req.query;
+
+  let rows = [...(store.payments || [])];
+  rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+  if (vendorId) rows = rows.filter((p) => p.vendorId === vendorId);
+  if (from) rows = rows.filter((p) => engine.dayKey(p.date) >= engine.dayKey(from));
+  if (to) rows = rows.filter((p) => engine.dayKey(p.date) <= engine.dayKey(to));
+
+  res.json({
+    success: true,
+    data: rows,
+    summary: { count: rows.length, total: r2(rows.reduce((s, p) => s + (Number(p.amount) || 0), 0)) }
+  });
+});
+
+/* -------------------------------- vendor credits (purchase returns) -------------------------------- */
+
+/**
+ * Vendor Credit — return part or all of a specific purchase back to its
+ * supplier. Batch-tracked lines pull from the exact batch that purchase
+ * created (traced via `line.batchId`, stamped on receipt); plain-stock lines
+ * decrement `product.stock`/warehouse the same way a purchase void does.
+ * Always posts a real reversing journal entry (Dr Vendor / Cr Inventory /
+ * Cr GST Input) — unlike the older single-batch "return to supplier" inventory
+ * action, this is never accounting-silent.
+ */
+router.post('/purchases/:id/return', (req, res) => {
+  const store = req.tenantStore;
+  const purchase = (store.purchases || []).find((p) => p.id === req.params.id);
+  if (!purchase) return res.status(404).json({ success: false, message: 'Purchase not found.' });
+  if (purchase.status === 'VOID') {
+    return res.status(400).json({ success: false, message: 'Cannot return items from a voided purchase.' });
+  }
+  if (!purchase.vendorId) {
+    return res.status(400).json({ success: false, message: 'This purchase has no vendor to credit.' });
+  }
+  const vendor = store.vendors.find((v) => v.id === purchase.vendorId);
+  if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found.' });
+
+  const { items, reason, date } = req.body;
+  const requested = (Array.isArray(items) ? items : []).filter((l) => Number(l.qty) > 0);
+  if (!requested.length) {
+    return res.status(400).json({ success: false, message: 'Select at least one item to return.' });
+  }
+
+  // Kept in the purchase line's own unit (bags, boxes, whatever it was
+  // received in) — same convention `purchase.items[].qty` already uses — so
+  // it can be compared directly against `purchaseLine.qty` without a base-unit
+  // detour. Only the actual stock/batch mutation below needs base units.
+  const alreadyCredited = (productId, batchId) =>
+    (store.vendorCredits || [])
+      .filter((vc) => vc.purchaseId === purchase.id && vc.status !== 'VOID')
+      .reduce(
+        (sum, vc) =>
+          sum +
+          (vc.items || [])
+            .filter((it) => it.productId === productId && (it.batchId || null) === (batchId || null))
+            .reduce((s, it) => s + Number(it.qty || 0), 0),
+        0
+      );
+
+  // Pass 1: validate every requested line before mutating anything, so a bad
+  // line further down the list can't leave earlier lines half-applied.
+  const plan = [];
+  for (const reqLine of requested) {
+    const qty = r2(Number(reqLine.qty));
+    const purchaseLine = (purchase.items || []).find(
+      (pl) => pl.productId === reqLine.productId && (pl.batchId || null) === (reqLine.batchId || null)
+    );
+    if (!purchaseLine) {
+      return res.status(400).json({ success: false, message: `No matching line found on this purchase for the selected item.` });
+    }
+    const product = store.products.find((p) => p.id === reqLine.productId);
+    if (!product) {
+      return res.status(400).json({ success: false, message: `Product no longer exists in the catalogue.` });
+    }
+
+    const maxReturnable = r2(Number(purchaseLine.qty) - alreadyCredited(reqLine.productId, purchaseLine.batchId));
+    const baseQtyToRemove = baseQty(product, { unit: purchaseLine.unit, qty });
+
+    let batch = null;
+    if (product.trackBatches) {
+      if (!purchaseLine.batchId) {
+        return res.status(400).json({ success: false, message: `${product.name}: original batch could not be traced on this purchase.` });
+      }
+      batch = product.batches.find((b) => b.id === purchaseLine.batchId);
+      if (!batch) {
+        return res.status(400).json({ success: false, message: `${product.name}: batch ${purchaseLine.batchNo || ''} no longer exists (already fully consumed/removed).` });
+      }
+    }
+    const physicalCapBase = product.trackBatches ? Number(batch.qty) : Number(product.stock || 0);
+
+    if (!(qty > 0) || qty > maxReturnable + 0.009 || baseQtyToRemove > physicalCapBase + 0.0001) {
+      return res.status(400).json({
+        success: false,
+        message: `${product.name}: enter a quantity between 0 and ${r2(Math.min(maxReturnable, physicalCapBase))} ${purchaseLine.unit || ''} (already returned or sold reduces what's returnable).`
+      });
+    }
+
+    plan.push({ product, purchaseLine, batch, qty, baseQtyToRemove });
+  }
+
+  // Pass 2: apply.
+  const creditLines = [];
+  plan.forEach(({ product, purchaseLine, batch, qty, baseQtyToRemove }) => {
+    if (product.trackBatches) {
+      writeOffBatch(product, batch.id, baseQtyToRemove, reason || 'Returned to supplier', actor(req));
+    } else {
+      product.stock = r2(Number(product.stock || 0) - baseQtyToRemove);
+      if (product.warehouses && typeof product.warehouses === 'object') {
+        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - baseQtyToRemove);
+        product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      }
+    }
+
+    logStockMovement(store, {
+      product,
+      type: 'RETURN',
+      qtyChange: -baseQtyToRemove,
+      reason: `Returned to supplier (${vendor.name}) — ${reason || 'Purchase Return'}`,
+      refId: purchase.id,
+      user: actor(req)
+    });
+
+    const lineSubtotal = r2(qty * Number(purchaseLine.rate || 0));
+    const lineTax = r2((lineSubtotal * Number(purchaseLine.taxRate || 0)) / 100);
+    creditLines.push({
+      productId: product.id,
+      productName: product.name,
+      unit: purchaseLine.unit || product.unit,
+      batchId: purchaseLine.batchId || null,
+      batchNo: purchaseLine.batchNo || null,
+      qty,
+      baseQty: baseQtyToRemove,
+      rate: Number(purchaseLine.rate || 0),
+      taxRate: Number(purchaseLine.taxRate || 0),
+      lineSubtotal,
+      lineTax,
+      lineTotal: r2(lineSubtotal + lineTax)
+    });
+  });
+
+  const subtotal = r2(creditLines.reduce((s, l) => s + l.lineSubtotal, 0));
+  const tax = r2(creditLines.reduce((s, l) => s + l.lineTax, 0));
+  const totalAmount = r2(subtotal + tax);
+
+  const vendorCredit = {
+    id: `vc_${Date.now()}`,
+    vendorId: vendor.id,
+    vendorName: vendor.name,
+    purchaseId: purchase.id,
+    purchaseInvoiceNo: purchase.invoiceNo,
+    date: date || new Date().toISOString(),
+    reason: reason || 'Purchase Return',
+    items: creditLines,
+    subtotal,
+    tax,
+    totalAmount,
+    status: 'ACTIVE',
+    createdBy: actor(req),
+    createdAt: new Date().toISOString()
+  };
+
+  try {
+    const voucher = posting.postPurchaseReturn(store, vendorCredit, {
+      vendor,
+      interState: store.settings.tax.interState,
+      createdBy: actor(req)
+    });
+    vendorCredit.voucherId = voucher.id;
+    vendorCredit.voucherNo = voucher.voucherNo;
+  } catch (err) {
+    vendorCredit.accountingError = err.message;
+  }
+
+  const account = (store.accounts || []).find((a) => a.partyId === vendor.id && a.partyType === 'VENDOR');
+  if (account) vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
+
+  if (!Array.isArray(store.vendorCredits)) store.vendorCredits = [];
+  store.vendorCredits.unshift(vendorCredit);
+
+  res.status(201).json({
+    success: true,
+    message: `Returned ${creditLines.length} item(s) to ${vendor.name}. Credited ₹${totalAmount.toFixed(2)}.`,
+    data: vendorCredit
+  });
+});
+
+router.get('/vendor-credits', (req, res) => {
+  const store = req.tenantStore;
+  const { vendorId, purchaseId, from, to } = req.query;
+
+  let rows = [...(store.vendorCredits || [])];
+  rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+  if (vendorId) rows = rows.filter((v) => v.vendorId === vendorId);
+  if (purchaseId) rows = rows.filter((v) => v.purchaseId === purchaseId);
+  if (from) rows = rows.filter((v) => engine.dayKey(v.date) >= engine.dayKey(from));
+  if (to) rows = rows.filter((v) => engine.dayKey(v.date) <= engine.dayKey(to));
+
+  const active = rows.filter((v) => v.status !== 'VOID');
+
+  res.json({
+    success: true,
+    data: rows,
+    summary: { count: active.length, total: r2(active.reduce((s, v) => s + (Number(v.totalAmount) || 0), 0)) }
+  });
+});
+
+/** Voids a vendor credit: restores the returned stock/batch and reverses the journal entry. */
+router.post('/vendor-credits/:id/void', (req, res) => {
+  const store = req.tenantStore;
+  const vc = (store.vendorCredits || []).find((v) => v.id === req.params.id);
+  if (!vc) return res.status(404).json({ success: false, message: 'Vendor credit not found.' });
+  if (vc.status === 'VOID') {
+    return res.status(400).json({ success: false, message: 'This vendor credit is already voided.' });
+  }
+
+  (vc.items || []).forEach((line) => {
+    const product = store.products.find((p) => p.id === line.productId);
+    if (!product) return;
+    // `line.qty` is in the original purchase line's unit (bags, boxes, …) for
+    // display; stock/batches are tracked in base units, so restoration must
+    // use the base-unit amount actually removed, not the display quantity.
+    const qty = Number(line.baseQty ?? line.qty) || 0;
+
+    if (product.trackBatches && line.batchId) {
+      const batch = product.batches.find((b) => b.id === line.batchId);
+      if (batch) {
+        batch.qty = r2(Number(batch.qty) + qty);
+      } else {
+        product.batches.push({
+          id: `batch_${Date.now()}_${Math.floor(Math.random() * 1e6)}`,
+          batchNo: line.batchNo || 'RESTORED',
+          mfgDate: null,
+          expiryDate: null,
+          qty,
+          costPrice: Number(line.rate) || 0,
+          sellPrice: null,
+          refPurchaseId: vc.purchaseId,
+          warehouseId: 'wh_main',
+          source: 'restored',
+          createdAt: new Date().toISOString()
+        });
+      }
+      product.stock = r2((product.batches || []).reduce((s, b) => s + (Number(b.qty) || 0), 0));
+    } else {
+      product.stock = r2(Number(product.stock || 0) + qty);
+      if (product.warehouses && typeof product.warehouses === 'object') {
+        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) + qty);
+        product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      }
+    }
+
+    logStockMovement(store, {
+      product,
+      type: 'PURCHASE',
+      qtyChange: qty,
+      reason: `Void of return to supplier — ${vc.purchaseInvoiceNo || ''}`,
+      refId: vc.id,
+      user: actor(req)
+    });
+  });
+
+  (store.journal || [])
+    .filter((v) => v.refId === vc.id && !v.isReversed && !v.reversalOf)
+    .forEach((v) => {
+      try {
+        engine.reverseJournal(store, v.id, actor(req));
+      } catch (err) {
+        if (err.message !== 'Voucher has already been reversed.') {
+          console.error(`[Void vendor credit ${vc.id}] Failed to reverse voucher ${v.id}:`, err.message);
+        }
+      }
+    });
+
+  if (vc.vendorId) {
+    const vendor = store.vendors.find((v) => v.id === vc.vendorId);
+    const account = (store.accounts || []).find((a) => a.partyId === vc.vendorId && a.partyType === 'VENDOR');
+    if (vendor && account) vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
+  }
+
+  vc.status = 'VOID';
+  vc.voidedBy = actor(req);
+  vc.voidedAt = new Date().toISOString();
+
+  res.json({ success: true, message: 'Vendor credit voided; returned stock restored.', data: vc });
+});
+
+/* -------------------------------- purchase orders -------------------------------- */
+
+router.get('/purchase-orders', (req, res) => {
+  const store = req.tenantStore;
+  const { vendorId, status, from, to } = req.query;
+
+  let rows = [...(store.purchaseOrders || [])];
+  rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+  if (vendorId) rows = rows.filter((p) => p.vendorId === vendorId);
+  if (status && status !== 'ALL') rows = rows.filter((p) => p.status === status);
+  if (from) rows = rows.filter((p) => engine.dayKey(p.date) >= engine.dayKey(from));
+  if (to) rows = rows.filter((p) => engine.dayKey(p.date) <= engine.dayKey(to));
+
+  res.json({
+    success: true,
+    data: rows,
+    summary: {
+      open: rows.filter((p) => p.status === 'ISSUED' || p.status === 'PARTIALLY_RECEIVED').length,
+      totalOpenValue: r2(
+        rows
+          .filter((p) => p.status === 'ISSUED' || p.status === 'PARTIALLY_RECEIVED')
+          .reduce((s, p) => s + (Number(p.totalAmount) || 0), 0)
+      )
+    }
+  });
+});
+
+/**
+ * Creates a purchase order — a commitment to a vendor before anything has
+ * been received. No stock or accounting moves yet; that only happens when a
+ * purchase is later recorded against it via `POST /purchases` with `poId`.
+ */
+router.post('/purchase-orders', (req, res) => {
+  const store = req.tenantStore;
+  const { vendorId, vendorName, items, expectedDate, notes, date } = req.body;
+
+  let vendor = vendorId ? store.vendors.find((v) => v.id === vendorId) : null;
+  if (!vendor && vendorName) {
+    vendor = store.vendors.find((v) => v.name.toLowerCase() === String(vendorName).toLowerCase());
+    if (!vendor) {
+      vendor = {
+        id: `v_${Date.now()}`,
+        name: vendorName,
+        phone: '',
+        email: '',
+        gstin: '',
+        address: '',
+        outstandingPayable: 0,
+        createdAt: new Date().toISOString()
+      };
+      store.vendors.push(vendor);
+    }
+  }
+  if (!vendor) {
+    return res.status(400).json({ success: false, message: 'Select or enter a vendor for this purchase order.' });
+  }
+
+  const lines = Array.isArray(items) ? items : [];
+  const shapedItems = lines
+    .map((line) => {
+      const product = store.products.find((p) => p.id === line.productId);
+      return {
+        productId: line.productId || null,
+        productName: line.productName || product?.name || 'Item',
+        unit: line.unit || product?.unit || 'pcs',
+        hsn: line.hsn || product?.hsn || '',
+        taxRate: Number(line.taxRate ?? product?.taxRate ?? 0),
+        orderedQty: Number(line.qty) || 0,
+        receivedQty: 0,
+        rate: Number(line.rate) || 0
+      };
+    })
+    .filter((l) => l.productId && l.orderedQty > 0);
+
+  if (!shapedItems.length) {
+    return res.status(400).json({ success: false, message: 'Add at least one catalogue item with a quantity to the purchase order.' });
+  }
+
+  const subtotal = r2(shapedItems.reduce((s, l) => s + l.orderedQty * l.rate, 0));
+  const tax = r2(shapedItems.reduce((s, l) => s + (l.orderedQty * l.rate * l.taxRate) / 100, 0));
+  const totalAmount = r2(subtotal + tax);
+
+  store.voucherCounters.PO = (store.voucherCounters.PO || 0) + 1;
+  const poNumber = `PO-${String(store.voucherCounters.PO).padStart(5, '0')}`;
+
+  const po = {
+    id: `po_${Date.now()}`,
+    poNumber,
+    vendorId: vendor.id,
+    vendorName: vendor.name,
+    date: date || new Date().toISOString(),
+    expectedDate: expectedDate || null,
+    items: shapedItems,
+    subtotal,
+    tax,
+    totalAmount,
+    status: 'ISSUED',
+    notes: notes || '',
+    createdBy: actor(req),
+    createdAt: new Date().toISOString(),
+    purchaseIds: []
+  };
+
+  if (!Array.isArray(store.purchaseOrders)) store.purchaseOrders = [];
+  store.purchaseOrders.unshift(po);
+
+  res.status(201).json({ success: true, message: `Purchase order ${poNumber} created for ${vendor.name}.`, data: po });
+});
+
+router.post('/purchase-orders/:id/cancel', (req, res) => {
+  const store = req.tenantStore;
+  const po = (store.purchaseOrders || []).find((p) => p.id === req.params.id);
+  if (!po) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
+  if (po.status === 'CANCELLED') return res.status(400).json({ success: false, message: 'Already cancelled.' });
+  if ((po.items || []).some((l) => l.receivedQty > 0)) {
+    return res.status(400).json({
+      success: false,
+      message: 'This purchase order already has receipts recorded against it. Cancel is only allowed before anything has been received.'
+    });
+  }
+
+  po.status = 'CANCELLED';
+  po.cancelledBy = actor(req);
+  po.cancelledAt = new Date().toISOString();
+
+  res.json({ success: true, message: `Purchase order ${po.poNumber} cancelled.`, data: po });
 });
 
 module.exports = router;

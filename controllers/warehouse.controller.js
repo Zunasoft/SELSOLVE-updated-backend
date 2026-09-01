@@ -7,6 +7,7 @@
  */
 
 const { logStockMovement, defaultWarehouses } = require('../store');
+const { getBatchWarehouseQty, transferBatchesFEFO } = require('./batches');
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 
 function ensureWarehouses(store) {
@@ -165,14 +166,19 @@ exports.transferStock = (req, res) => {
       return res.status(404).json({ success: false, message: `Product "${raw.productId}" not found.` });
     }
 
-    if (!product.warehouses) {
-      product.warehouses = {
-        wh_main: Math.max(0, product.stock - 10),
-        wh_shop: Math.min(product.stock, 10)
-      };
+    let sourceCurrent;
+    if (product.trackBatches) {
+      sourceCurrent = getBatchWarehouseQty(product, sourceWarehouseId);
+    } else {
+      if (!product.warehouses) {
+        product.warehouses = {
+          wh_main: Math.max(0, product.stock - 10),
+          wh_shop: Math.min(product.stock, 10)
+        };
+      }
+      sourceCurrent = Number(product.warehouses[sourceWarehouseId] || 0);
     }
 
-    const sourceCurrent = Number(product.warehouses[sourceWarehouseId] || 0);
     if (sourceCurrent < qty) {
       return res.status(400).json({
         success: false,
@@ -188,10 +194,17 @@ exports.transferStock = (req, res) => {
   const refId = `tr_${Date.now()}`;
 
   for (const { product, qty } of validatedItems) {
-    const sourceCurrent = Number(product.warehouses[sourceWarehouseId] || 0);
-    product.warehouses[sourceWarehouseId] = sourceCurrent - qty;
-    product.warehouses[targetWarehouseId] = Number(product.warehouses[targetWarehouseId] || 0) + qty;
-    product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
+    if (product.trackBatches) {
+      // FEFO across whichever of this product's batches sit in the source
+      // warehouse — a batch that moves entirely gets relabeled, a batch only
+      // partially needed splits into a new record at the target.
+      transferBatchesFEFO(product, sourceWarehouseId, targetWarehouseId, qty);
+    } else {
+      const sourceCurrent = Number(product.warehouses[sourceWarehouseId] || 0);
+      product.warehouses[sourceWarehouseId] = sourceCurrent - qty;
+      product.warehouses[targetWarehouseId] = Number(product.warehouses[targetWarehouseId] || 0) + qty;
+      product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0);
+    }
 
     const movement = logStockMovement(store, {
       product,

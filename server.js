@@ -128,6 +128,32 @@ app.get('/uploads/products/:slug/:filename', async (req, res) => {
   res.send(image.data.buffer ? Buffer.from(image.data.buffer) : image.data);
 });
 
+/**
+ * Generic record attachments (vendor invoice photos, PDFs, etc.) — same public
+ * posture as product images above, for the same reason (no Authorization
+ * header on a plain link/embed).
+ */
+app.get('/uploads/attachments/:slug/:filename', async (req, res) => {
+  if (!(await ensureMasterDB())) {
+    return res.status(503).json({ success: false, message: 'File store is unavailable.' });
+  }
+
+  const tenant = await models.Tenant.findOne({ slug: req.params.slug }, { dbName: 1 }).lean();
+  if (!tenant) return res.status(404).json({ success: false, message: 'File not found.' });
+
+  const { getTenantDb } = require('./tenantDb');
+  const db = getTenantDb(tenant.dbName);
+  if (!db) return res.status(503).json({ success: false, message: 'File store is unavailable.' });
+
+  const file = await db.collection('attachments').findOne({ filename: path.basename(req.params.filename) });
+  if (!file) return res.status(404).json({ success: false, message: 'File not found.' });
+
+  res.set('Content-Type', file.contentType || 'application/octet-stream');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.set('Content-Disposition', `inline; filename="${encodeURIComponent(file.originalName || file.filename)}"`);
+  res.send(file.data.buffer ? Buffer.from(file.data.buffer) : file.data);
+});
+
 // Images uploaded to disk by earlier builds stay reachable at their old URLs.
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 

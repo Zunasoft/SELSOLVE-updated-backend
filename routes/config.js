@@ -43,7 +43,20 @@ router.get('/features', (req, res) => {
 /* --------------------------------- settings --------------------------------- */
 
 router.get('/settings', (req, res) => {
-  res.json({ success: true, data: req.tenantStore.settings });
+  const store = req.tenantStore;
+  if (!store.settings.loyalty && store.settings.pos) {
+    store.settings.loyalty = {
+      enableLoyalty: store.settings.pos.enableLoyalty !== false,
+      loyaltySpendAmount: Number(store.settings.pos.loyaltySpendAmount) || 100,
+      loyaltyPointsPerSpend: Number(store.settings.pos.loyaltyPointsPerSpend ?? store.settings.pos.loyaltyPointsPerHundred) || 1,
+      loyaltyPointsPerHundred: Number(store.settings.pos.loyaltyPointsPerHundred ?? store.settings.pos.loyaltyPointsPerSpend) || 1,
+      loyaltyMinSpendToEarn: Number(store.settings.pos.loyaltyMinSpendToEarn) || 0,
+      loyaltyRedeemValue: Number(store.settings.pos.loyaltyRedeemValue) || 0.5,
+      loyaltyMinRedeemPoints: Number(store.settings.pos.loyaltyMinRedeemPoints) || 50,
+      loyaltyMaxRedeemPercent: Number(store.settings.pos.loyaltyMaxRedeemPercent) || 100
+    };
+  }
+  res.json({ success: true, data: store.settings });
 });
 
 /** Section-wise merge so one screen can save without clobbering the others. */
@@ -53,7 +66,11 @@ router.put('/settings/:section', async (req, res) => {
     const section = req.params.section;
 
     if (!store.settings[section]) {
-      return res.status(404).json({ success: false, message: `Unknown settings section "${section}".` });
+      if (section === 'loyalty' || section === 'pos') {
+        store.settings[section] = {};
+      } else {
+        return res.status(404).json({ success: false, message: `Unknown settings section "${section}".` });
+      }
     }
 
     // Mutating req.tenantStore.settings is enough — the tenant middleware
@@ -63,6 +80,39 @@ router.put('/settings/:section', async (req, res) => {
     // sections could each read/write the whole settings object and clobber
     // each other's change.
     store.settings[section] = { ...store.settings[section], ...req.body };
+
+    // Sync loyalty properties bidirectionally between pos and loyalty sections
+    if (section === 'loyalty' || section === 'pos') {
+      const loyaltyKeys = [
+        'enableLoyalty',
+        'loyaltySpendAmount',
+        'loyaltyPointsPerSpend',
+        'loyaltyPointsPerHundred',
+        'loyaltyMinSpendToEarn',
+        'loyaltyRedeemValue',
+        'loyaltyMinRedeemPoints',
+        'loyaltyMaxRedeemPercent'
+      ];
+      
+      const otherSection = section === 'loyalty' ? 'pos' : 'loyalty';
+      if (!store.settings[otherSection]) store.settings[otherSection] = {};
+
+      loyaltyKeys.forEach((k) => {
+        if (req.body[k] !== undefined) {
+          store.settings[otherSection][k] = req.body[k];
+        }
+      });
+
+      // Keep loyaltyPointsPerSpend and loyaltyPointsPerHundred synchronized
+      if (req.body.loyaltyPointsPerSpend !== undefined) {
+        store.settings.pos.loyaltyPointsPerHundred = req.body.loyaltyPointsPerSpend;
+        if (store.settings.loyalty) store.settings.loyalty.loyaltyPointsPerHundred = req.body.loyaltyPointsPerSpend;
+      } else if (req.body.loyaltyPointsPerHundred !== undefined) {
+        store.settings.pos.loyaltyPointsPerSpend = req.body.loyaltyPointsPerHundred;
+        if (store.settings.loyalty) store.settings.loyalty.loyaltyPointsPerSpend = req.body.loyaltyPointsPerHundred;
+      }
+    }
+
     res.json({
       success: true,
       message: `${section.charAt(0).toUpperCase() + section.slice(1)} settings saved.`,

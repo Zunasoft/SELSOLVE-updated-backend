@@ -8,6 +8,8 @@ const { logStockMovement } = require('../store');
 const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
 const { decorateRecipe } = require('../modules/recipes');
+const { consumeBatchesFEFO, restoreBatches } = require('../controllers/batches');
+const { baseQty } = require('../controllers/unitConversion');
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const r2 = engine.r2;
@@ -148,66 +150,22 @@ router.delete('/bills/held/:id', (req, res) => {
 /* -------------------------------- checkout -------------------------------- */
 
 /**
- * A line billed in an alternate unit still moves base units of stock: one "box"
- * of a product whose box factor is 12 takes 12 pieces off the shelf. The factor
- * travels on the cart line, so a bill printed in boxes and a stock report
- * counted in pieces stay in agreement.
- */
-function baseQty(product, cartItem) {
-  const qty = Number(cartItem.qty) || 0;
-  const soldUnit = String(cartItem.saleUnit || cartItem.unit || '').toLowerCase().trim();
-  const prodUnit = String(product?.unit || '').toLowerCase().trim();
-
-  if (!soldUnit || !prodUnit || soldUnit === prodUnit) return qty;
-
-  // 1. Explicit unitFactor passed on the cart item (e.g. 0.001 for grams when base is kg)
-  if (Number(cartItem.unitFactor) > 0) {
-    return qty * Number(cartItem.unitFactor);
-  }
-
-  // 2. Look up in product's altUnits
-  const alt = (product.altUnits || []).find(
-    (u) => String(u.unit).toLowerCase() === soldUnit
-  );
-  if (alt && Number(alt.factor) > 0) {
-    return qty * Number(alt.factor);
-  }
-
-  // 3. Look up in product's customSubUnit
-  const subName = String(product.customSubUnitName || '').toLowerCase().trim();
-  const subFactor = Number(product.customSubUnitFactor) || 0;
-  if (subName && subName === soldUnit && subFactor > 0) {
-    return qty / subFactor; // e.g. 500 g with subFactor 1000 => 500 / 1000 = 0.5 kg
-  }
-
-  // 4. Standard conversions fallback
-  if (prodUnit === 'kg' && (soldUnit === 'g' || soldUnit === 'gm' || soldUnit === 'grams')) {
-    return qty / 1000;
-  }
-  if ((prodUnit === 'g' || prodUnit === 'gm') && soldUnit === 'kg') {
-    return qty * 1000;
-  }
-  if ((prodUnit === 'ltr' || prodUnit === 'liter' || prodUnit === 'litre') && (soldUnit === 'ml' || soldUnit === 'milliliter')) {
-    return qty / 1000;
-  }
-  if (prodUnit === 'dozen' && soldUnit === 'pcs') {
-    return qty / (subFactor || 12);
-  }
-  if ((prodUnit === 'box' || prodUnit === 'carton') && soldUnit === 'pcs') {
-    return qty / (subFactor || 12);
-  }
-
-  return qty;
-}
-
-/**
  * Deduct warehouse stock safely. First consumes from shop floor (wh_shop),
  * and if insufficient, takes the remaining quantity from the main warehouse (wh_main).
  * Always recalculates total product.stock from warehouses.
+ *
+ * Batch-tracked products skip the warehouse split entirely and deduct FEFO
+ * from `product.batches` instead — that stock isn't warehouse-scoped yet.
+ * Returns which batches were drawn from (or null for a non-batch product),
+ * so the caller can record it on the sale line for traceability.
  */
-function deductWarehouseStock(product, qtyToDeduct) {
+function deductWarehouseStock(product, qtyToDeduct, preferredBatchId) {
   const deduct = Number(qtyToDeduct) || 0;
-  if (deduct <= 0) return;
+  if (deduct <= 0) return null;
+
+  if (product.trackBatches) {
+    return consumeBatchesFEFO(product, deduct, preferredBatchId);
+  }
 
   const currentStock = Number(product.stock || 0);
   product.stock = r2(currentStock - deduct);
@@ -228,11 +186,28 @@ function deductWarehouseStock(product, qtyToDeduct) {
     }
     product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
   }
+  return null;
 }
 
-function restoreWarehouseStock(product, qtyToRestore) {
+/**
+ * Mirrors `deductWarehouseStock` for void/delete. When `batchesSold` (the
+ * exact batches a sale drew from, recorded on the order line) is available,
+ * it restores into those same batches rather than re-running FEFO — putting
+ * stock back exactly where it came from. Falls back to a labeled placeholder
+ * batch for legacy orders that predate batch tracking.
+ */
+function restoreWarehouseStock(product, qtyToRestore, batchesSold) {
   const restore = Number(qtyToRestore) || 0;
   if (restore <= 0) return;
+
+  if (product.trackBatches) {
+    if (Array.isArray(batchesSold) && batchesSold.length) {
+      restoreBatches(product, batchesSold);
+    } else {
+      restoreBatches(product, [{ batchId: null, batchNo: 'RESTORED', qty: restore }]);
+    }
+    return;
+  }
 
   const currentStock = Number(product.stock || 0);
   product.stock = r2(currentStock + restore);
@@ -332,7 +307,8 @@ function deductStock(store, items, orderId, user) {
       shortages.push({ name: product.name, available: product.stock });
     }
 
-    deductWarehouseStock(product, soldQty);
+    const batchResult = deductWarehouseStock(product, soldQty, cartItem.batchId);
+    if (batchResult) cartItem.batchesSold = batchResult.consumed;
 
     logStockMovement(store, {
       product,
@@ -421,6 +397,8 @@ router.post('/orders', async (req, res) => {
     const wanted = Math.floor(Number(redeemPoints));
     const available = customer.loyaltyPoints || 0;
     const minPoints = Number(pos.loyaltyMinRedeemPoints) || 0;
+    const maxPercent = Number(pos.loyaltyMaxRedeemPercent) || 100;
+    const maxRedeemAmount = r2((Number(total) * maxPercent) / 100);
 
     if (wanted > available) {
       return res.status(400).json({
@@ -437,7 +415,7 @@ router.post('/orders', async (req, res) => {
 
     const rate = Number(pos.loyaltyRedeemValue) || 0;
     // Redemption can settle a bill but never turn it into a refund.
-    loyaltyRedeemed = Math.min(r2(wanted * rate), r2(total));
+    loyaltyRedeemed = Math.min(r2(wanted * rate), r2(total), maxRedeemAmount);
     pointsRedeemed = rate > 0 ? Math.ceil(loyaltyRedeemed / rate) : 0;
     customer.loyaltyPoints = available - pointsRedeemed;
   }
@@ -518,7 +496,8 @@ router.post('/orders', async (req, res) => {
       total: Number(i.total) || Math.round((Number(i.qty) || 1) * (Number(i.price) || 0) * 100) / 100,
       discount: Number(i.discount) || 0,
       hsn: i.hsn || (product ? product.hsn : '') || '',
-      baseQty: product ? baseQty(product, i) : (Number(i.qty) || 1)
+      baseQty: product ? baseQty(product, i) : (Number(i.qty) || 1),
+      batchesSold: Array.isArray(i.batchesSold) ? i.batchesSold : []
     };
   });
 
@@ -589,7 +568,14 @@ router.post('/orders', async (req, res) => {
 
   // Points accrue on what was actually paid
   if (!isDraft && customer && pos.enableLoyalty !== false) {
-    const earned = Math.floor((initialPaid / 100) * (pos.loyaltyPointsPerHundred || 1));
+    const minSpend = Number(pos.loyaltyMinSpendToEarn) || 0;
+    const spendUnit = Math.max(1, Number(pos.loyaltySpendAmount) || 100);
+    const pointsPerSpend = Number(pos.loyaltyPointsPerSpend ?? pos.loyaltyPointsPerHundred ?? 1) || 1;
+
+    let earned = 0;
+    if (initialPaid >= minSpend) {
+      earned = Math.floor((initialPaid / spendUnit) * pointsPerSpend);
+    }
     customer.loyaltyPoints = (customer.loyaltyPoints || 0) + earned;
     order.loyaltyEarned = earned;
     order.loyaltyBalance = customer.loyaltyPoints;
@@ -683,6 +669,11 @@ router.get('/orders', (req, res) => {
     );
   }
 
+  const today = engine.dayKey(new Date());
+  const isOverdue = (o) =>
+    o.status !== 'VOID' && o.status !== 'DRAFT' && o.paymentStatus !== 'PAID' && !!o.dueDate && engine.dayKey(o.dueDate) < today;
+  rows = rows.map((o) => ({ ...o, isOverdue: isOverdue(o) }));
+
   res.json({ success: true, data: rows.slice(0, Number(limit) || 500), count: rows.length });
 });
 
@@ -690,7 +681,10 @@ router.get('/orders/:orderId', (req, res) => {
   const store = req.tenantStore;
   const order = store.orders.find((o) => o.orderId === req.params.orderId);
   if (!order) return res.status(404).json({ success: false, message: 'Invoice not found.' });
-  res.json({ success: true, data: { ...order, company: store.settings.company, billing: store.settings.billing } });
+  const today = engine.dayKey(new Date());
+  const isOverdue =
+    order.status !== 'VOID' && order.status !== 'DRAFT' && order.paymentStatus !== 'PAID' && !!order.dueDate && engine.dayKey(order.dueDate) < today;
+  res.json({ success: true, data: { ...order, isOverdue, company: store.settings.company, billing: store.settings.billing } });
 });
 
 /** Mark an unpaid/partial invoice as Paid / Record Full or Partial Payment */
@@ -1057,7 +1051,7 @@ router.delete('/orders/:orderId', (req, res) => {
           return;
         }
 
-        restoreWarehouseStock(product, soldQty);
+        restoreWarehouseStock(product, soldQty, item.batchesSold);
 
         logStockMovement(store, {
           product,
@@ -1076,7 +1070,13 @@ router.delete('/orders/:orderId', (req, res) => {
           try {
             engine.reverseJournal(store, v.id, actor(req));
           } catch (err) {
-            /* already reversed */
+            // "Already reversed" is expected when another voucher in this
+            // same chain already reversed it — anything else is a real
+            // failure that would otherwise leave stock/status changed but
+            // the ledger un-reversed with no trace anywhere.
+            if (err.message !== 'Voucher has already been reversed.') {
+              console.error(`[Delete Invoice ${order.orderId}] Failed to reverse voucher ${v.id}:`, err.message);
+            }
           }
         });
 
@@ -1176,7 +1176,7 @@ router.post('/orders/:orderId/void', (req, res) => {
       return;
     }
 
-    restoreWarehouseStock(product, soldQty);
+    restoreWarehouseStock(product, soldQty, item.batchesSold);
 
     logStockMovement(store, {
       product,
@@ -1195,15 +1195,29 @@ router.post('/orders/:orderId/void', (req, res) => {
       try {
         reversed.push(engine.reverseJournal(store, v.id, actor(req)).voucherNo);
       } catch (err) {
-        /* already reversed — nothing to undo */
+        // "Already reversed" is expected when another voucher in this same
+        // chain already reversed it — anything else is a real failure that
+        // would otherwise leave stock restored but the ledger un-reversed
+        // with no trace anywhere.
+        if (err.message !== 'Voucher has already been reversed.') {
+          console.error(`[Void ${order.orderId}] Failed to reverse voucher ${v.id}:`, err.message);
+        }
       }
     });
 
-  if (order.paymentMethod === 'Cash' && store.session) {
-    store.session.currentCash = r2(store.session.currentCash - order.total);
+  // Deduct only the cash actually collected, not the full invoice total — a
+  // partially-paid order (rest on customer credit) tagged paymentMethod:'Cash'
+  // for its upfront tender would otherwise pull cash never physically
+  // received out of the drawer. Mirrors the DELETE /orders/:orderId handler.
+  const paidCash = (order.payments || [])
+    .filter((p) => String(p.paymentMethod).toLowerCase() === 'cash')
+    .reduce((sum, p) => sum + (Number(p.amount) || 0), 0) || (order.paymentMethod === 'Cash' ? Number(order.paidAmount || 0) : 0);
+
+  if (paidCash > 0 && store.session) {
+    store.session.currentCash = r2(store.session.currentCash - paidCash);
     store.session.cashEntries.push({
       type: 'OUT',
-      amount: order.total,
+      amount: paidCash,
       reason: `Void ${order.orderId}`,
       time: new Date().toISOString()
     });
@@ -1234,6 +1248,301 @@ router.post('/orders/:orderId/void', (req, res) => {
   order.voidedAt = new Date().toISOString();
 
   res.json({ success: true, message: `Invoice ${order.orderId} voided.`, data: { order, reversed } });
+});
+
+/* -------------------------------- credit notes (sales returns) -------------------------------- */
+
+/**
+ * Sales Credit Note — return part of a specific invoice without voiding the
+ * whole thing. Mirrors `/purchases/:id/return` on the vendor side: restores
+ * stock (batch-aware, composite/combo-aware, same unwind logic as void) and
+ * posts a real reversing journal entry, rather than silently adjusting
+ * numbers with no ledger trace.
+ */
+router.post('/orders/:orderId/return', (req, res) => {
+  const store = req.tenantStore;
+  const order = store.orders.find((o) => o.orderId === req.params.orderId);
+  if (!order) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+  if (order.status === 'VOID') {
+    return res.status(400).json({ success: false, message: 'Cannot return items from a voided invoice.' });
+  }
+  if (order.status === 'DRAFT') {
+    return res.status(400).json({ success: false, message: 'This invoice has not been issued yet.' });
+  }
+
+  const { items, reason, date } = req.body;
+  const requested = (Array.isArray(items) ? items : []).filter((l) => Number(l.qty) > 0);
+  if (!requested.length) {
+    return res.status(400).json({ success: false, message: 'Select at least one item to return.' });
+  }
+
+  const customer = order.customerId ? (store.customers || []).find((c) => c.id === order.customerId) : null;
+
+  // Order lines don't carry a single batchId (FEFO can spread one line across
+  // several batches), so — unlike vendor credits — returns are tracked per
+  // product line only; restoring into the specific batches happens below via
+  // the line's own recorded `batchesSold`.
+  const alreadyCredited = (productId) =>
+    (store.creditNotes || [])
+      .filter((cn) => cn.orderId === order.orderId && cn.status !== 'VOID')
+      .reduce(
+        (sum, cn) => sum + (cn.items || []).filter((it) => it.productId === productId).reduce((s, it) => s + Number(it.qty || 0), 0),
+        0
+      );
+
+  // Pass 1: validate every requested line before mutating anything.
+  const plan = [];
+  for (const reqLine of requested) {
+    const qty = r2(Number(reqLine.qty));
+    const orderLine = (order.items || []).find((ol) => ol.id === reqLine.productId);
+    if (!orderLine) {
+      return res.status(400).json({ success: false, message: 'No matching line found on this invoice for the selected item.' });
+    }
+    const product = findProductInStore(store, orderLine);
+    if (!product) {
+      return res.status(400).json({ success: false, message: `${orderLine.name}: product no longer exists in the catalogue.` });
+    }
+
+    const maxReturnable = r2(Number(orderLine.qty) - alreadyCredited(orderLine.id));
+    if (!(qty > 0) || qty > maxReturnable + 0.009) {
+      return res.status(400).json({
+        success: false,
+        message: `${orderLine.name}: enter a quantity between 0 and ${maxReturnable} ${orderLine.unit || ''} (already returned reduces what's returnable).`
+      });
+    }
+
+    plan.push({ product, orderLine, qty });
+  }
+
+  // Pass 2: apply — same composite/combo/batch unwind logic as a full void,
+  // just scaled to the returned quantity instead of the whole sold quantity.
+  const creditLines = [];
+  plan.forEach(({ product, orderLine, qty }) => {
+    const baseQtyToRestore = baseQty(product, { unit: orderLine.unit, qty });
+    const isComposite = product.isComposite || product.productType === 'composite';
+    const recipe = (store.recipes || []).find((r) => r.productId === product.id);
+    const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
+
+    if (isComposite && ingredients.length > 0) {
+      const yieldQty = Number(recipe?.yieldQty) || Number(product.recipeYieldQty) || 1;
+      ingredients.forEach((ing) => {
+        const raw = store.products.find((p) => p.id === ing.productId || (p.name && ing.name && p.name.trim().toLowerCase() === ing.name.trim().toLowerCase()));
+        if (!raw) return;
+        const reqPerUnit = (Number(ing.qty) || 0) / yieldQty;
+        const returned = r2(reqPerUnit * baseQtyToRestore);
+        restoreWarehouseStock(raw, returned);
+        logStockMovement(store, {
+          product: raw,
+          type: 'RETURN',
+          qtyChange: returned,
+          reason: `Customer return of ${product.name} (Invoice ${order.orderId})`,
+          refId: order.orderId,
+          user: actor(req)
+        });
+      });
+    } else {
+      const isCombo = product.isCombo || product.productType === 'combo';
+      const comboItems = product.comboItems || product.bundleItems || [];
+      if (isCombo && comboItems.length > 0) {
+        comboItems.forEach((ci) => {
+          const comp = store.products.find((p) => p.id === ci.productId || p.id === ci.id);
+          if (!comp) return;
+          const compQty = Number(ci.qty || ci.quantity || 1);
+          const returned = r2(compQty * baseQtyToRestore);
+          restoreWarehouseStock(comp, returned);
+          logStockMovement(store, {
+            product: comp,
+            type: 'RETURN',
+            qtyChange: returned,
+            reason: `Customer return via combo ${product.name} (Invoice ${order.orderId})`,
+            refId: order.orderId,
+            user: actor(req)
+          });
+        });
+      } else {
+        // Restore into the exact batches this line originally drew from, in
+        // the same order, up to the quantity being returned — rather than a
+        // fresh FEFO pick, which would put stock into the wrong lot.
+        let partialBatchesSold;
+        if (product.trackBatches && Array.isArray(orderLine.batchesSold) && orderLine.batchesSold.length) {
+          let remaining = baseQtyToRestore;
+          partialBatchesSold = [];
+          for (const b of orderLine.batchesSold) {
+            if (remaining <= 0) break;
+            const take = Math.min(Number(b.qty) || 0, remaining);
+            if (take <= 0) continue;
+            partialBatchesSold.push({ batchId: b.batchId, batchNo: b.batchNo, qty: take });
+            remaining = r2(remaining - take);
+          }
+        }
+        restoreWarehouseStock(product, baseQtyToRestore, partialBatchesSold);
+        logStockMovement(store, {
+          product,
+          type: 'RETURN',
+          qtyChange: baseQtyToRestore,
+          reason: `Customer return (Invoice ${order.orderId})`,
+          refId: order.orderId,
+          user: actor(req)
+        });
+      }
+    }
+
+    const rate = Number(orderLine.price || 0);
+    const taxRate = Number(orderLine.taxRate || 0);
+    const lineSubtotal = r2(qty * rate);
+    const lineTax = r2((lineSubtotal * taxRate) / 100);
+    creditLines.push({
+      productId: orderLine.id,
+      name: orderLine.name,
+      unit: orderLine.unit || product.unit,
+      qty,
+      baseQty: baseQtyToRestore,
+      rate,
+      taxRate,
+      costPrice: Number(product.purchasePrice || 0),
+      lineSubtotal,
+      lineTax,
+      lineTotal: r2(lineSubtotal + lineTax)
+    });
+  });
+
+  const subtotal = r2(creditLines.reduce((s, l) => s + l.lineSubtotal, 0));
+  const tax = r2(creditLines.reduce((s, l) => s + l.lineTax, 0));
+  const totalAmount = r2(subtotal + tax);
+
+  const creditNote = {
+    id: `cn_${Date.now()}`,
+    orderId: order.orderId,
+    customerId: order.customerId || null,
+    customerName: order.customerName || 'Walk-in Customer',
+    date: date || new Date().toISOString(),
+    reason: reason || 'Sales Return',
+    items: creditLines,
+    subtotal,
+    tax,
+    totalAmount,
+    status: 'ACTIVE',
+    createdBy: actor(req),
+    createdAt: new Date().toISOString()
+  };
+
+  try {
+    const result = posting.postSalesReturn(store, creditNote, {
+      customer,
+      interState: store.settings.tax.interState,
+      createdBy: actor(req)
+    });
+    creditNote.voucherId = result.voucher.id;
+    creditNote.voucherNo = result.voucher.voucherNo;
+  } catch (err) {
+    creditNote.accountingError = err.message;
+  }
+
+  if (customer) {
+    const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
+    if (account) {
+      const bal = engine.accountBalance(store, account.id);
+      customer.outstanding = Math.max(0, bal);
+      customer.advance = Math.max(0, -bal);
+    }
+  }
+
+  if (!Array.isArray(store.creditNotes)) store.creditNotes = [];
+  store.creditNotes.unshift(creditNote);
+
+  res.status(201).json({
+    success: true,
+    message: `Returned ${creditLines.length} item(s) from ${order.customerName || 'customer'}. Credited ₹${totalAmount.toFixed(2)}.`,
+    data: creditNote
+  });
+});
+
+router.get('/credit-notes', (req, res) => {
+  const store = req.tenantStore;
+  const { customerId, orderId, from, to } = req.query;
+
+  let rows = [...(store.creditNotes || [])];
+  rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+
+  if (customerId) rows = rows.filter((v) => v.customerId === customerId);
+  if (orderId) rows = rows.filter((v) => v.orderId === orderId);
+  if (from) rows = rows.filter((v) => engine.dayKey(v.date) >= engine.dayKey(from));
+  if (to) rows = rows.filter((v) => engine.dayKey(v.date) <= engine.dayKey(to));
+
+  const active = rows.filter((v) => v.status !== 'VOID');
+
+  res.json({
+    success: true,
+    data: rows,
+    summary: { count: active.length, total: r2(active.reduce((s, v) => s + (Number(v.totalAmount) || 0), 0)) }
+  });
+});
+
+/** Voids a credit note: restores the returned stock/batch and reverses the journal entry. */
+router.post('/credit-notes/:id/void', (req, res) => {
+  const store = req.tenantStore;
+  const cn = (store.creditNotes || []).find((v) => v.id === req.params.id);
+  if (!cn) return res.status(404).json({ success: false, message: 'Credit note not found.' });
+  if (cn.status === 'VOID') {
+    return res.status(400).json({ success: false, message: 'This credit note is already voided.' });
+  }
+
+  (cn.items || []).forEach((line) => {
+    const product = store.products.find((p) => p.id === line.productId);
+    if (!product) return;
+    const qty = Number(line.baseQty ?? line.qty) || 0;
+    if (qty <= 0) return;
+
+    if (product.trackBatches) {
+      // Take the same amount back out via FEFO — it can't be traced to one
+      // specific batch once it's merged back into the pool.
+      consumeBatchesFEFO(product, qty);
+    } else {
+      product.stock = r2(Number(product.stock || 0) - qty);
+      if (product.warehouses && typeof product.warehouses === 'object') {
+        const whKey = product.warehouses.wh_shop !== undefined ? 'wh_shop' : (Object.keys(product.warehouses)[0] || 'wh_main');
+        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - qty);
+        product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      }
+    }
+
+    logStockMovement(store, {
+      product,
+      type: 'SALE',
+      qtyChange: -qty,
+      reason: `Void of customer return — ${cn.orderId || ''}`,
+      refId: cn.id,
+      user: actor(req)
+    });
+  });
+
+  (store.journal || [])
+    .filter((v) => v.refId === cn.id && !v.isReversed && !v.reversalOf)
+    .forEach((v) => {
+      try {
+        engine.reverseJournal(store, v.id, actor(req));
+      } catch (err) {
+        if (err.message !== 'Voucher has already been reversed.') {
+          console.error(`[Void credit note ${cn.id}] Failed to reverse voucher ${v.id}:`, err.message);
+        }
+      }
+    });
+
+  if (cn.customerId) {
+    const customer = store.customers.find((c) => c.id === cn.customerId);
+    const account = (store.accounts || []).find((a) => a.partyId === cn.customerId && a.partyType === 'CUSTOMER');
+    if (customer && account) {
+      const bal = engine.accountBalance(store, account.id);
+      customer.outstanding = Math.max(0, bal);
+      customer.advance = Math.max(0, -bal);
+    }
+  }
+
+  cn.status = 'VOID';
+  cn.voidedBy = actor(req);
+  cn.voidedAt = new Date().toISOString();
+
+  res.json({ success: true, message: 'Credit note voided; returned stock reversed.', data: cn });
 });
 
 /* --------------------------------- session --------------------------------- */

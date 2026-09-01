@@ -148,6 +148,7 @@ function defaultSettings() {
       phone: '+91 9876543210',
       email: 'contact@store.com',
       gstin: '',
+      fssai: '',
       currencySymbol: '₹',
       currencyCode: 'INR',
       logoUrl: ''
@@ -162,7 +163,55 @@ function defaultSettings() {
       footerNote: 'Thank you for shopping with us! Visit again.',
       terms: 'Goods once sold cannot be returned without receipt.',
       printReceiptAfterSale: true,
-      autoOpenDrawerOnCash: true
+      autoOpenDrawerOnCash: true,
+      // Thermal Bill & Invoice Templates Configuration
+      activeThermalTemplate: 'detailed_gst', // 'detailed_gst' | 'standard' | 'minimal' | 'modern' | 'restaurant'
+      paperWidth: '80mm', // '80mm' | '58mm'
+      fontSize: 'md', // 'sm' | 'md' | 'lg'
+      dividerStyle: 'dashed', // 'dashed' | 'dotted' | 'solid' | 'double'
+      showGstin: true,
+      showFssai: true,
+      showStoreAddress: true,
+      showStorePhone: true,
+      showStoreEmail: false,
+      showLogo: false,
+      showCustomerDetails: true,
+      showCustomerGstin: true,
+      showCustomerAddress: false,
+      showCashier: true,
+      showHsn: true,
+      showItemTaxRate: true,
+      showItemDiscount: true,
+      showGstBreakup: true,
+      showSavings: true,
+      showPaymentBreakup: true,
+      showLoyaltySummary: true,
+      showAdvanceSummary: true,
+      showQrCode: true,
+      qrCodeType: 'upi', // 'upi' | 'invoice' | 'custom'
+      showBarcode: true,
+      showTerms: true,
+      showFooterNote: true,
+      showSignature: false,
+      showWordsTotal: false,
+      // Full A4 / A5 Tax Invoice Bill Templates Configuration
+      activeInvoiceTemplate: 'corporate_blue', // 'corporate_blue' | 'modern_clean' | 'classic_emerald' | 'industrial_logistics' | 'compact_a5'
+      invoiceAccentColor: 'blue', // 'blue' | 'indigo' | 'emerald' | 'slate' | 'crimson' | 'amber'
+      invoicePaperSize: 'A4', // 'A4' | 'A5'
+      showInvoiceLogo: true,
+      showCompanyTaxMeta: true,
+      showConsigneeShipTo: true,
+      showTransportMeta: true,
+      showItemHsn: true,
+      showItemUnit: true,
+      showItemTaxBreakup: true,
+      showHsnSummaryTable: true,
+      showBankDetails: true,
+      showPaymentQr: true,
+      showInvoiceWordsTotal: true,
+      showInvoiceSignature: true,
+      showInvoiceTerms: true,
+      customTemplates: []
     },
     tax: {
       interState: false,
@@ -191,14 +240,30 @@ function defaultSettings() {
     pos: {
       allowNegativeStock: true,
       enableLoyalty: true,
+      loyaltySpendAmount: 100,
+      loyaltyPointsPerSpend: 1,
       loyaltyPointsPerHundred: 1,
+      loyaltyMinSpendToEarn: 0,
       loyaltyRedeemValue: 0.5,
       loyaltyMinRedeemPoints: 50,
+      loyaltyMaxRedeemPercent: 100,
       quickAmountPills: [100, 200, 500, 2000],
       enableTables: false,
       kotEnabled: false,
       requirePasswordForStockEdit: false,
-      stockEditPassword: ''
+      stockEditPassword: '',
+      enableBatchTracking: false,
+      nearExpiryDays: 30
+    },
+    loyalty: {
+      enableLoyalty: true,
+      loyaltySpendAmount: 100,
+      loyaltyPointsPerSpend: 1,
+      loyaltyPointsPerHundred: 1,
+      loyaltyMinSpendToEarn: 0,
+      loyaltyRedeemValue: 0.5,
+      loyaltyMinRedeemPoints: 50,
+      loyaltyMaxRedeemPercent: 100
     }
   };
 }
@@ -274,7 +339,11 @@ function emptyStore(overrides = {}) {
     orders: [],
     quotations: overrides.quotations || [],
     purchases: overrides.purchases || [],
+    purchaseOrders: overrides.purchaseOrders || [],
+    vendorCredits: overrides.vendorCredits || [],
+    creditNotes: overrides.creditNotes || [],
     stockMovements: [],
+    batchWriteOffs: [],
     heldBills: [],
     tables: overrides.tables || [],
 

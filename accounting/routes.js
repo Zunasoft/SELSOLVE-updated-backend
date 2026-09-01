@@ -641,10 +641,16 @@ router.post('/payments', (req, res) => {
     record.voucherNo = voucher.voucherNo;
     store.payments.unshift(record);
 
+    posting.applyVendorPaymentToPurchases(store, vendor, record.amount, record.discount);
+
     const account = (store.accounts || []).find(
       (a) => a.partyId === vendor.id && a.partyType === 'VENDOR'
     );
-    vendor.outstandingPayable = Math.max(0, accountBalance(store, account.id));
+    if (account) {
+      vendor.outstandingPayable = Math.max(0, accountBalance(store, account.id));
+    } else {
+      vendor.outstandingPayable = Math.max(0, (Number(vendor.outstandingPayable) || 0) - record.amount);
+    }
 
     res.status(201).json({
       success: true,

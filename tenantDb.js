@@ -15,6 +15,9 @@ const ARRAY_COLLECTIONS = [
   { key: 'recipes', collection: 'recipes', idField: 'productId' },
   { key: 'heldBills', collection: 'heldbills', idField: 'id' },
   { key: 'purchases', collection: 'purchases', idField: 'id' },
+  { key: 'purchaseOrders', collection: 'purchaseorders', idField: 'id' },
+  { key: 'vendorCredits', collection: 'vendorcredits', idField: 'id' },
+  { key: 'creditNotes', collection: 'creditnotes', idField: 'id' },
   { key: 'accounts', collection: 'accounts', idField: 'id' },
   { key: 'sessions', collection: 'sessions', idField: 'id' },
   { key: 'quotations', collection: 'quotations', idField: 'id' },
@@ -33,7 +36,8 @@ const ARRAY_COLLECTIONS = [
   { key: 'expenses', collection: 'expenses', idField: 'id', appendOnly: true },
   { key: 'receipts', collection: 'receipts', idField: 'id', appendOnly: true },
   { key: 'payments', collection: 'payments', idField: 'id', appendOnly: true },
-  { key: 'transfers', collection: 'transfers', idField: 'id', appendOnly: true }
+  { key: 'transfers', collection: 'transfers', idField: 'id', appendOnly: true },
+  { key: 'batchWriteOffs', collection: 'batchwriteoffs', idField: 'id', appendOnly: true }
 ];
 
 /** Singleton values, all kept as one document each in the `meta` collection. */

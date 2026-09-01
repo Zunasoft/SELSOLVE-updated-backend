@@ -296,7 +296,7 @@ router.get('/reports/purchases', (req, res) => {
     if (!byVendor[key]) byVendor[key] = { vendor: key, invoices: 0, total: 0, unpaid: 0 };
     byVendor[key].invoices += 1;
     byVendor[key].total = r2(byVendor[key].total + p.totalAmount);
-    if (p.paymentStatus !== 'PAID') byVendor[key].unpaid = r2(byVendor[key].unpaid + p.totalAmount);
+    if (p.paymentStatus !== 'PAID') byVendor[key].unpaid = r2(byVendor[key].unpaid + (Number(p.totalAmount) || 0) - (Number(p.paidAmount) || 0));
   });
 
   res.json({
