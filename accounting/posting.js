@@ -122,12 +122,39 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
     }
 
     if (settledPortion > 0) {
-      const debitAccount = settlementAccount(store, order.paymentMethod, order.settlementAccountId);
-      lines.unshift({
-        accountId: debitAccount.id,
-        debit: settledPortion,
-        narration: `Invoice ${order.orderId}`
-      });
+      // A split/multi-pay sale collected money across more than one method
+      // (e.g. half Cash, half UPI) — book each method's share to its own
+      // ledger (Cash vs Bank) instead of dumping the whole settled amount
+      // into whichever account order.paymentMethod's composite label ('Split
+      // Payment') would otherwise resolve to.
+      const paymentRows = (order.payments || []).filter((p) => Number(p.amount) > 0);
+      if (paymentRows.length > 1) {
+        const byAccount = new Map();
+        let remaining = settledPortion;
+        for (const p of paymentRows) {
+          if (remaining <= 0) break;
+          const amt = r2(Math.min(remaining, Number(p.amount) || 0));
+          if (amt <= 0) continue;
+          const acc = settlementAccount(store, p.paymentMethod, order.settlementAccountId);
+          if (!acc?.id) continue;
+          byAccount.set(acc.id, r2((byAccount.get(acc.id) || 0) + amt));
+          remaining = r2(remaining - amt);
+        }
+        if (remaining > 0) {
+          const fallback = settlementAccount(store, order.paymentMethod, order.settlementAccountId);
+          if (fallback?.id) byAccount.set(fallback.id, r2((byAccount.get(fallback.id) || 0) + remaining));
+        }
+        for (const [accountId, amt] of byAccount) {
+          if (amt > 0) lines.unshift({ accountId, debit: amt, narration: `Invoice ${order.orderId}` });
+        }
+      } else {
+        const debitAccount = settlementAccount(store, order.paymentMethod, order.settlementAccountId);
+        lines.unshift({
+          accountId: debitAccount.id,
+          debit: settledPortion,
+          narration: `Invoice ${order.orderId}`
+        });
+      }
     }
   }
 

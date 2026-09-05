@@ -436,6 +436,22 @@ router.post('/orders', async (req, res) => {
 
   const payableTotal = r2(Math.max(0, Number(total) - loyaltyRedeemed - advanceRedeemed));
 
+  // Multi-pay / split-tender: several amounts collected across different
+  // methods (e.g. half Cash, half UPI) for the same bill. Each entry is kept
+  // as its own line in order.payments below so cash-drawer sync and the
+  // ledger split (postSale) can tell exactly how much of each method was
+  // actually collected, instead of lumping the whole total under one mode.
+  const splitEntries = Array.isArray(splitPayments)
+    ? splitPayments
+        .map((p) => ({
+          method: String(p.method || p.paymentMethod || 'Cash').trim() || 'Cash',
+          amount: r2(Math.max(0, Number(p.amount) || 0)),
+          ref: String(p.ref || p.paymentRef || '').trim()
+        }))
+        .filter((p) => p.amount > 0)
+    : [];
+  const isSplit = splitEntries.length > 0;
+
   const requestedStatus = String(req.body.status || '').toUpperCase();
   const isDraft = requestedStatus === 'DRAFT';
   const isExplicitUnpaid = requestedStatus === 'UNPAID' || requestedStatus === 'PENDING';
@@ -444,6 +460,8 @@ router.post('/orders', async (req, res) => {
   let initialPaid = 0;
   if (isDraft || isExplicitUnpaid) {
     initialPaid = 0;
+  } else if (isSplit) {
+    initialPaid = Math.min(payableTotal, r2(splitEntries.reduce((sum, p) => sum + p.amount, 0)));
   } else if (req.body.paidAmount !== undefined || req.body.amountPaid !== undefined) {
     initialPaid = Math.min(payableTotal, Math.max(0, r2(Number(req.body.paidAmount ?? req.body.amountPaid ?? 0))));
   } else if (requestedStatus === 'PARTIALLY_PAID' || requestedStatus === 'PARTIAL') {
@@ -529,9 +547,9 @@ router.post('/orders', async (req, res) => {
     dispatchDocNo: dispatchDocNo || '',
     termsOfDelivery: termsOfDelivery || '',
     paymentTerms: paymentTerms || '',
-    paymentMethod: payableTotal === 0 && advanceRedeemed > 0 ? 'Advance / Store Credit' : paymentMethod || 'Cash',
+    paymentMethod: payableTotal === 0 && advanceRedeemed > 0 ? 'Advance / Store Credit' : (isSplit ? 'Split Payment' : (paymentMethod || 'Cash')),
     paymentRef: req.body.paymentRef || '',
-    splitPayments: Array.isArray(splitPayments) ? splitPayments : null,
+    splitPayments: isSplit ? splitEntries : null,
     subtotal: r2(subtotal),
     tax: r2(tax),
     discount: r2(discount),
@@ -544,17 +562,27 @@ router.post('/orders', async (req, res) => {
     total: payableTotal,
     paidAmount: initialPaid,
     balanceDue: balanceDue,
-    payments: initialPaid > 0 ? [
-      {
-        id: `pay_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        amount: initialPaid,
-        paymentMethod: payableTotal === 0 && advanceRedeemed > 0 ? 'Advance / Store Credit' : paymentMethod || 'Cash',
-        paymentRef: req.body.paymentRef || '',
-        paidAt: now,
-        receivedBy: actor(req),
-        notes: req.body.paymentNotes || req.body.notes || 'Initial payment'
-      }
-    ] : [],
+    payments: isSplit
+      ? splitEntries.map((p) => ({
+          id: `pay_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          amount: p.amount,
+          paymentMethod: p.method,
+          paymentRef: p.ref,
+          paidAt: now,
+          receivedBy: actor(req),
+          notes: req.body.paymentNotes || req.body.notes || 'Split payment'
+        }))
+      : initialPaid > 0 ? [
+        {
+          id: `pay_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          amount: initialPaid,
+          paymentMethod: payableTotal === 0 && advanceRedeemed > 0 ? 'Advance / Store Credit' : paymentMethod || 'Cash',
+          paymentRef: req.body.paymentRef || '',
+          paidAt: now,
+          receivedBy: actor(req),
+          notes: req.body.paymentNotes || req.body.notes || 'Initial payment'
+        }
+      ] : [],
     notes: notes || '',
     tableId: tableId || null,
     cashier: actor(req),
@@ -581,11 +609,20 @@ router.post('/orders', async (req, res) => {
     order.loyaltyBalance = customer.loyaltyPoints;
   }
 
-  if (!isDraft && initialPaid > 0 && String(order.paymentMethod).toLowerCase() === 'cash' && store.session) {
-    store.session.currentCash = r2(store.session.currentCash + initialPaid);
+  // Credit only the cash actually collected — for a split payment (e.g. half
+  // Cash, half UPI) the top-level order.paymentMethod is the composite label
+  // 'Split Payment', so it no longer tells us whether cash changed hands.
+  // order.payments carries each method separately and is the source of truth
+  // everywhere else (void/delete already read it the same way).
+  const cashCollected = (order.payments || [])
+    .filter((p) => String(p.paymentMethod).toLowerCase() === 'cash')
+    .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+  if (!isDraft && cashCollected > 0 && store.session) {
+    store.session.currentCash = r2(store.session.currentCash + cashCollected);
     store.session.cashEntries.push({
       type: 'IN',
-      amount: initialPaid,
+      amount: cashCollected,
       reason: `Sale ${orderId}`,
       time: order.date
     });

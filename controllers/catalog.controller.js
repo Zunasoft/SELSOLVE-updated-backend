@@ -172,8 +172,26 @@ function getTenantPriceSheets(store) {
   return store.priceSheets;
 }
 
+function generateSku(name, barcodeOrId) {
+  const cleanName = String(name || 'PRD')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 4)
+    .padEnd(3, 'X');
+  const cleanCode = String(barcodeOrId || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(-4);
+  const suffix = cleanCode || Math.floor(1000 + Math.random() * 9000);
+  return `SKU-${cleanName}-${suffix}`;
+}
+exports.generateSku = generateSku;
+
 function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
   const barcode = payload.barcode || existing?.barcode || payload.defaultBarcode || randomBarcode();
+  const sku = payload.sku !== undefined && String(payload.sku).trim() !== ''
+    ? String(payload.sku).trim().toUpperCase()
+    : existing?.sku || generateSku(payload.name || existing?.name, barcode);
 
   let barcodes = [];
   if (Array.isArray(payload.barcodes) && payload.barcodes.length) {
@@ -187,6 +205,23 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
   }
 
   if (!barcodes.includes(barcode)) barcodes.unshift(barcode);
+
+  let barcodeDetails = [];
+  if (Array.isArray(payload.barcodeDetails) && payload.barcodeDetails.length) {
+    barcodeDetails = payload.barcodeDetails
+      .filter((b) => b && (b.code || b.barcode))
+      .map((b) => ({
+        code: String(b.code || b.barcode).trim(),
+        type: b.type || 'alternate'
+      }));
+  } else if (Array.isArray(existing?.barcodeDetails) && existing.barcodeDetails.length) {
+    barcodeDetails = existing.barcodeDetails;
+  } else {
+    barcodeDetails = barcodes.map((c, i) => ({
+      code: c,
+      type: c === barcode || i === 0 ? 'primary' : 'alternate'
+    }));
+  }
 
   const price = num(payload.price, existing?.price ?? 0);
   const purchasePrice = num(payload.purchasePrice, existing?.purchasePrice ?? Math.round(price * 0.7));
@@ -268,7 +303,9 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     categoryId: categoryIds[0],
     categoryIds,
     barcode,
+    sku,
     barcodes,
+    barcodeDetails,
     defaultBarcode: barcode,
     hsn: payload.hsn ?? existing?.hsn ?? '',
     unit,
@@ -434,6 +471,15 @@ exports.getProducts = (req, res) => {
   const store = req.tenantStore;
   const { q, categoryId, lowStock, outOfStock, productType, status } = req.query;
 
+  // Ensure every product in store has an SKU code
+  if (Array.isArray(store.products)) {
+    store.products.forEach((p, idx) => {
+      if (!p.sku) {
+        p.sku = generateSku(p.name, p.barcode || p.id || (idx + 1));
+      }
+    });
+  }
+
   let rows = store.products || [];
   if (categoryId && categoryId !== 'all') rows = rows.filter((p) => (p.categoryIds || [p.categoryId]).includes(categoryId));
   if (productType && productType !== 'all') rows = rows.filter((p) => (p.productTypes || [p.productType]).includes(productType));
@@ -460,6 +506,7 @@ exports.getProducts = (req, res) => {
         p.name.toLowerCase().includes(needle) ||
         (p.printName || '').toLowerCase().includes(needle) ||
         (p.regionalName || '').toLowerCase().includes(needle) ||
+        (p.sku || '').toLowerCase().includes(needle) ||
         p.id.toLowerCase().includes(needle) ||
         (p.barcodes || [p.barcode]).some((b) => String(b).includes(needle))
     );
@@ -566,6 +613,23 @@ exports.updateProduct = (req, res) => {
 
   const existing = store.products[index];
   const previousStock = existing.stock;
+
+  // Once a product has real stock sitting in batches, dropping trackBatches
+  // would strand that stock outside the batch system (FEFO consumption,
+  // expiry alerts, per-batch cost) it's recorded against — so the flag can
+  // only be turned off after every batch has been sold, transferred, or
+  // written down to zero. Checked server-side too since the client can be
+  // bypassed.
+  if (existing.trackBatches && req.body.trackBatches !== undefined && !Boolean(req.body.trackBatches)) {
+    const remaining = (existing.batches || []).reduce((sum, b) => sum + (Number(b.qty) || 0), 0);
+    if (remaining > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot turn off batch tracking — ${remaining} unit(s) of batched stock still remain. Sell, transfer, or write off all batches first.`
+      });
+    }
+  }
+
   const updated = shapeProduct(store, req.body, existing, actor(req));
   store.products[index] = updated;
 
@@ -737,6 +801,7 @@ exports.getPriceSheetGrid = (req, res) => {
       regionalName: p.regionalName || p.printName,
       category: categoryNames.length ? categoryNames.join(', ') : '—',
       barcode: p.barcode,
+      sku: p.sku || '',
       hsn: p.hsn,
       unit: p.unit,
       productType: p.productType,
@@ -821,7 +886,8 @@ function normalizeImportRow(row) {
   const productTypes = [productType];
 
   const unit = getVal('unit', 'uom', 'units', 'baseunit', 'unitofmeasure') || 'pcs';
-  const barcode = getVal('barcode', 'code', 'sku', 'upc', 'itemcode', 'ean', 'barcodeno');
+  const sku = getVal('sku', 'skucode', 'itemcode', 'productcode');
+  const barcode = getVal('barcode', 'code', 'upc', 'ean', 'barcodeno');
   const purchasePrice = cleanNumStr(getVal('purchasePrice', 'purchaseprice', 'costprice', 'cost', 'buyprice', 'unitcost', 'purchasecost'));
   const price = cleanNumStr(getVal('price', 'sellingprice', 'saleprice', 'rate', 'sale_price', 'mrp', 'retailprice', 'unitprice', 'sellprice', 'offerprice', 'netprice'));
   const mrp = cleanNumStr(getVal('mrp', 'maxretailprice', 'maximumretailprice'));
@@ -837,6 +903,7 @@ function normalizeImportRow(row) {
     categoryName,
     productType,
     unit,
+    sku: sku || generateSku(name, barcode),
     barcode,
     purchasePrice,
     price,

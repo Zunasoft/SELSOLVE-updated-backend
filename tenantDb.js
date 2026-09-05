@@ -172,6 +172,17 @@ async function doHydrate(dbName, store, tenant, trackBaseline = true) {
     store[spec.key] = rows.map(stripId);
   }
 
+  // Ensure every loaded product has an SKU code
+  if (Array.isArray(store.products)) {
+    store.products.forEach((p, idx) => {
+      if (!p.sku) {
+        const cleanName = String(p.name || 'PRD').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4).padEnd(3, 'X');
+        const cleanCode = String(p.barcode || p.id || (idx + 1)).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(-4) || '001';
+        p.sku = `SKU-${cleanName}-${cleanCode}`;
+      }
+    });
+  }
+
   if (meta.settings !== undefined) store.settings = mergeSettings(defaultSettings(), meta.settings);
   if (meta.session !== undefined) store.session = meta.session;
   if (meta.voucherCounters !== undefined) store.voucherCounters = meta.voucherCounters || {};
