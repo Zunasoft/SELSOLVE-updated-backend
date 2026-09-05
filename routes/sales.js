@@ -954,13 +954,113 @@ router.post('/orders/:orderId/issue', async (req, res) => {
   });
 });
 
-/** Update a Draft Invoice */
+/**
+ * Header/party details that are safe to correct on an already-issued
+ * invoice or bill (typos, a wrong phone number, missed shipping info) without
+ * touching stock or the accounting ledger. Items, quantities, prices and
+ * totals are deliberately excluded here — those must go through Void or a
+ * Sales Return (credit note) so stock and the books stay reconciled; see
+ * LOCKED_FIELDS_ON_ISSUED below.
+ */
+const EDITABLE_DETAIL_FIELDS = [
+  { key: 'customerName', label: 'Customer Name' },
+  { key: 'customerPhone', label: 'Customer Phone' },
+  { key: 'customerGstin', label: 'Customer GSTIN' },
+  { key: 'customerPan', label: 'Customer PAN' },
+  { key: 'customerAddress', label: 'Customer Address' },
+  { key: 'customerState', label: 'Customer State' },
+  { key: 'customerStateCode', label: 'Customer State Code' },
+  { key: 'notes', label: 'Notes' },
+  { key: 'dueDate', label: 'Due Date' },
+  { key: 'placeOfSupply', label: 'Place of Supply' },
+  { key: 'vendorCode', label: 'Vendor Code' },
+  { key: 'dispatchFrom', label: 'Dispatch From' },
+  { key: 'dispatchDate', label: 'Dispatch Date' },
+  { key: 'shipToName', label: 'Ship To Name' },
+  { key: 'shipToAddress', label: 'Ship To Address' },
+  { key: 'vehicleNo', label: 'Vehicle No' },
+  { key: 'shipBy', label: 'Ship By' },
+  { key: 'transporterName', label: 'Transporter Name' },
+  { key: 'buyerRef', label: 'Buyer Reference' },
+  { key: 'buyerRefDate', label: 'Buyer Reference Date' },
+  { key: 'buyerOrderNo', label: 'Buyer Order No' },
+  { key: 'buyerOrderDate', label: 'Buyer Order Date' },
+  { key: 'dispatchDocNo', label: 'Dispatch Doc No' },
+  { key: 'termsOfDelivery', label: 'Terms of Delivery' },
+  { key: 'paymentTerms', label: 'Payment Terms' },
+  { key: 'paymentRef', label: 'Payment Reference' }
+];
+
+// Rejected outright on an issued invoice's details-only edit — these all feed
+// stock deduction or the ledger, so changing them here would desync inventory
+// and the books from what was actually posted at checkout.
+const LOCKED_FIELDS_ON_ISSUED = [
+  'items', 'subtotal', 'tax', 'discount', 'roundOff', 'total', 'grossTotal',
+  'paymentMethod', 'paidAmount', 'balanceDue', 'status', 'paymentStatus'
+];
+
+/** Records a field-level diff on the order (for its own "Edited" history) and the tenant-wide edit log. */
+function logInvoiceEdit(store, order, changes, user) {
+  if (!changes.length) return null;
+  const now = new Date().toISOString();
+  const entry = {
+    id: `edit_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    orderId: order.orderId,
+    editedBy: user,
+    editedAt: now,
+    changes
+  };
+
+  if (!Array.isArray(store.invoiceEditLogs)) store.invoiceEditLogs = [];
+  store.invoiceEditLogs.unshift(entry);
+  if (store.invoiceEditLogs.length > 2000) store.invoiceEditLogs.pop();
+
+  if (!Array.isArray(order.editHistory)) order.editHistory = [];
+  order.editHistory.unshift(entry);
+
+  order.isEdited = true;
+  order.lastEditedAt = now;
+  order.lastEditedBy = user;
+  return entry;
+}
+
+/** Update an invoice/bill — a Draft may be freely edited; an issued one is limited to header/party details. */
 router.put('/orders/:orderId', (req, res) => {
   const store = req.tenantStore;
   const order = (store.orders || []).find((o) => o.orderId === req.params.orderId);
   if (!order) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+
+  if (order.status === 'VOID') {
+    return res.status(400).json({ success: false, message: 'Voided invoices cannot be edited.' });
+  }
+
   if (order.status !== 'DRAFT') {
-    return res.status(400).json({ success: false, message: 'Only Draft invoices can be modified. Finalized invoices must be voided.' });
+    const lockedKeysPresent = LOCKED_FIELDS_ON_ISSUED.filter((k) => req.body[k] !== undefined);
+    if (lockedKeysPresent.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Items and amounts on an issued invoice can't be edited directly — void the invoice or raise a Sales Return (credit note) instead. (Blocked field${lockedKeysPresent.length > 1 ? 's' : ''}: ${lockedKeysPresent.join(', ')})`
+      });
+    }
+
+    const changes = [];
+    EDITABLE_DETAIL_FIELDS.forEach(({ key, label }) => {
+      if (req.body[key] === undefined) return;
+      const oldValue = order[key] ?? '';
+      const newValue = req.body[key] ?? '';
+      if (String(oldValue) !== String(newValue)) {
+        changes.push({ field: key, label, oldValue, newValue });
+        order[key] = req.body[key];
+      }
+    });
+
+    if (changes.length > 0) logInvoiceEdit(store, order, changes, actor(req));
+
+    return res.json({
+      success: true,
+      message: changes.length > 0 ? `Invoice #${order.orderId} details updated.` : 'No changes to save.',
+      data: { ...order, company: store.settings.company, billing: store.settings.billing }
+    });
   }
 
   const {

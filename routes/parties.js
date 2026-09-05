@@ -953,6 +953,110 @@ router.post('/purchases', (req, res) => {
 });
 
 /**
+ * Vendor/header details that are safe to correct on a purchase already
+ * received into stock — typos, a missed vendor GSTIN, shipping info — without
+ * touching stock or the accounting ledger. Mirrors EDITABLE_DETAIL_FIELDS in
+ * routes/sales.js; items, amounts and payment fields are excluded on purpose,
+ * see PURCHASE_LOCKED_FIELDS below.
+ */
+const PURCHASE_EDITABLE_DETAIL_FIELDS = [
+  { key: 'vendorName', label: 'Vendor Name' },
+  { key: 'vendorPhone', label: 'Vendor Phone' },
+  { key: 'vendorGstin', label: 'Vendor GSTIN' },
+  { key: 'vendorPan', label: 'Vendor PAN' },
+  { key: 'vendorAddress', label: 'Vendor Address' },
+  { key: 'vendorState', label: 'Vendor State' },
+  { key: 'vendorStateCode', label: 'Vendor State Code' },
+  { key: 'invoiceNo', label: 'Invoice No' },
+  { key: 'notes', label: 'Notes' },
+  { key: 'dueDate', label: 'Due Date' },
+  { key: 'paymentRef', label: 'Payment Reference' },
+  { key: 'paymentTerms', label: 'Payment Terms' },
+  { key: 'termsOfDelivery', label: 'Terms of Delivery' },
+  { key: 'placeOfSupply', label: 'Place of Supply' },
+  { key: 'dispatchFrom', label: 'Dispatch From' },
+  { key: 'dispatchDate', label: 'Dispatch Date' },
+  { key: 'dispatchDocNo', label: 'Dispatch Doc No' },
+  { key: 'shipToName', label: 'Ship To Name' },
+  { key: 'shipToAddress', label: 'Ship To Address' },
+  { key: 'vehicleNo', label: 'Vehicle No' },
+  { key: 'shipBy', label: 'Ship By' },
+  { key: 'transporterName', label: 'Transporter Name' },
+  { key: 'buyerOrderNo', label: 'Buyer Order No' },
+  { key: 'buyerOrderDate', label: 'Buyer Order Date' }
+];
+
+// Rejected outright on a details-only edit — these feed stock received at
+// invoice cost or the ledger, so changing them here would desync inventory
+// and the books from what was actually posted on receipt.
+const PURCHASE_LOCKED_FIELDS = [
+  'items', 'subtotal', 'tax', 'discount', 'roundOff', 'totalAmount', 'additionalCharges',
+  'paymentMode', 'paymentStatus', 'paidAmount', 'settlementAccountId', 'status', 'vendorId', 'poId'
+];
+
+function logPurchaseEdit(store, purchase, changes, user) {
+  if (!changes.length) return null;
+  const now = new Date().toISOString();
+  const entry = {
+    id: `edit_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    purchaseId: purchase.id,
+    editedBy: user,
+    editedAt: now,
+    changes
+  };
+
+  if (!Array.isArray(store.purchaseEditLogs)) store.purchaseEditLogs = [];
+  store.purchaseEditLogs.unshift(entry);
+  if (store.purchaseEditLogs.length > 2000) store.purchaseEditLogs.pop();
+
+  if (!Array.isArray(purchase.editHistory)) purchase.editHistory = [];
+  purchase.editHistory.unshift(entry);
+
+  purchase.isEdited = true;
+  purchase.lastEditedAt = now;
+  purchase.lastEditedBy = user;
+  return entry;
+}
+
+/** Update a purchase invoice's vendor/header details only — items and amounts are locked once received. */
+router.put('/purchases/:id', (req, res) => {
+  const store = req.tenantStore;
+  const purchase = (store.purchases || []).find((p) => p.id === req.params.id);
+  if (!purchase) return res.status(404).json({ success: false, message: 'Purchase not found.' });
+
+  if (purchase.status === 'VOID') {
+    return res.status(400).json({ success: false, message: 'Voided purchases cannot be edited.' });
+  }
+
+  const lockedKeysPresent = PURCHASE_LOCKED_FIELDS.filter((k) => req.body[k] !== undefined);
+  if (lockedKeysPresent.length > 0) {
+    return res.status(400).json({
+      success: false,
+      message: `Items and amounts on a received purchase can't be edited directly — void the purchase or raise a Return instead. (Blocked field${lockedKeysPresent.length > 1 ? 's' : ''}: ${lockedKeysPresent.join(', ')})`
+    });
+  }
+
+  const changes = [];
+  PURCHASE_EDITABLE_DETAIL_FIELDS.forEach(({ key, label }) => {
+    if (req.body[key] === undefined) return;
+    const oldValue = purchase[key] ?? '';
+    const newValue = req.body[key] ?? '';
+    if (String(oldValue) !== String(newValue)) {
+      changes.push({ field: key, label, oldValue, newValue });
+      purchase[key] = req.body[key];
+    }
+  });
+
+  if (changes.length > 0) logPurchaseEdit(store, purchase, changes, actor(req));
+
+  res.json({
+    success: true,
+    message: changes.length > 0 ? `Purchase ${purchase.invoiceNo} details updated.` : 'No changes to save.',
+    data: purchase
+  });
+});
+
+/**
  * Void a purchase invoice: pulls the received stock back out, reverses the
  * posted accounting voucher, and recomputes the vendor's payable — mirrors
  * how `/orders/:orderId/void` treats a sales bill. Purchases are never hard
