@@ -11,7 +11,7 @@ const posting = require('../accounting/posting');
 const { savePartyToDb, deletePartyFromDb } = require('../tenantProvisioner');
 const { shapeProduct } = require('../controllers/catalog.controller');
 const { addBatch, voidPurchaseBatches, writeOffBatch } = require('../controllers/batches');
-const { baseQty } = require('../controllers/unitConversion');
+const { baseQty, isWholeNumberUnit } = require('../controllers/unitConversion');
 
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
@@ -715,6 +715,21 @@ router.post('/purchases', (req, res) => {
   }
 
   const lines = Array.isArray(items) ? items : [];
+
+  // Same whole-number rule as billing: a line received in a discrete-count
+  // unit (pcs, box, dozen, ...) can't carry a fractional quantity.
+  const fractionalLine = lines.find((i) => {
+    const unit = i.unit || 'pcs';
+    const qty = Number(i.qty);
+    return isWholeNumberUnit(unit) && Number.isFinite(qty) && qty % 1 !== 0;
+  });
+  if (fractionalLine) {
+    return res.status(400).json({
+      success: false,
+      message: `"${fractionalLine.name || 'Item'}" is received in ${fractionalLine.unit} — quantity must be a whole number.`
+    });
+  }
+
   const subtotal = lines.length
     ? r2(lines.reduce((s, i) => s + Number(i.qty) * Number(i.rate), 0))
     : r2(totalAmount);
@@ -776,6 +791,24 @@ router.post('/purchases', (req, res) => {
     poNumber: purchaseOrder ? purchaseOrder.poNumber : null
   };
 
+  // Receiving under a batch number this product already has on file would
+  // otherwise make that batch ambiguous — two physically different lots
+  // sharing one traceable number. Rather than failing the whole purchase over
+  // a naming collision (an existing working flow must keep working), fall
+  // back to the next auto-generated number and flag it on the purchase so
+  // it's visible in the purchase record, not silently swapped.
+  const batchNoWarnings = [];
+  const addBatchSafely = (product, opts) => {
+    try {
+      return addBatch(product, opts);
+    } catch (err) {
+      batchNoWarnings.push(
+        `${product.name || 'Item'}: requested batch "${opts.batchNo}" was already in use — assigned a new batch number instead.`
+      );
+      return addBatch(product, { ...opts, batchNo: undefined });
+    }
+  };
+
   const createdProducts = [];
   lines.forEach((line) => {
     let product = store.products.find(
@@ -834,7 +867,7 @@ router.post('/purchases', (req, res) => {
         line.batches.forEach((b) => {
           const bQty = baseQty(product, { unit: line.unit, qty: Number(b.qty || 0) });
           if (bQty <= 0) return;
-          const batch = addBatch(product, {
+          const batch = addBatchSafely(product, {
             batchNo: b.batchNo,
             mfgDate: b.mfgDate,
             expiryDate: b.expiryDate,
@@ -852,7 +885,7 @@ router.post('/purchases', (req, res) => {
           line.batchNo = line.batches[0].batchNo;
         }
       } else {
-        const batch = addBatch(product, {
+        const batch = addBatchSafely(product, {
           batchNo: line.batchNo,
           mfgDate: line.mfgDate,
           expiryDate: line.expiryDate,
@@ -898,6 +931,20 @@ router.post('/purchases', (req, res) => {
     purchase.accountingError = err.message;
   }
 
+  // Cash paid to the vendor up front (at purchase entry, not the separate
+  // "settle due" screen) leaves the till just the same — the counter drawer
+  // needs to see it or its expected balance drifts from the ledger.
+  if (paid > 0 && String(purchase.paymentMode).toLowerCase() === 'cash' && store.session?.status === 'open') {
+    store.session.currentCash = r2(store.session.currentCash - paid);
+    store.session.cashEntries.push({
+      type: 'OUT',
+      amount: paid,
+      reason: `Vendor payment — ${purchase.vendorName} (Purchase ${purchase.invoiceNo})`,
+      time: purchase.date,
+      user: actor(req)
+    });
+  }
+
   if (totalAdditionalCharges > 0) {
     try {
       const landedVoucher = posting.postLandedCost(store, purchase, {
@@ -912,6 +959,19 @@ router.post('/purchases', (req, res) => {
       }
     } catch (err) {
       purchase.landedCostAccountingError = err.message;
+    }
+
+    // Same drawer-movement treatment for landed cost (freight/handling) when
+    // it's settled in cash at receiving time.
+    if (String(landedCostPaymentMode || 'Cash').toLowerCase() === 'cash' && store.session?.status === 'open') {
+      store.session.currentCash = r2(store.session.currentCash - totalAdditionalCharges);
+      store.session.cashEntries.push({
+        type: 'OUT',
+        amount: totalAdditionalCharges,
+        reason: `Landed cost — Purchase ${purchase.invoiceNo}`,
+        time: purchase.date,
+        user: actor(req)
+      });
     }
   }
 
@@ -937,6 +997,8 @@ router.post('/purchases', (req, res) => {
     if (!Array.isArray(purchaseOrder.purchaseIds)) purchaseOrder.purchaseIds = [];
     purchaseOrder.purchaseIds.push(purchase.id);
   }
+
+  if (batchNoWarnings.length) purchase.batchNoWarnings = batchNoWarnings;
 
   store.purchases.unshift(purchase);
 

@@ -9,10 +9,26 @@ const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
 const { decorateRecipe } = require('../modules/recipes');
 const { consumeBatchesFEFO, restoreBatches } = require('../controllers/batches');
-const { baseQty } = require('../controllers/unitConversion');
+const { pickSerialForSale, markSerialSold, restoreSerial } = require('../controllers/serials');
+const { baseQty, isWholeNumberUnit } = require('../controllers/unitConversion');
+const { savePartyToDb } = require('../tenantProvisioner');
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const r2 = engine.r2;
+
+/**
+ * A bill line in a whole-number unit (pcs, box, dozen, ...) can't carry a
+ * fractional quantity — "2.5 pcs" doesn't mean anything on a shop floor. The
+ * cart already blocks this at entry, but every write path that can land a
+ * line here re-checks it, the same way the qty>0/price>=0 guard beside this
+ * does, so a bypassed/scripted request can't slip a fractional PCS line in.
+ */
+const findFractionalQtyItem = (items) =>
+  (items || []).find((i) => {
+    const unit = i.unit || i.saleUnit || 'pcs';
+    const qty = Number(i.qty);
+    return isWholeNumberUnit(unit) && Number.isFinite(qty) && qty % 1 !== 0;
+  });
 
 /* --------------------------------- init --------------------------------- */
 
@@ -158,13 +174,27 @@ router.delete('/bills/held/:id', (req, res) => {
  * from `product.batches` instead — that stock isn't warehouse-scoped yet.
  * Returns which batches were drawn from (or null for a non-batch product),
  * so the caller can record it on the sale line for traceability.
+ *
+ * Serial-tracked products work the same way, but on a single unit instead of
+ * a quantity: the cashier's chosen serial (`preferredSerialId`, from the
+ * "which one am I selling" picker in Billing — the serial equivalent of the
+ * batch picker) is marked sold, or the oldest unit still in stock if none was
+ * specified. Warranty, if the product has it, starts counting from `saleDate`
+ * right here — the moment of sale, not the moment it was catalogued.
  */
-function deductWarehouseStock(product, qtyToDeduct, preferredBatchId) {
+function deductWarehouseStock(product, qtyToDeduct, preferredBatchId, preferredSerialId, orderId, saleDate) {
   const deduct = Number(qtyToDeduct) || 0;
   if (deduct <= 0) return null;
 
   if (product.trackBatches) {
     return consumeBatchesFEFO(product, deduct, preferredBatchId);
+  }
+
+  if (product.trackSerials) {
+    const target = pickSerialForSale(product, preferredSerialId);
+    if (!target) return { serialShortage: true };
+    const sold = markSerialSold(product, target.id, orderId, saleDate);
+    return { serialSold: sold };
   }
 
   const currentStock = Number(product.stock || 0);
@@ -195,8 +225,12 @@ function deductWarehouseStock(product, qtyToDeduct, preferredBatchId) {
  * it restores into those same batches rather than re-running FEFO — putting
  * stock back exactly where it came from. Falls back to a labeled placeholder
  * batch for legacy orders that predate batch tracking.
+ *
+ * A serial-tracked line restores the exact unit it sold (`serialSoldId`,
+ * recorded on the order line) back to IN_STOCK and clears its warranty
+ * window — a voided/returned sale never really started that clock.
  */
-function restoreWarehouseStock(product, qtyToRestore, batchesSold) {
+function restoreWarehouseStock(product, qtyToRestore, batchesSold, serialSoldId) {
   const restore = Number(qtyToRestore) || 0;
   if (restore <= 0) return;
 
@@ -206,6 +240,11 @@ function restoreWarehouseStock(product, qtyToRestore, batchesSold) {
     } else {
       restoreBatches(product, [{ batchId: null, batchNo: 'RESTORED', qty: restore }]);
     }
+    return;
+  }
+
+  if (product.trackSerials) {
+    if (serialSoldId) restoreSerial(product, serialSoldId);
     return;
   }
 
@@ -307,8 +346,16 @@ function deductStock(store, items, orderId, user) {
       shortages.push({ name: product.name, available: product.stock });
     }
 
-    const batchResult = deductWarehouseStock(product, soldQty, cartItem.batchId);
-    if (batchResult) cartItem.batchesSold = batchResult.consumed;
+    const stockResult = deductWarehouseStock(product, soldQty, cartItem.batchId, cartItem.serialId, orderId, cartItem.saleDate);
+    if (stockResult?.consumed) cartItem.batchesSold = stockResult.consumed;
+    if (stockResult?.serialSold) {
+      cartItem.serialId = stockResult.serialSold.id;
+      cartItem.serialNo = stockResult.serialSold.serialNo;
+      cartItem.warrantyEndDate = stockResult.serialSold.warrantyEndDate || null;
+    }
+    if (stockResult?.serialShortage) {
+      shortages.push({ name: product.name, available: 0, message: 'No serial-tracked units left in stock.' });
+    }
 
     logStockMovement(store, {
       product,
@@ -322,6 +369,70 @@ function deductStock(store, items, orderId, user) {
 
   return shortages;
 }
+
+/**
+ * Read-only mirror of `deductStock`'s traversal (composite ingredients,
+ * combo components, plain/batch/serial stock) — used only when the shop has
+ * "Allow Billing Below Zero Stock" turned off, to refuse the whole checkout
+ * up front. `deductStock` itself mutates as it walks the cart, so checking
+ * for shortages *during* that pass would mean some lines are already
+ * deducted by the time a later line is found to be short; this runs first,
+ * touches nothing, and the checkout is rejected before any stock moves.
+ */
+function findStockShortages(store, items) {
+  const shortages = [];
+
+  items.forEach((cartItem) => {
+    const product = findProductInStore(store, cartItem);
+    if (!product) return;
+
+    const soldQty = baseQty(product, cartItem);
+    const isComposite = product.isComposite || product.productType === 'composite';
+    const recipe = (store.recipes || []).find((r) => r.productId === product.id);
+    const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
+
+    if (isComposite && ingredients.length > 0) {
+      const yieldQty = Number(recipe?.yieldQty) || Number(product.recipeYieldQty) || 1;
+      ingredients.forEach((ing) => {
+        const raw = store.products.find((p) => p.id === ing.productId || (p.name && ing.name && p.name.trim().toLowerCase() === ing.name.trim().toLowerCase()));
+        if (!raw) return;
+        const reqPerUnit = (Number(ing.qty) || 0) / yieldQty;
+        const needed = Math.round(reqPerUnit * soldQty * 10000) / 10000;
+        if (Number(raw.stock || 0) < needed) {
+          shortages.push({ name: raw.name, available: Number(raw.stock || 0), needed });
+        }
+      });
+      return;
+    }
+
+    const isCombo = product.isCombo || product.productType === 'combo';
+    const comboItems = product.comboItems || product.bundleItems || [];
+    if (isCombo && comboItems.length > 0) {
+      comboItems.forEach((ci) => {
+        const comp = store.products.find((p) => p.id === ci.productId || p.id === ci.id);
+        if (!comp) return;
+        const compQty = Number(ci.qty || ci.quantity || 1);
+        const needed = Math.round(compQty * soldQty * 10000) / 10000;
+        if (Number(comp.stock || 0) < needed) {
+          shortages.push({ name: comp.name, available: Number(comp.stock || 0), needed });
+        }
+      });
+      return;
+    }
+
+    // `product.stock` is kept in sync as the true available count for every
+    // stock style this app has — plain, batch-summed (consumeBatchesFEFO)
+    // and serial-summed (recomputeSerialStock) — so one check covers all three.
+    if (Number(product.stock || 0) < soldQty) {
+      shortages.push({ name: product.name, available: Number(product.stock || 0), needed: soldQty });
+    }
+  });
+
+  return shortages;
+}
+
+/** True once a shop has explicitly turned billing-below-zero OFF; missing/undefined defaults to allowed, same as the stock-adjustment guard elsewhere. */
+const negativeStockBlocked = (store) => store.settings?.pos && store.settings.pos.allowNegativeStock === false;
 
 router.post('/orders', async (req, res) => {
   try {
@@ -349,6 +460,14 @@ router.post('/orders', async (req, res) => {
     return res.status(400).json({
       success: false,
       message: `Invalid quantity or price for "${badItem.name || badItem.id || 'item'}". Quantity must be greater than zero and price cannot be negative.`
+    });
+  }
+
+  const fractionalItem = findFractionalQtyItem(items);
+  if (fractionalItem) {
+    return res.status(400).json({
+      success: false,
+      message: `"${fractionalItem.name || fractionalItem.id || 'Item'}" is billed in ${fractionalItem.unit || fractionalItem.saleUnit} — quantity must be a whole number.`
     });
   }
 
@@ -495,6 +614,17 @@ router.post('/orders', async (req, res) => {
 
   const balanceDue = isDraft ? payableTotal : r2(Math.max(0, payableTotal - initialPaid));
 
+  if (!isDraft && negativeStockBlocked(store)) {
+    const preCheckShortages = findStockShortages(store, items);
+    if (preCheckShortages.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Not enough stock to bill: ${preCheckShortages.map((s) => `${s.name} (have ${s.available}, need ${s.needed})`).join('; ')}. Turn on "Allow Billing Below Zero Stock" in Settings, or adjust stock first.`,
+        shortages: preCheckShortages
+      });
+    }
+  }
+
   let shortages = [];
   if (!isDraft) {
     shortages = deductStock(store, items, orderId, actor(req));
@@ -515,7 +645,10 @@ router.post('/orders', async (req, res) => {
       discount: Number(i.discount) || 0,
       hsn: i.hsn || (product ? product.hsn : '') || '',
       baseQty: product ? baseQty(product, i) : (Number(i.qty) || 1),
-      batchesSold: Array.isArray(i.batchesSold) ? i.batchesSold : []
+      batchesSold: Array.isArray(i.batchesSold) ? i.batchesSold : [],
+      serialId: i.serialId || undefined,
+      serialNo: i.serialNo || undefined,
+      warrantyEndDate: i.warrantyEndDate || undefined
     };
   });
 
@@ -864,6 +997,14 @@ router.post('/orders/:orderId/issue', async (req, res) => {
     });
   }
 
+  const fractionalItem = findFractionalQtyItem(order.items);
+  if (fractionalItem) {
+    return res.status(400).json({
+      success: false,
+      message: `"${fractionalItem.name || fractionalItem.id || 'Item'}" is billed in ${fractionalItem.unit || fractionalItem.saleUnit} — quantity must be a whole number.`
+    });
+  }
+
   const targetStatus = String(req.body.status || '').toUpperCase();
   const paymentMethod = req.body.paymentMethod || order.paymentMethod || 'Cash';
   const paymentRef = req.body.paymentRef || '';
@@ -893,6 +1034,17 @@ router.post('/orders/:orderId/issue', async (req, res) => {
     initialPaid = 0;
     finalStatus = 'UNPAID';
     paymentStatus = 'UNPAID';
+  }
+
+  if (negativeStockBlocked(store)) {
+    const preCheckShortages = findStockShortages(store, order.items);
+    if (preCheckShortages.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Not enough stock to issue this invoice: ${preCheckShortages.map((s) => `${s.name} (have ${s.available}, need ${s.needed})`).join('; ')}. Turn on "Allow Billing Below Zero Stock" in Settings, or adjust stock first.`,
+        shortages: preCheckShortages
+      });
+    }
   }
 
   const shortages = deductStock(store, order.items, order.orderId, actor(req));
@@ -1079,6 +1231,13 @@ router.put('/orders/:orderId', (req, res) => {
         message: `Invalid quantity or price for "${badItem.name || badItem.id || 'item'}". Quantity must be greater than zero and price cannot be negative.`
       });
     }
+    const fractionalItem = findFractionalQtyItem(items);
+    if (fractionalItem) {
+      return res.status(400).json({
+        success: false,
+        message: `"${fractionalItem.name || fractionalItem.id || 'Item'}" is billed in ${fractionalItem.unit || fractionalItem.saleUnit} — quantity must be a whole number.`
+      });
+    }
   }
 
   if (customerName !== undefined) order.customerName = customerName;
@@ -1188,7 +1347,7 @@ router.delete('/orders/:orderId', (req, res) => {
           return;
         }
 
-        restoreWarehouseStock(product, soldQty, item.batchesSold);
+        restoreWarehouseStock(product, soldQty, item.batchesSold, item.serialId);
 
         logStockMovement(store, {
           product,
@@ -1313,7 +1472,7 @@ router.post('/orders/:orderId/void', (req, res) => {
       return;
     }
 
-    restoreWarehouseStock(product, soldQty, item.batchesSold);
+    restoreWarehouseStock(product, soldQty, item.batchesSold, item.serialId);
 
     logStockMovement(store, {
       product,
@@ -1768,7 +1927,7 @@ router.post('/session/close', (req, res) => {
   res.json({ success: true, message: 'POS counter session closed.', data: store.session });
 });
 
-router.post('/session/cash-entry', (req, res) => {
+router.post('/session/cash-entry', async (req, res) => {
   const store = req.tenantStore;
   const { type, amount, reason, person, phone, address, purpose, classification, expenseCategory, accountId, vendorId, customerId, partyType } = req.body;
   const value = Number(amount);
@@ -1777,7 +1936,6 @@ router.post('/session/cash-entry', (req, res) => {
     return res.status(400).json({ success: false, message: 'Open a counter session first.' });
   }
 
-  const isUnofficial = classification === 'UNOFFICIAL';
   const isExpense = classification === 'EXPENSE' || type === 'EXPENSE';
   const effectiveType = isExpense ? 'OUT' : (type === 'IN' ? 'IN' : 'OUT');
 
@@ -1797,6 +1955,47 @@ router.post('/session/cash-entry', (req, res) => {
     vendorObj = (store.vendors || []).find((v) => v.id === vendorId || (v.name && person && v.name.toLowerCase() === person.toLowerCase())) || null;
   }
 
+  // There's no such thing as "unofficial" cash — every rupee that lands in the
+  // drawer from someone who isn't already a known customer/vendor gets that
+  // person turned into a real customer (matched by phone if they've paid in
+  // before) so the money always has a party, a ledger account and a paper
+  // trail behind it, instead of a free-text name nobody can look up later.
+  let newlyCreatedCustomer = false;
+  if (!customerObj && !vendorObj && partyType === 'OTHER' && effectiveType === 'IN' && String(phone || '').trim()) {
+    const cleanPhone = String(phone).trim();
+    customerObj = (store.customers || []).find((c) => c.phone && String(c.phone).trim() === cleanPhone) || null;
+    if (!customerObj) {
+      customerObj = {
+        id: `c_${Date.now()}`,
+        name: (person || 'Walk-in Customer').trim(),
+        phone: cleanPhone,
+        email: '',
+        address: (address || '').trim(),
+        group: 'Retail',
+        creditLimit: 0,
+        gstin: '',
+        pan: '',
+        state: '',
+        stateCode: '',
+        priceSheetId: null,
+        outstanding: 0,
+        advance: 0,
+        loyaltyPoints: 0,
+        createdAt: new Date().toISOString(),
+        source: 'CASH_COUNTER'
+      };
+      store.customers.push(customerObj);
+      engine.ensurePartyAccount(store, customerObj, 'CUSTOMER');
+      newlyCreatedCustomer = true;
+      try {
+        await savePartyToDb(req.tenantDbName, { ...customerObj, type: 'customer' });
+      } catch (err) {
+        /* the cash entry and in-memory customer still stand even if the
+           background persist fails — it'll be picked up on the next save */
+      }
+    }
+  }
+
   const resolvedPerson = customerObj ? customerObj.name : (vendorObj ? vendorObj.name : person) || '';
   const resolvedPartyType = customerObj ? 'CUSTOMER' : (vendorObj ? 'VENDOR' : (partyType || 'OTHER'));
   const resolvedPhone = customerObj ? (customerObj.phone || '') : (vendorObj ? (vendorObj.phone || '') : (phone || ''));
@@ -1808,12 +2007,12 @@ router.post('/session/cash-entry', (req, res) => {
     amount: value,
     classification: isExpense
       ? 'EXPENSE'
+      : newlyCreatedCustomer
+      ? 'NEW_CUSTOMER_ENTRY'
       : customerObj
       ? 'CUSTOMER_ENTRY'
       : vendorObj
       ? (effectiveType === 'IN' ? 'VENDOR_REPAY' : 'VENDOR_PAYMENT')
-      : isUnofficial
-      ? 'UNOFFICIAL'
       : 'OFFICIAL',
     partyType: resolvedPartyType,
     person: resolvedPerson,
@@ -1821,7 +2020,8 @@ router.post('/session/cash-entry', (req, res) => {
     address: resolvedAddress,
     customerId: customerObj ? customerObj.id : null,
     vendorId: vendorObj ? vendorObj.id : null,
-    purpose: purpose || reason || (isExpense ? 'Internal business expense' : customerObj ? `Customer ${effectiveType === 'IN' ? 'Receipt' : 'Refund'}` : vendorObj ? `Vendor ${effectiveType === 'IN' ? 'Repayment/Refund' : 'Payment'}` : `Cash ${effectiveType}`),
+    isNewCustomer: newlyCreatedCustomer,
+    purpose: purpose || reason || (isExpense ? 'Internal business expense' : newlyCreatedCustomer ? `New customer cash receipt (${resolvedPerson})` : customerObj ? `Customer ${effectiveType === 'IN' ? 'Receipt' : 'Refund'}` : vendorObj ? `Vendor ${effectiveType === 'IN' ? 'Repayment/Refund' : 'Payment'}` : `Cash ${effectiveType}`),
     expenseCategory: expenseCategory || (isExpense ? 'General' : null),
     reason: reason || purpose || `Cash ${effectiveType}`,
     time: new Date().toISOString(),
@@ -1831,100 +2031,102 @@ router.post('/session/cash-entry', (req, res) => {
   store.session.cashEntries.push(entry);
 
   let voucherNo = null;
-  // Official fund transfers, vendor settlements, customer receipts, or expenses post to double-entry ledger
-  if (!isUnofficial) {
-    try {
-      const cash = engine.bySystemKey(store, 'CASH');
-      if (customerObj && effectiveType === 'IN') {
-        // Customer Paying Into Drawer (Receipt / Settlement)
-        const voucher = posting.postReceipt(
-          store,
-          {
-            id: `rec_${Date.now()}`,
-            date: new Date().toISOString(),
-            amount: value,
-            discount: 0,
-            paymentMode: 'Cash',
-            notes: `${entry.purpose} (Customer: ${customerObj.name})`
-          },
-          { customer: customerObj, createdBy: actor(req) }
-        );
-        voucherNo = voucher.voucherNo;
-        if (customerObj.outstanding !== undefined) {
-          customerObj.outstanding = r2((customerObj.outstanding || 0) - value);
-        }
-      } else if (vendorObj && effectiveType === 'IN') {
-        // Vendor Repayment / Refund Into Drawer
-        const voucher = posting.postVendorRefund(store, {
+  // Every cash movement — customer receipt, vendor settlement, expense, or a
+  // plain fund transfer — posts to the double-entry ledger. There's no more
+  // "unofficial" bucket that skips the books.
+  try {
+    const cash = engine.bySystemKey(store, 'CASH');
+    if (customerObj && effectiveType === 'IN') {
+      // Customer Paying Into Drawer (Receipt / Settlement)
+      const voucher = posting.postReceipt(
+        store,
+        {
+          id: `rec_${Date.now()}`,
+          date: new Date().toISOString(),
           amount: value,
-          vendor: vendorObj,
-          notes: `${entry.purpose} (Vendor: ${vendorObj.name})`,
-          createdBy: actor(req)
-        });
-        voucherNo = voucher.voucherNo;
-      } else if (vendorObj && effectiveType === 'OUT') {
-        // Vendor Cash Payout From Drawer
-        const voucher = posting.postPayment(
+          discount: 0,
+          paymentMode: 'Cash',
+          notes: `${entry.purpose} (Customer: ${customerObj.name})`
+        },
+        { customer: customerObj, createdBy: actor(req) }
+      );
+      voucherNo = voucher.voucherNo;
+      if (customerObj.outstanding !== undefined) {
+        customerObj.outstanding = r2((customerObj.outstanding || 0) - value);
+      }
+    } else if (vendorObj && effectiveType === 'IN') {
+      // Vendor Repayment / Refund Into Drawer
+      const voucher = posting.postVendorRefund(store, {
+        amount: value,
+        vendor: vendorObj,
+        notes: `${entry.purpose} (Vendor: ${vendorObj.name})`,
+        createdBy: actor(req)
+      });
+      voucherNo = voucher.voucherNo;
+    } else if (vendorObj && effectiveType === 'OUT') {
+      // Vendor Cash Payout From Drawer
+      const voucher = posting.postPayment(
+        store,
+        {
+          id: `pay_${Date.now()}`,
+          date: new Date().toISOString(),
+          amount: value,
+          discount: 0,
+          paymentMode: 'Cash',
+          notes: `${entry.purpose} (Vendor: ${vendorObj.name})`
+        },
+        { vendor: vendorObj, createdBy: actor(req) }
+      );
+      voucherNo = voucher.voucherNo;
+      if (vendorObj.outstanding !== undefined) {
+        vendorObj.outstanding = r2((vendorObj.outstanding || 0) - value);
+      }
+    } else if (isExpense) {
+      const expenseAcc = (store.accounts || []).find((a) => a.type === 'EXPENSE') || { id: 'acc_gen_expense' };
+      const voucher = posting.postDirectExpense(
+        store,
+        {
+          id: `exp_${Date.now()}`,
+          accountId: expenseAcc.id,
+          paidFromAccountId: cash.id,
+          amount: value,
+          taxAmount: 0,
+          notes: `${expenseCategory ? `[${expenseCategory}] ` : ''}${entry.purpose} (Recipient: ${person || 'N/A'})`,
+          date: new Date().toISOString()
+        },
+        { createdBy: actor(req) }
+      );
+      voucherNo = voucher.voucherNo;
+    } else {
+      const bank = (store.accounts || []).find((a) => a.systemKey === 'BANK');
+      const counter = accountId ? engine.resolveAccount(store, accountId) : bank;
+      if (counter && counter.id !== cash.id) {
+        const voucher = posting.postFundTransfer(
           store,
           {
-            id: `pay_${Date.now()}`,
-            date: new Date().toISOString(),
+            id: `cashentry_${Date.now()}`,
+            fromAccountId: effectiveType === 'IN' ? counter.id : cash.id,
+            toAccountId: effectiveType === 'IN' ? cash.id : counter.id,
             amount: value,
-            discount: 0,
-            paymentMode: 'Cash',
-            notes: `${entry.purpose} (Vendor: ${vendorObj.name})`
-          },
-          { vendor: vendorObj, createdBy: actor(req) }
-        );
-        voucherNo = voucher.voucherNo;
-        if (vendorObj.outstanding !== undefined) {
-          vendorObj.outstanding = r2((vendorObj.outstanding || 0) - value);
-        }
-      } else if (isExpense) {
-        const expenseAcc = (store.accounts || []).find((a) => a.type === 'EXPENSE') || { id: 'acc_gen_expense' };
-        const voucher = posting.postDirectExpense(
-          store,
-          {
-            id: `exp_${Date.now()}`,
-            accountId: expenseAcc.id,
-            paidFromAccountId: cash.id,
-            amount: value,
-            taxAmount: 0,
-            notes: `${expenseCategory ? `[${expenseCategory}] ` : ''}${entry.purpose} (Recipient: ${person || 'N/A'})`,
+            charges: 0,
+            notes: `${entry.purpose}${person ? ` (Person: ${person})` : ''}`,
             date: new Date().toISOString()
           },
           { createdBy: actor(req) }
         );
         voucherNo = voucher.voucherNo;
-      } else {
-        const bank = (store.accounts || []).find((a) => a.systemKey === 'BANK');
-        const counter = accountId ? engine.resolveAccount(store, accountId) : bank;
-        if (counter && counter.id !== cash.id) {
-          const voucher = posting.postFundTransfer(
-            store,
-            {
-              id: `cashentry_${Date.now()}`,
-              fromAccountId: effectiveType === 'IN' ? counter.id : cash.id,
-              toAccountId: effectiveType === 'IN' ? cash.id : counter.id,
-              amount: value,
-              charges: 0,
-              notes: `${entry.purpose}${person ? ` (Person: ${person})` : ''}`,
-              date: new Date().toISOString()
-            },
-            { createdBy: actor(req) }
-          );
-          voucherNo = voucher.voucherNo;
-        }
       }
-    } catch (err) {
-      /* the drawer entry still stands even if double-entry posting fails */
     }
+  } catch (err) {
+    /* the drawer entry still stands even if double-entry posting fails */
   }
 
   res.json({
     success: true,
-    message: `${entry.classification === 'EXPENSE' ? 'Expense' : isUnofficial ? 'Unofficial cash' : 'Cash'} ${effectiveType} recorded.`,
-    data: { session: store.session, entry, voucherNo }
+    message: newlyCreatedCustomer
+      ? `Cash ${effectiveType} recorded — ${customerObj.name} added to Customers.`
+      : `${entry.classification === 'EXPENSE' ? 'Expense' : 'Cash'} ${effectiveType} recorded.`,
+    data: { session: store.session, entry, voucherNo, customer: newlyCreatedCustomer ? customerObj : undefined }
   });
 });
 
@@ -2256,6 +2458,17 @@ router.post('/quotations/:id/convert', async (req, res) => {
   if (quotation.customerId) customer = store.customers.find((c) => c.id === quotation.customerId);
   if (!customer && quotation.customerName && quotation.customerName !== 'Walk-in Customer') {
     customer = store.customers.find((c) => c.name.toLowerCase() === quotation.customerName.toLowerCase());
+  }
+
+  if (negativeStockBlocked(store)) {
+    const preCheckShortages = findStockShortages(store, quotation.items);
+    if (preCheckShortages.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Not enough stock to convert this quotation to an invoice: ${preCheckShortages.map((s) => `${s.name} (have ${s.available}, need ${s.needed})`).join('; ')}. Turn on "Allow Billing Below Zero Stock" in Settings, or adjust stock first.`,
+        shortages: preCheckShortages
+      });
+    }
   }
 
   const shortages = deductStock(store, quotation.items, orderId, actor(req));

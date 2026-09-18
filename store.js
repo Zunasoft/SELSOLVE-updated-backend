@@ -164,6 +164,7 @@ function defaultSettings() {
       terms: 'Goods once sold cannot be returned without receipt.',
       printReceiptAfterSale: true,
       autoOpenDrawerOnCash: true,
+      showProductImages: true,
       // Thermal Bill & Invoice Templates Configuration
       activeThermalTemplate: 'detailed_gst', // 'detailed_gst' | 'standard' | 'minimal' | 'modern' | 'restaurant'
       paperWidth: '80mm', // '80mm' | '58mm'
@@ -412,7 +413,7 @@ function seedAccounting(store, { openingCash = 0, openingBank = 0, bankName = 'H
   }
 }
 
-function logStockMovement(store, { product, type, qtyChange, reason, refId, user, timestamp }) {
+function logStockMovement(store, { product, type, qtyChange, reason, refId, user, timestamp, warehouseId, warehouseName, batchNo, serials }) {
   const now = new Date();
   const isoTimestamp = timestamp || now.toISOString();
   const movement = {
@@ -437,7 +438,11 @@ function logStockMovement(store, { product, type, qtyChange, reason, refId, user
     unit: product.unit || 'pcs',
     reason: reason || type,
     refId: refId || null,
-    user: user || 'Owner'
+    user: user || 'Owner',
+    warehouseId: warehouseId || null,
+    warehouseName: warehouseName || null,
+    batchNo: batchNo || null,
+    serials: Array.isArray(serials) ? serials : []
   };
   store.stockMovements.unshift(movement);
   if (store.stockMovements.length > 2000) store.stockMovements.pop();

@@ -52,18 +52,25 @@ function sortBatchesFEFO(batches) {
   });
 }
 
-/**
- * Adds a new batch to a product from a purchase (or an opening-stock
- * migration). Always recomputes `product.stock` from the batch list.
- */
-function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, refPurchaseId, source, warehouseId }) {
-  if (!Array.isArray(product.batches)) product.batches = [];
+/** True if `batchNo` is already allocated to this product (case/whitespace-insensitive), including batches that were later fully consumed or written off — the number stays "used" even once its stock hits zero. */
+function isBatchNoTaken(product, batchNo, ignoreBatchId) {
+  const needle = String(batchNo || '').trim().toLowerCase();
+  if (!needle) return false;
+  return (product.batches || []).some(
+    (b) => b.id !== ignoreBatchId && String(b.batchNo || '').trim().toLowerCase() === needle
+  );
+}
 
-  let finalBatchNo = '';
-  if (batchNo && String(batchNo).trim()) {
-    finalBatchNo = String(batchNo).trim();
-  } else {
-    // Auto-generate numbers starting from 1 (or max numeric batch number + 1)
+/**
+ * Next auto-generated batch number for a product — a counter that only ever
+ * moves forward. A void or a write-off can remove/zero a batch record, but it
+ * must never free up that batch's *number* for reuse on an unrelated lot, or
+ * two physically different receipts end up sharing one traceable number. The
+ * counter itself lives on the product (so it survives across purchases) and
+ * is seeded once from the highest numeric batch number already on file.
+ */
+function nextAutoBatchNo(product) {
+  if (!Number.isFinite(product.batchSeq)) {
     let maxNum = 0;
     (product.batches || []).forEach((b) => {
       const num = parseInt(b.batchNo, 10);
@@ -71,7 +78,36 @@ function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellP
         maxNum = num;
       }
     });
-    finalBatchNo = maxNum > 0 ? String(maxNum + 1) : String((product.batches || []).length + 1);
+    product.batchSeq = maxNum;
+  }
+  product.batchSeq += 1;
+  return String(product.batchSeq);
+}
+
+/**
+ * Adds a new batch to a product from a purchase (or an opening-stock
+ * migration). Always recomputes `product.stock` from the batch list.
+ *
+ * A manually-entered batch number that's already on file for this product is
+ * rejected rather than silently duplicated — "Batch 12" received twice under
+ * two unrelated batch records would make FEFO consumption, reports and the
+ * purchase history that cites "Batch 12" all ambiguous about which lot they
+ * mean. Re-receiving genuinely the same lot belongs in the existing batch
+ * (add stock to it directly), not a second record with a repeated number.
+ */
+function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, refPurchaseId, source, warehouseId }) {
+  if (!Array.isArray(product.batches)) product.batches = [];
+
+  let finalBatchNo = '';
+  if (batchNo && String(batchNo).trim()) {
+    finalBatchNo = String(batchNo).trim();
+    if (isBatchNoTaken(product, finalBatchNo)) {
+      throw new Error(
+        `Batch "${finalBatchNo}" has already been allocated for ${product.name || 'this product'}. Use a different batch number, or add stock to the existing batch instead.`
+      );
+    }
+  } else {
+    finalBatchNo = nextAutoBatchNo(product);
   }
 
   const batch = {
@@ -249,20 +285,50 @@ function writeOffBatch(product, batchId, qty, reason, user) {
  * Normalizes the `batches` array on an incoming product payload (used by
  * `shapeProduct` for direct edits/opening-stock entry, as opposed to
  * `addBatch`, which purchases call one line at a time).
+ *
+ * Batch-master edits (fixing a number, an expiry date, a cost) never touch
+ * `qty` here — this only ever re-maps the same rows' own quantities, so the
+ * product's derived stock (`sum(batches.qty)`, computed by the caller) can't
+ * drift from a pure metadata edit. The one thing that *would* silently
+ * corrupt traceability is a batch-number collision: clearing one row's
+ * number for auto-reassignment used to just take `array position + 1`,
+ * which could land on a number another row in the same list already uses
+ * manually. Numbers are resolved in one left-to-right pass instead, tracking
+ * what's already been claimed, so two rows can never end up sharing one.
  */
 function shapeBatches(payload, existing) {
   const source = Array.isArray(payload.batches) ? payload.batches : existing?.batches;
   if (!Array.isArray(source)) return existing?.batches || [];
 
-  let batchCounter = 0;
+  const used = new Set();
+  let autoSeq = 0;
+  const nextAuto = () => {
+    let candidate;
+    do {
+      autoSeq += 1;
+      candidate = String(autoSeq);
+    } while (used.has(candidate));
+    return candidate;
+  };
+
   return source
     .filter((b) => b && Number(b.qty) >= 0)
     .map((b) => {
-      batchCounter++;
       const manual = b.batchNo && String(b.batchNo).trim();
+      let batchNo;
+      if (manual && !used.has(manual)) {
+        // First claim of this number wins; a later row asking for the same
+        // number (a typo/copy-paste duplicate) falls through to auto-assign
+        // rather than leaving two batches ambiguously sharing one label.
+        batchNo = manual;
+      } else {
+        batchNo = nextAuto();
+      }
+      used.add(batchNo);
+
       return {
         id: b.id || randomId('batch'),
-        batchNo: manual ? String(b.batchNo).trim() : String(batchCounter),
+        batchNo,
         mfgDate: b.mfgDate || null,
         expiryDate: b.expiryDate || null,
         qty: r4(b.qty),
@@ -280,6 +346,7 @@ module.exports = {
   sortBatchesFEFO,
   recomputeBatchStock,
   addBatch,
+  isBatchNoTaken,
   consumeBatchesFEFO,
   restoreBatches,
   voidPurchaseBatches,

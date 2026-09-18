@@ -13,6 +13,8 @@ const { logStockMovement, DEFAULT_UNITS, defaultPriceSheets, calculateProductSto
 const posting = require('../accounting/posting');
 const { setRecipe, removeRecipe, decorateRecipe, recipeFromProductPayload } = require('../modules/recipes');
 const { shapeBatches, writeOffBatch } = require('./batches');
+const { shapeSerials, shapeSerialCustomLabels } = require('./serials');
+const { enforceQtyPrecision, isWholeNumberUnit } = require('./unitConversion');
 
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const num = (v, fallback = 0) => {
@@ -172,26 +174,36 @@ function getTenantPriceSheets(store) {
   return store.priceSheets;
 }
 
-function generateSku(name, barcodeOrId) {
-  const cleanName = String(name || 'PRD')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-    .slice(0, 4)
-    .padEnd(3, 'X');
-  const cleanCode = String(barcodeOrId || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-    .slice(-4);
-  const suffix = cleanCode || Math.floor(1000 + Math.random() * 9000);
-  return `SKU-${cleanName}-${suffix}`;
+/**
+ * SKU codes are numeric-only, sequential, and grow as large as needed — no
+ * padding/truncation, so the counter never runs out of room. The running
+ * counter lives on the store; the first time it's needed it's seeded from
+ * the highest numeric SKU already in use (falling back to a 6-digit base)
+ * so a freshly-loaded store doesn't collide with SKUs assigned earlier.
+ */
+function generateSku(store) {
+  if (!Number.isFinite(store.skuSeq)) {
+    const existingMax = (store.products || []).reduce((max, p) => {
+      const digits = String(p.sku || '').replace(/\D/g, '');
+      const n = digits ? parseInt(digits, 10) : 0;
+      return n > max ? n : max;
+    }, 0);
+    store.skuSeq = Math.max(existingMax, 100000);
+  }
+  store.skuSeq += 1;
+  return String(store.skuSeq);
 }
 exports.generateSku = generateSku;
 
+/** Numeric-only: any letters/symbols a user types are stripped, not stored. */
+const cleanSku = (value) => String(value ?? '').replace(/\D/g, '');
+
 function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
   const barcode = payload.barcode || existing?.barcode || payload.defaultBarcode || randomBarcode();
-  const sku = payload.sku !== undefined && String(payload.sku).trim() !== ''
-    ? String(payload.sku).trim().toUpperCase()
-    : existing?.sku || generateSku(payload.name || existing?.name, barcode);
+  const enteredSku = payload.sku !== undefined ? cleanSku(payload.sku) : '';
+  const sku = enteredSku !== ''
+    ? enteredSku
+    : existing?.sku || generateSku(store);
 
   let barcodes = [];
   if (Array.isArray(payload.barcodes) && payload.barcodes.length) {
@@ -275,6 +287,31 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     warehouses = whMap;
   }
 
+  // Serial tracking is the other end of the same idea as batches — for a
+  // product that isn't lot/expiry-managed but where every unit needs its own
+  // traceable identity (electronics, etc.) — so the two are mutually
+  // exclusive on one product. Each serial is exactly one physical unit
+  // (there's no "qty" to sum), so stock is simply the count still in hand.
+  const trackSerials = trackBatches
+    ? false
+    : payload.trackSerials !== undefined
+    ? Boolean(payload.trackSerials)
+    : Boolean(existing?.trackSerials);
+  const serialCustomLabels = shapeSerialCustomLabels(payload, existing);
+  let serials = trackSerials ? shapeSerials(payload, existing) : (existing?.trackSerials ? existing.serials || [] : []);
+
+  if (trackSerials) {
+    stock = serials.filter((s) => s.status !== 'SOLD').length;
+    const defaultWh = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+    const whMap = {};
+    serials.forEach((s) => {
+      if (s.status === 'SOLD') return;
+      const whId = s.warehouseId || defaultWh;
+      whMap[whId] = (whMap[whId] || 0) + 1;
+    });
+    warehouses = whMap;
+  }
+
   const productTypes = shapeProductTypes(payload, existing);
   const productType = productTypes[0];
 
@@ -317,11 +354,16 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     purchasePrice,
     wholesalePrice: num(payload.wholesalePrice, existing?.wholesalePrice ?? price),
     specialPrice: num(payload.specialPrice, existing?.specialPrice ?? price),
-    stock: productType === 'service' ? 9999 : stock,
-    minStock: num(payload.minStock, existing?.minStock ?? 5),
+    // Whole-number units (pcs, box, dozen, ...) can't carry fractional stock —
+    // the same rule billing enforces on the way out applies here on the way in.
+    stock: productType === 'service' ? 9999 : enforceQtyPrecision(unit, stock),
+    minStock: enforceQtyPrecision(unit, num(payload.minStock, existing?.minStock ?? 5)),
     warehouses,
     trackBatches,
     batches,
+    trackSerials,
+    serials,
+    serialCustomLabels,
     // Per-product override for the near-expiry alert window (days). Blank/null
     // means "use the store default" — a store's default might be 30 days,
     // but eggs at a 14-day shelf life need their own much shorter number.
@@ -339,6 +381,14 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     customSubUnitMrp: num(payload.customSubUnitMrp, existing?.customSubUnitMrp ?? 0),
     customSubUnitBarcode: payload.customSubUnitBarcode ?? existing?.customSubUnitBarcode ?? '',
     enableMinorUnit: payload.enableMinorUnit !== undefined ? Boolean(payload.enableMinorUnit) : Boolean(existing?.enableMinorUnit),
+    trackSerial: payload.trackSerial !== undefined ? Boolean(payload.trackSerial) : Boolean(existing?.trackSerial),
+    serialNumbers: Array.isArray(payload.serialNumbers) ? payload.serialNumbers : (existing?.serialNumbers || []),
+    // Warranty tracking — the clock only starts once a unit is actually
+    // billed (see markSerialSold in controllers/serials.js), not from the
+    // date it was added to the catalogue.
+    hasWarranty: payload.hasWarranty !== undefined ? Boolean(payload.hasWarranty) : Boolean(existing?.hasWarranty),
+    warrantyDurationValue: num(payload.warrantyDurationValue, existing?.warrantyDurationValue ?? 12),
+    warrantyDurationUnit: payload.warrantyDurationUnit || existing?.warrantyDurationUnit || 'months',
     isActive: payload.isActive !== undefined ? Boolean(payload.isActive) : existing?.isActive ?? true,
     createdAt: existing?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -473,9 +523,9 @@ exports.getProducts = (req, res) => {
 
   // Ensure every product in store has an SKU code
   if (Array.isArray(store.products)) {
-    store.products.forEach((p, idx) => {
+    store.products.forEach((p) => {
       if (!p.sku) {
-        p.sku = generateSku(p.name, p.barcode || p.id || (idx + 1));
+        p.sku = generateSku(store);
       }
     });
   }
@@ -903,7 +953,9 @@ function normalizeImportRow(row) {
     categoryName,
     productType,
     unit,
-    sku: sku || generateSku(name, barcode),
+    // Numeric-only, same as manual entry; leave blank when the imported value
+    // has no digits so shapeProduct assigns the next sequential SKU itself.
+    sku: cleanSku(sku),
     barcode,
     purchasePrice,
     price,
@@ -1108,7 +1160,7 @@ exports.getInventorySummary = (req, res) => {
 
 exports.adjustStock = (req, res) => {
   const store = req.tenantStore;
-  const { productId, mode, quantity, reason, password } = req.body;
+  const { productId, mode, quantity, reason, password, warehouseId, batchId, batchNo, serial, serials } = req.body;
 
   const product = (store.products || []).find((p) => p.id === productId);
   if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
@@ -1117,31 +1169,114 @@ exports.adjustStock = (req, res) => {
     return res.status(403).json({ success: false, code: 'STOCK_PASSWORD_INVALID', message: 'Incorrect stock-edit password.' });
   }
 
-  const qty = Number(quantity);
-  if (!Number.isFinite(qty)) {
+  const rawQty = Number(quantity);
+  if (!Number.isFinite(rawQty)) {
     return res.status(400).json({ success: false, message: 'A numeric quantity is required.' });
   }
+  if (rawQty % 1 !== 0 && isWholeNumberUnit(product.unit)) {
+    return res.status(400).json({ success: false, message: `${product.name} is tracked in ${product.unit} — adjustment quantity must be a whole number.` });
+  }
+  const qty = rawQty;
+  const previous = num(product.stock, 0);
 
-  const previous = product.stock;
-  product.stock = mode === 'SET' ? qty : mode === 'REMOVE' ? previous - qty : previous + qty;
+  // 1. Resolve Godown / Warehouse
+  const targetWh = (store.warehouses || []).find((w) => w.id === warehouseId)
+    || (store.warehouses || []).find((w) => w.isDefault)
+    || (store.warehouses || [])[0]
+    || { id: 'wh_shop', name: 'Main Godown' };
+  const whKey = targetWh.id;
 
-  if (product.stock < 0 && !store.settings.pos.allowNegativeStock) {
+  if (!product.warehouses || typeof product.warehouses !== 'object') {
+    product.warehouses = {};
+    if (previous > 0) {
+      product.warehouses[whKey] = previous;
+    }
+  }
+
+  const prevWhStock = num(product.warehouses[whKey], 0);
+  const newWhStock = mode === 'SET' ? qty : mode === 'REMOVE' ? prevWhStock - qty : prevWhStock + qty;
+
+  if (newWhStock < 0 && !store.settings.pos?.allowNegativeStock) {
+    return res.status(400).json({ success: false, message: `Stock in ${targetWh.name} cannot be negative (${newWhStock}).` });
+  }
+
+  product.warehouses[whKey] = Math.max(0, newWhStock);
+
+  if (Object.keys(product.warehouses).length > 0) {
+    product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + num(val, 0), 0);
+  } else {
+    product.stock = mode === 'SET' ? qty : mode === 'REMOVE' ? previous - qty : previous + qty;
+  }
+
+  if (product.stock < 0 && !store.settings.pos?.allowNegativeStock) {
+    product.warehouses[whKey] = prevWhStock;
     product.stock = previous;
     return res.status(400).json({ success: false, message: 'Negative stock is not allowed for this store.' });
   }
 
   const delta = product.stock - previous;
-  if (product.warehouses && typeof product.warehouses === 'object') {
-    const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_shop';
-    product.warehouses[whKey] = num(product.warehouses[whKey], 0) + delta;
-    product.stock = Object.values(product.warehouses).reduce((sum, val) => sum + num(val, 0), 0);
+
+  // 2. Batch Update
+  let appliedBatchNo = (batchNo || '').trim();
+  if (batchId || appliedBatchNo) {
+    if (!Array.isArray(product.batches)) product.batches = [];
+    let targetBatch = product.batches.find((b) => b.id === batchId || (appliedBatchNo && String(b.batchNo).toLowerCase() === appliedBatchNo.toLowerCase()));
+    if (targetBatch) {
+      appliedBatchNo = targetBatch.batchNo;
+      const prevBQty = Number(targetBatch.qty) || 0;
+      targetBatch.qty = mode === 'SET' ? qty : mode === 'REMOVE' ? Math.max(0, prevBQty - qty) : prevBQty + qty;
+      if (whKey) targetBatch.warehouseId = whKey;
+    } else if (appliedBatchNo && mode !== 'REMOVE') {
+      targetBatch = {
+        id: `b_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+        batchNo: appliedBatchNo,
+        qty: qty,
+        warehouseId: whKey,
+        costPrice: product.purchasePrice || 0,
+        sellPrice: product.price || 0,
+        createdAt: new Date().toISOString()
+      };
+      product.batches.push(targetBatch);
+      product.trackBatches = true;
+    }
   }
+
+  // 3. Serial Numbers Update
+  const inputSerials = Array.isArray(serials)
+    ? serials
+    : (serial ? String(serial).split(',').map((s) => s.trim()).filter(Boolean) : []);
+
+  if (inputSerials.length > 0) {
+    if (!Array.isArray(product.serialNumbers)) product.serialNumbers = [];
+    if (mode === 'ADD') {
+      inputSerials.forEach((sn) => {
+        if (!product.serialNumbers.includes(sn)) product.serialNumbers.push(sn);
+      });
+    } else if (mode === 'REMOVE') {
+      product.serialNumbers = product.serialNumbers.filter((sn) => !inputSerials.includes(sn));
+    } else if (mode === 'SET') {
+      product.serialNumbers = [...inputSerials];
+    }
+  }
+
+  // 4. Detailed Reason and Stock Movement Log
+  const details = [];
+  if (reason) details.push(reason);
+  if (targetWh?.name) details.push(`Godown: ${targetWh.name}`);
+  if (appliedBatchNo) details.push(`Batch: ${appliedBatchNo}`);
+  if (inputSerials.length > 0) details.push(`Serial(s): ${inputSerials.join(', ')}`);
+  const fullReason = details.join(' · ');
+
   const movement = logStockMovement(store, {
     product,
     type: 'ADJUSTMENT',
     qtyChange: delta,
-    reason: reason || 'Manual stock adjustment',
-    user: actor(req)
+    reason: fullReason,
+    user: actor(req),
+    warehouseId: whKey,
+    warehouseName: targetWh?.name,
+    batchNo: appliedBatchNo || null,
+    serials: inputSerials
   });
 
   const voucher = posting.postStockAdjustment(
@@ -1149,8 +1284,8 @@ exports.adjustStock = (req, res) => {
     {
       id: movement.id,
       productName: product.name,
-      reason: reason || 'Manual adjustment',
-      value: delta * product.purchasePrice,
+      reason: fullReason,
+      value: delta * (product.purchasePrice || 0),
       date: movement.date
     },
     { createdBy: actor(req) }
@@ -1158,7 +1293,7 @@ exports.adjustStock = (req, res) => {
 
   res.json({
     success: true,
-    message: `Stock adjusted from ${previous} to ${product.stock} ${product.unit}.`,
+    message: `Stock adjusted from ${previous} to ${product.stock} ${product.unit} in ${targetWh.name}.`,
     data: { product, movement, voucherNo: voucher ? voucher.voucherNo : null }
   });
 };
