@@ -123,7 +123,7 @@ const SAMPLE_VENDORS = [
   for (const dbName of tenantDbNames) {
     console.log(`\nSeeding vendors into ${dbName}...`);
     const db = mongoose.connection.useDb(dbName, { useCache: true }).db;
-    
+
     for (const ven of SAMPLE_VENDORS) {
       await db.collection('vendors').updateOne(
         { id: ven.id },

@@ -5,15 +5,7 @@ try {
   nodemailer = null;
 }
 
-/**
- * Nodemailer transport.
- *
- * Configure real delivery through .env:
- *   SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS, MAIL_FROM
- *
- * When SMTP credentials are absent or nodemailer is not installed, the transport
- * falls back to a JSON logger so the OTP flow keeps working locally.
- */
+// Configure real delivery via .env (SMTP_HOST/PORT/SECURE/USER/PASS, MAIL_FROM); missing config or a missing nodemailer package falls back to a JSON/console logger so OTP keeps working locally.
 
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_USER = process.env.SMTP_USER || '';
@@ -129,9 +121,54 @@ const sendOtpEmail = async ({ to, otp, expiryMinutes = 10, purpose = 'tenant', r
   }
 };
 
+// Fire-and-forget: a failed/unconfigured send never blocks the sale or stock adjustment that triggered it.
+const sendLowStockEmail = async ({ to, storeName, product }) => {
+  const mail = {
+    from: MAIL_FROM,
+    to,
+    subject: `Low stock: ${product.name} (${product.stock} ${product.unit || ''} left)`,
+    text:
+      `${product.name} has reached its reorder level at ${storeName || 'your store'}.\n` +
+      `Current stock: ${product.stock} ${product.unit || ''}\n` +
+      `Reorder level: ${product.minStock} ${product.unit || ''}\n` +
+      (product.sku ? `SKU: ${product.sku}\n` : '') +
+      `Replenish it soon to avoid a stock-out.`,
+    html: `
+      <div style="font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
+        <div style="background:#f59e0b;padding:20px 24px;color:#ffffff;">
+          <div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;opacity:.9;">Reorder Alert</div>
+          <div style="font-size:19px;font-weight:700;margin-top:4px;">${product.name}</div>
+        </div>
+        <div style="padding:24px;color:#0f172a;font-size:14px;line-height:1.7;">
+          <p style="margin:0 0 12px;">Stock at <strong>${storeName || 'your store'}</strong> has reached its reorder level.</p>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <tr><td style="padding:6px 0;color:#64748b;">Current stock</td><td style="padding:6px 0;text-align:right;font-weight:700;">${product.stock} ${product.unit || ''}</td></tr>
+            <tr><td style="padding:6px 0;color:#64748b;">Reorder level</td><td style="padding:6px 0;text-align:right;">${product.minStock} ${product.unit || ''}</td></tr>
+            ${product.sku ? `<tr><td style="padding:6px 0;color:#64748b;">SKU</td><td style="padding:6px 0;text-align:right;">${product.sku}</td></tr>` : ''}
+          </table>
+        </div>
+      </div>
+    `
+  };
+
+  try {
+    if (transporter && isSmtpConfigured) {
+      const info = await transporter.sendMail(mail);
+      console.log(`[Mailer] Low-stock alert for "${product.name}" sent to ${to} (messageId: ${info.messageId})`);
+      return { delivered: true, messageId: info.messageId };
+    }
+    console.log(`[Mailer] (console-only) Low-stock alert for "${product.name}" → ${to}`);
+    return { delivered: false, reason: isSmtpConfigured ? 'SMTP failure' : 'SMTP not configured' };
+  } catch (err) {
+    console.error(`[Mailer] Failed to send low-stock alert for "${product.name}" to ${to}: ${err.message}`);
+    return { delivered: false, reason: err.message };
+  }
+};
+
 module.exports = {
   transporter,
   sendOtpEmail,
+  sendLowStockEmail,
   verifyMailer,
   isSmtpConfigured
 };

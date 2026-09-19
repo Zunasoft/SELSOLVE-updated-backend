@@ -400,6 +400,60 @@ router.get('/reports/vendors/payables', (req, res) => {
   });
 });
 
+/**
+ * Collective Ledger Report — REQ-34. A single consolidated view across every
+ * customer and vendor sub-ledger together, rather than needing to open the
+ * separate Customer Outstanding and Vendor Payables reports one at a time.
+ * Every figure is the same live sub-ledger balance those two reports use —
+ * this never introduces its own, separately-tracked number.
+ */
+router.get('/reports/collective-ledger', (req, res) => {
+  const store = req.tenantStore;
+  const opts = { from: req.query.from || null, to: req.query.to || null };
+
+  const customerRows = engine.partyOutstanding(store, 'CUSTOMER', opts).map((row) => {
+    const customer = (store.customers || []).find((c) => c.id === row.partyId) || {};
+    return {
+      id: row.partyId,
+      partyType: 'CUSTOMER',
+      name: row.name || customer.name,
+      phone: customer.phone || '',
+      due: r2(Math.max(0, row.balance)),
+      advance: r2(Math.max(0, -row.balance)),
+      netBalance: r2(row.balance)
+    };
+  });
+
+  const vendorRows = engine.partyOutstanding(store, 'VENDOR', opts).map((row) => {
+    const vendor = (store.vendors || []).find((v) => v.id === row.partyId) || {};
+    return {
+      id: row.partyId,
+      partyType: 'VENDOR',
+      name: row.name || vendor.name,
+      phone: vendor.phone || '',
+      due: r2(Math.max(0, row.balance)),
+      advance: r2(Math.max(0, -row.balance)),
+      netBalance: r2(row.balance)
+    };
+  });
+
+  const rows = [...customerRows, ...vendorRows]
+    .filter((r) => r.due > 0 || r.advance > 0)
+    .sort((a, b) => b.due - a.due);
+
+  res.json({
+    success: true,
+    data: {
+      rows,
+      totalReceivable: r2(customerRows.reduce((s, r) => s + r.due, 0)),
+      totalPayable: r2(vendorRows.reduce((s, r) => s + r.due, 0)),
+      totalCustomerAdvance: r2(customerRows.reduce((s, r) => s + r.advance, 0)),
+      totalVendorAdvance: r2(vendorRows.reduce((s, r) => s + r.advance, 0)),
+      partyCount: rows.length
+    }
+  });
+});
+
 /* ------------------------------ expense report ------------------------------ */
 
 /**

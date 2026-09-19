@@ -37,11 +37,13 @@ function isSerialNoTaken(product, serialNo, ignoreId) {
 
 /**
  * Recomputes `product.stock` as the count of serials still in stock. Sold
- * serials stay in the array (that's the whole point — traceability doesn't
- * end at the sale) but stop counting toward on-hand quantity.
+ * and returned-to-vendor serials stay in the array (that's the whole point —
+ * traceability doesn't end there) but stop counting toward on-hand quantity —
+ * counted explicitly by status rather than "not SOLD" so a third status
+ * (RETURNED) can't silently keep counting as on-hand.
  */
 function recomputeSerialStock(product) {
-  product.stock = (product.serials || []).filter((s) => s.status !== 'SOLD').length;
+  product.stock = (product.serials || []).filter((s) => s.status === 'IN_STOCK').length;
 }
 
 /**
@@ -117,7 +119,7 @@ function computeWarrantyEnd(startDate, durationValue, durationUnit) {
  * only ordering that makes sense without a cashier's preference).
  */
 function pickSerialForSale(product, preferredSerialId) {
-  const pool = (product.serials || []).filter((s) => s.status !== 'SOLD');
+  const pool = (product.serials || []).filter((s) => s.status === 'IN_STOCK');
   if (preferredSerialId) {
     const found = pool.find((s) => s.id === preferredSerialId);
     if (found) return found;
@@ -132,7 +134,7 @@ function pickSerialForSale(product, preferredSerialId) {
  * actually billed to a customer.
  */
 function markSerialSold(product, serialId, orderId, saleDate) {
-  const serial = (product.serials || []).find((s) => s.id === serialId && s.status !== 'SOLD');
+  const serial = (product.serials || []).find((s) => s.id === serialId && s.status === 'IN_STOCK');
   if (!serial) return null;
   serial.status = 'SOLD';
   serial.soldOrderId = orderId || null;
@@ -157,6 +159,60 @@ function restoreSerial(product, serialId) {
   return serial;
 }
 
+/**
+ * Creates one serial record for a unit received on a purchase — the serial
+ * counterpart of `addBatchSafely`. Called once per unit (a purchase line for
+ * a serial-tracked product carries one entry per unit, never a bulk qty),
+ * so there's no batch-style "split a quantity across rows" to reconcile.
+ */
+function addSerialFromPurchase(product, { serialNo, imei, refPurchaseId, warehouseId } = {}) {
+  if (!Array.isArray(product.serials)) product.serials = [];
+
+  const manual = serialNo ? String(serialNo).trim().replace(/\s+/g, '').slice(0, 10) : '';
+  let finalSerialNo = manual && !isSerialNoTaken(product, manual) ? manual : '';
+  if (!finalSerialNo) {
+    let n = product.serials.length;
+    do {
+      n += 1;
+      finalSerialNo = String(n);
+    } while (isSerialNoTaken(product, finalSerialNo));
+  }
+
+  const serial = {
+    id: randomId('serial'),
+    serialNo: finalSerialNo,
+    imei: imei ? String(imei).trim().slice(0, 20) : '',
+    customFields: ['', '', '', ''],
+    status: 'IN_STOCK',
+    warehouseId: warehouseId || 'wh_main',
+    refPurchaseId: refPurchaseId || null,
+    soldOrderId: null,
+    createdAt: new Date().toISOString()
+  };
+  product.serials.push(serial);
+  recomputeSerialStock(product);
+  return serial;
+}
+
+/**
+ * Returns one serial to the vendor (purchase return) — the serial
+ * counterpart of `writeOffBatch`. A serial is a single indivisible unit, so
+ * unlike a batch write-off there's no partial quantity: the unit is either
+ * still IN_STOCK and returnable, or it isn't. The record is kept (status
+ * flips to RETURNED rather than being deleted) so it stays traceable in
+ * Serial Tracking history exactly like a sold serial does.
+ */
+function returnSerialToVendor(product, serialId, reason, user) {
+  const serial = (product.serials || []).find((s) => s.id === serialId && s.status === 'IN_STOCK');
+  if (!serial) return null;
+  serial.status = 'RETURNED';
+  serial.returnReason = reason || 'Returned to supplier';
+  serial.returnedBy = user || 'Owner';
+  serial.returnedAt = new Date().toISOString();
+  recomputeSerialStock(product);
+  return serial;
+}
+
 module.exports = {
   DEFAULT_CUSTOM_LABELS,
   shapeSerialCustomLabels,
@@ -166,5 +222,7 @@ module.exports = {
   computeWarrantyEnd,
   pickSerialForSale,
   markSerialSold,
+  addSerialFromPurchase,
+  returnSerialToVendor,
   restoreSerial
 };

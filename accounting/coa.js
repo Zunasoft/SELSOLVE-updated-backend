@@ -1,16 +1,4 @@
-/**
- * Chart of Accounts — the foundation of the Selsolve accounting system.
- *
- * Every account carries:
- *   code       stable numeric code used for ordering and manual lookup
- *   type       ASSET | LIABILITY | EQUITY | INCOME | EXPENSE
- *   isGroup    group headers hold no postings, only children
- *   systemKey  stable handle the auto-posting engine uses to find an account
- *              without depending on user-editable names
- *
- * Sign convention: every posting is stored as a raw debit/credit pair in the
- * journal. Presentation flips the sign for CR-normal accounts (see engine.js).
- */
+// systemKey is a stable lookup handle the posting engine uses instead of user-editable names; journal entries are raw DR/CR pairs, and presentation flips sign for CR-normal accounts (see engine.js).
 
 const TYPES = ['ASSET', 'LIABILITY', 'EQUITY', 'INCOME', 'EXPENSE'];
 
@@ -31,11 +19,7 @@ const DEFAULT_COA = [
   ['1110', 'Cash in Hand', 'ASSET', true, '1100', 'CASH_GROUP'],
   ['1111', 'Main Cash Counter', 'ASSET', false, '1110', 'CASH'],
   ['1120', 'Bank Accounts', 'ASSET', true, '1100', 'BANK_GROUP'],
-  // Without a leaf account here, `settlementAccount()` in posting.js falls
-  // back to Cash for every non-cash payment (UPI, card, bank transfer) until
-  // a shop manually adds a bank account via Banks -> Add Bank Account —
-  // silently overstating cash-in-hand and understating bank balance for any
-  // sale/purchase/expense recorded before that first manual setup step.
+  // Seeded so settlementAccount() in posting.js has a BANK leaf immediately; otherwise non-cash payments post to Cash until a shop manually adds a bank account.
   ['1121', 'Primary Bank Account', 'ASSET', false, '1120', 'BANK'],
   ['1130', 'Accounts Receivable', 'ASSET', true, '1100', 'AR'],
   ['1140', 'Stock in Hand (Inventory)', 'ASSET', false, '1100', 'INVENTORY'],
@@ -104,10 +88,7 @@ const DEFAULT_COA = [
 
 const accountId = (code) => `acc_${code}`;
 
-/**
- * Materialise a fresh Chart of Accounts for a newly provisioned tenant.
- * Group accounts are marked isGroup so the posting engine rejects direct hits.
- */
+// Group accounts are marked isGroup so the posting engine rejects direct postings to them.
 function buildChartOfAccounts() {
   return DEFAULT_COA.map(([code, name, type, isGroup, parentCode, systemKey]) => ({
     id: accountId(code),

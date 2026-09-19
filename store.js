@@ -1,14 +1,7 @@
 const engine = require('./accounting/engine');
 const posting = require('./accounting/posting');
 
-/* ------------------------------------------------------------------ *
- * Roles & permissions — Module 11 of the SOW.
- *
- * A role is two things: which modules the user may open, and what they may do
- * once inside. `modules` drives navigation and the module-access gate;
- * the `can*` flags are the finer-grained action toggles. An individual user may
- * override any of it via `user.permissions`, which is merged over the role.
- * ------------------------------------------------------------------ */
+// Roles & permissions (Module 11): `modules` gates navigation, the `can*` flags gate actions; a user's own `permissions` merge over the role.
 
 /** Every screen a shop user can be granted, in navigation order. */
 const MODULE_KEYS = [
@@ -121,10 +114,7 @@ ROLE_PERMISSIONS.MANAGER = { ...ROLE_PERMISSIONS.ADMIN, label: 'Secondary Admin 
 /** The roles the console offers when creating a user — MANAGER stays readable but hidden. */
 const ASSIGNABLE_ROLES = ['OWNER', 'ADMIN', 'CASHIER'];
 
-/**
- * A user's effective permissions: the role defaults with the user's own
- * overrides merged on top, module map included.
- */
+// Role defaults with the user's own overrides merged on top, module map included.
 function effectivePermissions(user) {
   const base = ROLE_PERMISSIONS[user?.role] || ROLE_PERMISSIONS.CASHIER;
   const overrides = user?.permissions || {};
@@ -313,14 +303,7 @@ function defaultPriceSheets() {
   ];
 }
 
-/**
- * The canonical shape of a tenant's working set.
- *
- * Every collection the POS writes to must be initialised here — a missing key
- * means the first `store.<key>.unshift(...)` throws, and it also means the
- * value never reaches the tenant's database, since `tenantDb` persists exactly
- * the keys listed in its collection map.
- */
+// Every collection the POS writes to must be initialised here — a missing key breaks the first unshift() and also means tenantDb never persists it.
 function emptyStore(overrides = {}) {
   const store = {
     // catalogue
@@ -358,6 +341,13 @@ function emptyStore(overrides = {}) {
       openingCash: 0,
       currentCash: 0,
       cashEntries: []
+    },
+
+    // Company's own cash reserve/safe: the counter's opening float draws from it and closing remainders go back, tracked at note/coin level like a session's denominations.
+    companyLocker: {
+      balance: 0,
+      denominations: { '2000': 0, '500': 0, '200': 0, '100': 0, '50': 0, '20': 0, '10': 0, coins: 0 },
+      history: []
     },
 
     // accounting — `journal` is the key the engine actually uses
@@ -446,6 +436,26 @@ function logStockMovement(store, { product, type, qtyChange, reason, refId, user
   };
   store.stockMovements.unshift(movement);
   if (store.stockMovements.length > 2000) store.stockMovements.pop();
+
+  // Fired here (not per call site) so every stock-decreasing path is covered by one hook, and only the moment stock crosses the reorder level, not every later sale that keeps it below.
+  if (qtyChange < 0 && Number(product.minStock) > 0) {
+    const stockBefore = product.stock - qtyChange;
+    const justCrossed = stockBefore > product.minStock && product.stock <= product.minStock;
+    const notifyEmail = store.settings?.pos?.lowStockNotifyEnabled && store.settings?.pos?.lowStockNotifyEmail;
+    if (justCrossed && notifyEmail) {
+      try {
+        const { sendLowStockEmail } = require('./mailer');
+        sendLowStockEmail({
+          to: store.settings.pos.lowStockNotifyEmail,
+          storeName: store.settings?.company?.name,
+          product
+        }).catch(() => {});
+      } catch (err) {
+        // Mailer module missing/broken never blocks the stock movement itself.
+      }
+    }
+  }
+
   return movement;
 }
 
@@ -460,36 +470,18 @@ function genericStore() {
   return store;
 }
 
-/**
- * A blank working set for one request.
- *
- * Deliberately NOT cached per tenant. `tenantDb.hydrateTenantStore` fills it
- * from the tenant's own MongoDB database at the start of every request and
- * `tenantDb.persistTenantStore` writes the changes back before the response —
- * so MongoDB, not this object, is the state of the shop. Keeping one object per
- * tenant in process memory would let a read be answered from whatever the last
- * request on this instance happened to leave behind, which is exactly the
- * behaviour that made results differ between instances.
- */
+// Deliberately not cached per tenant — MongoDB, not this object, is the state of the shop; caching one per tenant in process memory made results differ between instances.
 function newTenantStore() {
   return genericStore();
 }
 
-/**
- * Retained for callers outside a request (scripts, migrations) that ask for a
- * store by database name. It is a fresh object every time, so it must be
- * hydrated before use.
- */
+// For callers outside a request (scripts, migrations) — a fresh object every time, so it must be hydrated before use.
 function getTenantStore(dbName) {
   if (!dbName) throw new Error('getTenantStore requires a tenant database name.');
   return newTenantStore();
 }
 
-/**
- * Calculates effective available stock for standard, composite, and combo products.
- * Composite and combo items calculate their producible/buyable quantity from raw materials.
- * Low stock alerts trigger only when available stock (or producible count) is <= minStock.
- */
+// Composite/combo products derive their producible/buyable quantity from raw-material stock instead of their own (notional) stock figure.
 function calculateProductStock(product, allProducts = [], recipes = []) {
   if (!product || product.productType === 'service') {
     return { stock: Infinity, isService: true, isLow: false, isOut: false, effectiveStock: 0 };

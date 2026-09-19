@@ -1,35 +1,11 @@
-/**
- * Batch/Lot tracking — opt-in per product via `product.trackBatches`.
- *
- * A batch is a slice of stock received together (one purchase line): its own
- * quantity, cost, and optional manufacture/expiry dates. `product.stock`
- * stays the single number the rest of the app already reads everywhere
- * (warehouses, recipes, price sheets, reports) — for a batch-tracked product
- * it is simply kept in sync as the sum of `product.batches[].qty` any time a
- * batch changes, so nothing outside this module needs to know batches exist.
- *
- * Consumption is FEFO (first-expiring-first-out): batches with an expiry
- * date are sold soonest-expiry-first; batches with no expiry date are sold
- * oldest-received-first, after every dated batch. A sale that needs more
- * than one batch has left automatically spills into the next one.
- */
+// Batch/lot tracking (opt-in via product.trackBatches): product.stock stays in sync as sum(batches[].qty) so the rest of the app never needs to know batches exist; consumption is FEFO (dated batches soonest-expiry-first, then undated oldest-received-first), auto-spilling into the next batch as needed.
 
-// A timestamp + small random suffix alone can collide when several batches
-// are minted in the same millisecond (e.g. splitting multiple batches across
-// one warehouse transfer) — a collision would make every `.find(b => b.id
-// === x)` lookup below silently target the wrong batch. The counter makes
-// that impossible within this process regardless of how tight the loop is.
+// A timestamp + random suffix alone can collide when several batches mint in the same millisecond, silently misdirecting `.find(b => b.id === x)`; the counter rules that out.
 let _batchIdCounter = 0;
 const randomId = (prefix) => `${prefix}_${Date.now()}_${(_batchIdCounter++).toString(36)}_${Math.floor(Math.random() * 1e6)}`;
 const r4 = (n) => Math.round((Number(n) || 0) * 10000) / 10000;
 
-/**
- * `product.warehouses{}` is what the rest of the app (WarehousesTab, price
- * sheets, low-stock-by-warehouse filters) already reads — for a batch-tracked
- * product it's kept as a mirror of `sum(batches.qty)` per `batch.warehouseId`,
- * recomputed alongside `product.stock` any time a batch changes, so none of
- * that code needs to know batches exist underneath it.
- */
+// product.warehouses{} is kept as a mirror of sum(batches.qty) per warehouseId, recomputed alongside product.stock, so existing warehouse-reading code never needs to know batches exist underneath it.
 function recomputeBatchStock(product) {
   product.stock = r4((product.batches || []).reduce((sum, b) => sum + (Number(b.qty) || 0), 0));
 
@@ -61,14 +37,7 @@ function isBatchNoTaken(product, batchNo, ignoreBatchId) {
   );
 }
 
-/**
- * Next auto-generated batch number for a product — a counter that only ever
- * moves forward. A void or a write-off can remove/zero a batch record, but it
- * must never free up that batch's *number* for reuse on an unrelated lot, or
- * two physically different receipts end up sharing one traceable number. The
- * counter itself lives on the product (so it survives across purchases) and
- * is seeded once from the highest numeric batch number already on file.
- */
+// A counter that only ever moves forward — a void/write-off must never free up a batch number for reuse, or two different receipts could end up sharing one traceable number.
 function nextAutoBatchNo(product) {
   if (!Number.isFinite(product.batchSeq)) {
     let maxNum = 0;
@@ -84,24 +53,14 @@ function nextAutoBatchNo(product) {
   return String(product.batchSeq);
 }
 
-/**
- * Adds a new batch to a product from a purchase (or an opening-stock
- * migration). Always recomputes `product.stock` from the batch list.
- *
- * A manually-entered batch number that's already on file for this product is
- * rejected rather than silently duplicated — "Batch 12" received twice under
- * two unrelated batch records would make FEFO consumption, reports and the
- * purchase history that cites "Batch 12" all ambiguous about which lot they
- * mean. Re-receiving genuinely the same lot belongs in the existing batch
- * (add stock to it directly), not a second record with a repeated number.
- */
-function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, refPurchaseId, source, warehouseId }) {
+// A manually-entered batch number already on file is rejected, not silently duplicated — a repeated number would make FEFO consumption, reports and purchase history ambiguous about which lot they mean.
+function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, refPurchaseId, source, warehouseId, allowDuplicate }) {
   if (!Array.isArray(product.batches)) product.batches = [];
 
   let finalBatchNo = '';
   if (batchNo && String(batchNo).trim()) {
     finalBatchNo = String(batchNo).trim();
-    if (isBatchNoTaken(product, finalBatchNo)) {
+    if (!allowDuplicate && isBatchNoTaken(product, finalBatchNo)) {
       throw new Error(
         `Batch "${finalBatchNo}" has already been allocated for ${product.name || 'this product'}. Use a different batch number, or add stock to the existing batch instead.`
       );
@@ -137,13 +96,7 @@ function getBatchWarehouseQty(product, warehouseId) {
   );
 }
 
-/**
- * Moves `qtyNeeded` of a batch-tracked product from one warehouse to
- * another, FEFO order. A batch that moves entirely just gets relabeled to
- * the target warehouse; a batch only partially needed is split into two
- * records (remainder stays at source, a new record lands at the target) so
- * each keeps its own traceable identity.
- */
+// FEFO order; a batch that moves entirely is just relabeled to the target warehouse, a partially-needed batch is split in two so each half keeps its own traceable identity.
 function transferBatchesFEFO(product, sourceWarehouseId, targetWarehouseId, qtyNeeded) {
   let remaining = r4(qtyNeeded);
   const transferred = [];
@@ -177,19 +130,7 @@ function transferBatchesFEFO(product, sourceWarehouseId, targetWarehouseId, qtyN
   return { transferred, shortage: remaining > 0 ? remaining : 0 };
 }
 
-/**
- * Consumes `qtyNeeded` across a product's batches, splitting across as many
- * as necessary. Mutates batch quantities and `product.stock` in place.
- * Returns which batches were drawn from (for sale-line traceability) and any
- * shortage that couldn't be covered (sale still proceeds — same convention
- * `deductStock()` already uses for non-batch shortages).
- *
- * `preferredBatchId` is the batch the cashier picked at billing (the POS
- * suggests the soonest-expiring one, but lets them choose another). It's
- * drawn from first; if it doesn't have enough on its own, the sale
- * auto-spills into the next batch(es) in FEFO order. With no preference,
- * this is plain FEFO from the start.
- */
+// `preferredBatchId` (the cashier's pick, defaulting to soonest-expiring) is drawn from first and auto-spills into the next FEFO batch(es) if it runs short; any uncovered shortage is returned but the sale still proceeds, same as deductStock()'s non-batch convention.
 function consumeBatchesFEFO(product, qtyNeeded, preferredBatchId) {
   let remaining = r4(qtyNeeded);
   const consumed = [];
@@ -228,8 +169,7 @@ function restoreBatches(product, batchesSold) {
     if (batch) {
       batch.qty = r4(Number(batch.qty) + Number(qty));
     } else {
-      // Batch itself was deleted/written off since the sale — restore into a
-      // clearly-labeled placeholder rather than silently dropping the stock.
+      // Batch was deleted/written off since the sale — restore into a clearly-labeled placeholder rather than silently dropping the stock.
       product.batches.push({
         id: randomId('batch'),
         batchNo: batchNo || 'RESTORED',
@@ -281,21 +221,7 @@ function writeOffBatch(product, batchId, qty, reason, user) {
   };
 }
 
-/**
- * Normalizes the `batches` array on an incoming product payload (used by
- * `shapeProduct` for direct edits/opening-stock entry, as opposed to
- * `addBatch`, which purchases call one line at a time).
- *
- * Batch-master edits (fixing a number, an expiry date, a cost) never touch
- * `qty` here — this only ever re-maps the same rows' own quantities, so the
- * product's derived stock (`sum(batches.qty)`, computed by the caller) can't
- * drift from a pure metadata edit. The one thing that *would* silently
- * corrupt traceability is a batch-number collision: clearing one row's
- * number for auto-reassignment used to just take `array position + 1`,
- * which could land on a number another row in the same list already uses
- * manually. Numbers are resolved in one left-to-right pass instead, tracking
- * what's already been claimed, so two rows can never end up sharing one.
- */
+// Used by shapeProduct for direct edits/opening-stock entry (vs addBatch, called per purchase line). Batch numbers are resolved in one left-to-right pass tracking what's claimed, since auto-reassignment by array position could collide with another row's manually-set number.
 function shapeBatches(payload, existing) {
   const source = Array.isArray(payload.batches) ? payload.batches : existing?.batches;
   if (!Array.isArray(source)) return existing?.batches || [];
@@ -317,9 +243,7 @@ function shapeBatches(payload, existing) {
       const manual = b.batchNo && String(b.batchNo).trim();
       let batchNo;
       if (manual && !used.has(manual)) {
-        // First claim of this number wins; a later row asking for the same
-        // number (a typo/copy-paste duplicate) falls through to auto-assign
-        // rather than leaving two batches ambiguously sharing one label.
+        // First claim wins; a later duplicate request falls through to auto-assign rather than two batches sharing one label.
         batchNo = manual;
       } else {
         batchNo = nextAuto();

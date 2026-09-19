@@ -22,12 +22,7 @@ const ARRAY_COLLECTIONS = [
   { key: 'sessions', collection: 'sessions', idField: 'id' },
   { key: 'quotations', collection: 'quotations', idField: 'id' },
 
-  // Append-only ledgers: nothing in the app ever removes a row from these arrays
-  // (grepped — every write site is push/unshift, never filter/splice), so a
-  // missing row here means "never synced" or "future bug that dropped it in
-  // memory," not "the user deleted it." Without `appendOnly`, the generic diff
-  // in doPersist would read that as a real deletion and `deleteMany` genuine
-  // financial history out of MongoDB.
+  // Append-only ledgers: nothing in the app ever removes a row from these arrays, so a missing row means "never synced," not "deleted" — without appendOnly, doPersist's diff would deleteMany real financial history out of MongoDB.
   { key: 'orders', collection: 'sales', idField: 'orderId', appendOnly: true, sort: { date: -1 } },
   { key: 'journal', collection: 'journal', idField: 'id', appendOnly: true, sort: { date: -1 } },
   { key: 'stockMovements', collection: 'stockmovements', idField: 'id', appendOnly: true, sort: { timestamp: -1 }, limit: 2000 },
@@ -41,14 +36,12 @@ const ARRAY_COLLECTIONS = [
 ];
 
 /** Singleton values, all kept as one document each in the `meta` collection. */
-const META_KEYS = ['settings', 'session', 'voucherCounters', 'units', 'customerGroups'];
+const META_KEYS = ['settings', 'session', 'voucherCounters', 'units', 'customerGroups', 'companyLocker'];
 
 const META_COLLECTION = 'meta';
 const PROVISION_KEY = '__provisioned';
 
-/* ------------------------------------------------------------------ *
- * Connection helpers
- * ------------------------------------------------------------------ */
+// Connection helpers
 
 const isConnected = () => mongoose.connection.readyState === 1;
 
@@ -94,12 +87,7 @@ function snapshot(store) {
   return map;
 }
 
-/* ------------------------------------------------------------------ *
- * Per-tenant serialization
- *
- * Hydrates and flushes for the same tenant run one after another, so a read
- * can never overtake a write that is still in flight.
- * ------------------------------------------------------------------ */
+// Per-tenant serialization: hydrates and flushes for the same tenant run one after another, so a read can never overtake a write still in flight.
 
 const queues = new Map();
 
@@ -116,9 +104,7 @@ function enqueue(dbName, task) {
   return next;
 }
 
-/* ------------------------------------------------------------------ *
- * Hydrate
- * ------------------------------------------------------------------ */
+// Hydrate
 
 const isPlainObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
 
@@ -150,8 +136,7 @@ async function doHydrate(dbName, store, tenant, trackBaseline = true) {
 
   let meta = await readMeta(db);
 
-  // A database that has never been provisioned is built now, on first use, so
-  // every later read has real rows to return.
+  // Never provisioned? Build it now, on first use, so every later read has real rows to return.
   if (!meta[PROVISION_KEY]) {
     await doProvision(dbName, tenant);
     meta = await readMeta(db);
@@ -185,26 +170,19 @@ async function doHydrate(dbName, store, tenant, trackBaseline = true) {
 
   if (meta.settings !== undefined) store.settings = mergeSettings(defaultSettings(), meta.settings);
   if (meta.session !== undefined) store.session = meta.session;
+  if (meta.companyLocker !== undefined) store.companyLocker = meta.companyLocker;
   if (meta.voucherCounters !== undefined) store.voucherCounters = meta.voucherCounters || {};
   if (Array.isArray(meta.units)) store.units = meta.units;
   if (Array.isArray(meta.customerGroups)) store.customerGroups = meta.customerGroups;
 
   await adoptLegacyData(db, store, meta);
 
-  // The baseline is only ever read by `doPersist`'s diff against a later
-  // write on this same store — a GET request never calls persist, so
-  // fingerprinting every row here (MD5 of JSON.stringify, across every
-  // collection) would be pure overhead on the read path, and reads are most
-  // of this app's traffic. Skipping it is why `trackBaseline` exists.
+  // `trackBaseline` skips fingerprinting on a GET (which never persists), avoiding pure overhead on the read path that dominates this app's traffic.
   if (trackBaseline) baselines.set(store, snapshot(store));
   return store;
 }
 
-/**
- * Pick up data written by the earlier persistence code so tenants provisioned
- * before this layer existed keep their settings and parties. Nothing is
- * deleted; the next flush simply rewrites it in the current layout.
- */
+// Picks up data written by the earlier persistence code so pre-existing tenants keep their settings/parties; nothing is deleted, the next flush rewrites it in the current layout.
 async function adoptLegacyData(db, store, meta) {
   try {
     if (meta.settings === undefined) {
@@ -227,31 +205,12 @@ async function adoptLegacyData(db, store, meta) {
   }
 }
 
-/**
- * Load a tenant's store from its own database.
- * Queued behind any flush already running for the same tenant.
- *
- * `tenant` is the master-database record, used only if the shop's database has
- * to be provisioned on the spot.
- */
+// Load a tenant's store from its own database, queued behind any flush already running for it; `tenant` is only used if the database needs provisioning on the spot.
 const hydrateTenantStore = (dbName, store, tenant, trackBaseline = true) =>
   enqueue(dbName, () => doHydrate(dbName, store, tenant, trackBaseline));
 
-/* ------------------------------------------------------------------ *
- * Persistence
- * ------------------------------------------------------------------ */
-
-/**
- * One request can touch a dozen collections at once — a sale alone writes an
- * order, a journal voucher, stock movements and the session's cash log in the
- * same flush. Writing those independently (as this used to) meant a failure on
- * just one of them (say, the `sales` write hitting a duplicate-key error) could
- * still leave the others committed: a cash-in entry and an incremented invoice
- * counter for a sale that was never actually saved. That exact scenario is what
- * corrupted this tenant's live session ledger before the `sales` index bug was
- * found. A single Mongo transaction makes the whole flush all-or-nothing: every
- * collection in this request commits together, or none of them do.
- */
+// Persistence
+// A single Mongo transaction makes one request's multi-collection flush all-or-nothing — writing collections independently once let a duplicate-key error on one leave the others (e.g. a cash-in entry) committed for a sale that was never actually saved.
 async function doPersist(dbName, store) {
   const db = getTenantDb(dbName);
   if (!db) return { persisted: false, reason: 'offline' };
@@ -323,19 +282,14 @@ async function doPersist(dbName, store) {
   }
 }
 
-/**
- * Write every change made to the store during this request back to the
- * tenant's own database. Queued per tenant.
- */
+// Writes every change made to the store during this request back to the tenant's own database; queued per tenant.
 const persistTenantStore = (dbName, store) =>
   enqueue(dbName, () => doPersist(dbName, store)).catch((err) => {
     console.error(`[Tenant DB ${dbName}] persist failed:`, err.message);
     return { persisted: false, reason: err.message };
   });
 
-/* ------------------------------------------------------------------ *
- * Provisioning
- * ------------------------------------------------------------------ */
+// Provisioning
 
 /** Build the starting state for a brand-new shop: chart of accounts, counters, owner login. */
 function seedStoreForTenant(tenant = {}) {
@@ -355,13 +309,7 @@ function seedStoreForTenant(tenant = {}) {
   return store;
 }
 
-/**
- * The provisioning work itself, WITHOUT the per-tenant queue.
- *
- * Kept separate because `doHydrate` provisions on first use from inside that
- * queue — going through `provisionTenantDB` there would make the queue wait on
- * a task it is already running.
- */
+// Kept separate (without the per-tenant queue) because doHydrate provisions on first use from inside that queue — going through provisionTenantDB there would deadlock it waiting on itself.
 async function doProvision(dbName, tenant = {}) {
   const db = getTenantDb(dbName);
   if (!db) throw new Error(`Cannot provision "${dbName}" — no MongoDB connection.`);
@@ -399,10 +347,7 @@ async function doProvision(dbName, tenant = {}) {
   return { dbName, created: true };
 }
 
-/**
- * Create and seed a tenant's isolated database.
- * Safe to call repeatedly — an already-provisioned database is left untouched.
- */
+// Safe to call repeatedly — an already-provisioned database is left untouched.
 function provisionTenantDB(dbName, tenant = {}) {
   if (!dbName) return Promise.resolve(null);
   return enqueue(dbName, () => doProvision(dbName, tenant));

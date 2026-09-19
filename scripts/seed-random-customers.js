@@ -174,7 +174,7 @@ const CUSTOMERS_LIST = [
   for (const dbName of tenantDbNames) {
     console.log(`\nSeeding customers into ${dbName}...`);
     const db = mongoose.connection.useDb(dbName, { useCache: true }).db;
-    
+
     for (const cust of CUSTOMERS_LIST) {
       await db.collection('customers').updateOne(
         { id: cust.id },

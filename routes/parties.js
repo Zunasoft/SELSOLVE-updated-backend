@@ -1,16 +1,12 @@
-/**
- * Customers, vendors and purchase management — Modules 6, 7 and 8 of the SOW.
- * Outstanding balances shown here are read straight from the party sub-ledgers
- * so they can never disagree with the Accounts module.
- */
 
 const express = require('express');
 const { logStockMovement, DEFAULT_CUSTOMER_GROUPS } = require('../store');
 const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
-const { savePartyToDb, deletePartyFromDb } = require('../tenantProvisioner');
+const { savePartyToDb } = require('../tenantProvisioner');
 const { shapeProduct } = require('../controllers/catalog.controller');
 const { addBatch, voidPurchaseBatches, writeOffBatch } = require('../controllers/batches');
+const { addSerialFromPurchase, returnSerialToVendor } = require('../controllers/serials');
 const { baseQty, isWholeNumberUnit } = require('../controllers/unitConversion');
 
 const router = express.Router();
@@ -63,6 +59,7 @@ router.post('/customers', async (req, res) => {
       group,
       creditLimit,
       openingBalance,
+      openingBalanceDate,
       openingAdvance,
       advanceBalance,
       loyaltyPoints,
@@ -101,6 +98,7 @@ router.post('/customers', async (req, res) => {
         accountId: account.id,
         amount: openingBalance,
         side: 'DR',
+        date: openingBalanceDate || undefined,
         createdBy: actor(req)
       });
       customer.outstanding = Number(openingBalance);
@@ -111,6 +109,7 @@ router.post('/customers', async (req, res) => {
         accountId: account.id,
         amount: advAmount,
         side: 'CR',
+        date: openingBalanceDate || undefined,
         createdBy: actor(req)
       });
       customer.advance = advAmount;
@@ -164,13 +163,7 @@ router.put('/customers/:id', async (req, res) => {
     const account = engine.ensurePartyAccount(store, customer, 'CUSTOMER');
     if (account) account.name = customer.name;
 
-    // Receivable and advance are opposite sides of the one sub-ledger balance
-    // (owed BY the customer vs. owed TO them), so both fields target the same
-    // account and are combined into one net figure rather than posted separately
-    // — posting them independently against a stale "current side only" reading
-    // used to land on the wrong balance whenever the customer already carried
-    // some amount on the other side (e.g. setting advance while a receivable
-    // was outstanding silently left a leftover receivable behind).
+    // Receivable and advance are opposite sides of the one sub-ledger balance, so both are combined into one net figure and posted together — posting them independently against a stale "current side only" reading used to leave a leftover balance on the other side.
     const targetAdvance = advanceBalance !== undefined ? advanceBalance : openingAdvance;
     const hasReceivableInput = outstandingReceivable !== undefined && outstandingReceivable !== null && outstandingReceivable !== '';
     const hasAdvanceInput = targetAdvance !== undefined && targetAdvance !== null && targetAdvance !== '';
@@ -184,11 +177,12 @@ router.put('/customers/:id', async (req, res) => {
       const diff = targetBalance - currentLedgerBal;
 
       if (Math.abs(diff) > 0.001) {
-        posting.postOpeningBalance(store, {
+        posting.postBalanceAdjustment(store, {
           accountId: account.id,
           amount: Math.abs(diff),
           side: diff > 0 ? 'DR' : 'CR',
-          createdBy: actor(req)
+          createdBy: actor(req),
+          narration: `Balance corrected via customer edit — ${customer.name}`
         });
         customer.outstanding = Math.max(0, targetBalance);
         customer.advance = Math.max(0, -targetBalance);
@@ -237,10 +231,7 @@ router.delete('/customers/:id', (req, res) => {
   res.json({ success: true, message: `${customer.name} removed.` });
 });
 
-/**
- * Loyalty balance and what it is worth at the counter — Module 3.
- * The redeem value is a shop setting, so the POS never has to guess the rate.
- */
+// Loyalty balance and what it is worth at the counter (Module 3) — redeem value is a shop setting so the POS never guesses the rate.
 router.get('/customers/:id/loyalty', (req, res) => {
   const store = req.tenantStore;
   const customer = (store.customers || []).find((c) => c.id === req.params.id);
@@ -301,8 +292,6 @@ router.post('/customers/:id/send-whatsapp', (req, res) => {
     }
   });
 });
-
-
 
 function getGroups(store) {
   if (!Array.isArray(store.customerGroups) || store.customerGroups.length === 0) {
@@ -421,8 +410,22 @@ router.get('/vendors', (req, res) => {
   const rows = (store.vendors || []).map((v) => {
     const balance = ledgerBalance(store, v.id, 'VENDOR');
     const vendorPurchases = (store.purchases || []).filter((p) => p.vendorId === v.id && p.status !== 'VOID');
+    let opBal = v.openingBalance;
+    if (opBal === undefined) {
+      const account = (store.accounts || []).find((a) => a.partyId === v.id && a.partyType === 'VENDOR');
+      if (account) {
+        const opJournal = (store.journal || []).find(
+          (j) => j.type === 'OPENING' && (j.partyId === v.id || (j.lines || []).some((l) => l.accountId === account.id))
+        );
+        if (opJournal) {
+          const line = (opJournal.lines || []).find((l) => l.accountId === account.id);
+          opBal = line ? (line.credit || line.debit || 0) : 0;
+        }
+      }
+    }
     return {
       ...v,
+      openingBalance: Number(opBal) || 0,
       outstandingPayable: Math.max(0, balance),
       advancePaid: Math.max(0, -balance),
       purchaseCount: vendorPurchases.length,
@@ -435,8 +438,37 @@ router.get('/vendors', (req, res) => {
 router.post('/vendors', async (req, res) => {
   try {
     const store = req.tenantStore;
-    const { name, phone, email, gstin, pan, address, outstandingPayable } = req.body;
+    const { name, phone, email, gstin, pan, address, outstandingPayable, openingBalance, openingBalanceDate } = req.body;
     if (!name) return res.status(400).json({ success: false, message: 'Vendor name is required.' });
+
+    // A duplicate needs matching name plus agreement on every other field BOTH records actually have a value for — sharing just one field (e.g. phone) isn't enough to call it the same supplier.
+    const trimmedName = String(name).trim().toLowerCase();
+    const cleanPhone = phone ? String(phone).trim() : '';
+    const cleanGstin = gstin ? String(gstin).trim().toUpperCase() : '';
+    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+    const cleanAddress = address ? String(address).trim().toLowerCase() : '';
+
+    const duplicate = store.vendors.find((v) => {
+      if (!v.name || v.name.trim().toLowerCase() !== trimmedName) return false;
+      const vPhone = (v.phone || '').trim();
+      if (cleanPhone && vPhone && vPhone !== cleanPhone) return false;
+      const vGstin = (v.gstin || '').trim().toUpperCase();
+      if (cleanGstin && vGstin && vGstin !== cleanGstin) return false;
+      const vEmail = (v.email || '').trim().toLowerCase();
+      if (cleanEmail && vEmail && vEmail !== cleanEmail) return false;
+      const vAddress = (v.address || '').trim().toLowerCase();
+      if (cleanAddress && vAddress && vAddress !== cleanAddress) return false;
+      return true;
+    });
+
+    if (duplicate) {
+      return res.status(400).json({
+        success: false,
+        message: `A vendor matching these exact details ("${duplicate.name}") already exists. Select it from the list instead of creating a duplicate.`
+      });
+    }
+
+    const initialOpening = Number(openingBalance !== undefined && openingBalance !== '' ? openingBalance : outstandingPayable) || 0;
 
     const vendor = {
       id: `v_${Date.now()}`,
@@ -446,6 +478,7 @@ router.post('/vendors', async (req, res) => {
       gstin: gstin || '',
       pan: pan || '',
       address: address || '',
+      openingBalance: initialOpening,
       outstandingPayable: 0,
       createdAt: new Date().toISOString()
     };
@@ -453,14 +486,15 @@ router.post('/vendors', async (req, res) => {
     await savePartyToDb(req.tenantDbName, { ...vendor, type: 'vendor' });
 
     const account = engine.ensurePartyAccount(store, vendor, 'VENDOR');
-    if (Number(outstandingPayable)) {
+    if (initialOpening) {
       posting.postOpeningBalance(store, {
         accountId: account.id,
-        amount: outstandingPayable,
+        amount: initialOpening,
         side: 'CR',
+        date: openingBalanceDate || undefined,
         createdBy: actor(req)
       });
-      vendor.outstandingPayable = Number(outstandingPayable);
+      vendor.outstandingPayable = initialOpening;
       await savePartyToDb(req.tenantDbName, { ...vendor, type: 'vendor' });
     }
 
@@ -526,12 +560,7 @@ router.put('/vendors/:id', async (req, res) => {
 
   const account = engine.ensurePartyAccount(store, vendor, 'VENDOR');
 
-  // Handle editable Amount Payable adjustment. The target is the account's net
-  // ledger balance, read fresh here rather than off `vendor.outstandingPayable`
-  // — that stored field is clamped to zero (Math.max(0, ...)) everywhere else
-  // it's written, so if the vendor ever carried an advance-paid (negative)
-  // balance, diffing against the clamped field posted the wrong amount and the
-  // vendor never actually landed on the payable figure that was typed in.
+  // Diff against the fresh ledger balance, not vendor.outstandingPayable — that field is clamped to zero everywhere else, so diffing against it while an advance-paid (negative) balance existed posted the wrong amount.
   if (outstandingPayable !== undefined && outstandingPayable !== null && outstandingPayable !== '') {
     const newPayable = Number(outstandingPayable) || 0;
     const currentLedgerBal = ledgerBalance(store, vendor.id, 'VENDOR');
@@ -544,11 +573,12 @@ router.put('/vendors/:id', async (req, res) => {
         new: `₹${newPayable.toLocaleString('en-IN')}`
       });
 
-      posting.postOpeningBalance(store, {
+      posting.postBalanceAdjustment(store, {
         accountId: account.id,
         amount: Math.abs(diff),
         side: diff > 0 ? 'CR' : 'DR',
-        createdBy: actor(req)
+        createdBy: actor(req),
+        narration: `Amount payable corrected via vendor edit — ${vendor.name}`
       });
       vendor.outstandingPayable = newPayable;
     }
@@ -593,9 +623,7 @@ router.delete('/vendors/:id', (req, res) => {
     return res.status(400).json({ success: false, message: 'Vendor has purchase history and cannot be deleted.' });
   }
 
-  // Mirrors the customer guard: a vendor with money still owed to them must not
-  // be removable, or the payable becomes permanently invisible while the ledger
-  // that tracks it silently keeps the real balance forever.
+  // Mirrors the customer guard: a vendor still owed money must not be removable, or the payable becomes permanently invisible while the ledger keeps the real balance.
   const balance = ledgerBalance(store, vendor.id, 'VENDOR');
   if (Math.abs(balance) > 0.009) {
     return res.status(400).json({
@@ -655,10 +683,7 @@ router.get('/purchases', (req, res) => {
   });
 });
 
-/**
- * Purchase invoice. Line items receive stock at the invoiced cost and refresh
- * the product's purchase price, so margins stay accurate as costs move.
- */
+// Line items receive stock at the invoiced cost and refresh the product's purchase price, so margins stay accurate as costs move.
 router.post('/purchases', (req, res) => {
   const store = req.tenantStore;
   const {
@@ -730,6 +755,30 @@ router.post('/purchases', (req, res) => {
     });
   }
 
+  // "Restrict already sold serial numbers in inward transactions" — validated up front so a conflict fails the whole purchase cleanly rather than leaving earlier lines already applied.
+  if (Boolean(store.settings?.pos?.restrictSoldSerialsInward)) {
+    for (const line of lines) {
+      if (!Array.isArray(line.serials) || line.serials.length === 0) continue;
+      const product = store.products.find(
+        (p) => p.id === line.productId || (line.name && p.name && p.name.toLowerCase() === String(line.name).toLowerCase())
+      );
+      if (!product || !product.trackSerials) continue;
+      for (const s of line.serials) {
+        const manual = s.serialNo ? String(s.serialNo).trim().replace(/\s+/g, '').slice(0, 10) : '';
+        if (!manual) continue;
+        const existing = (product.serials || []).find(
+          (ps) => String(ps.serialNo || '').trim().toLowerCase() === manual.toLowerCase()
+        );
+        if (existing && existing.status === 'SOLD') {
+          return res.status(400).json({
+            success: false,
+            message: `${product.name}: serial "${manual}" was already sold previously and can't be re-received while "Restrict already sold serial numbers in inward transactions" is enabled.`
+          });
+        }
+      }
+    }
+  }
+
   const subtotal = lines.length
     ? r2(lines.reduce((s, i) => s + Number(i.qty) * Number(i.rate), 0))
     : r2(totalAmount);
@@ -791,16 +840,12 @@ router.post('/purchases', (req, res) => {
     poNumber: purchaseOrder ? purchaseOrder.poNumber : null
   };
 
-  // Receiving under a batch number this product already has on file would
-  // otherwise make that batch ambiguous — two physically different lots
-  // sharing one traceable number. Rather than failing the whole purchase over
-  // a naming collision (an existing working flow must keep working), fall
-  // back to the next auto-generated number and flag it on the purchase so
-  // it's visible in the purchase record, not silently swapped.
+  // A colliding batch number would make two different lots share one traceable number; rather than failing the whole purchase, fall back to an auto-generated number and flag it on the purchase record.
   const batchNoWarnings = [];
   const addBatchSafely = (product, opts) => {
+    const allowDuplicate = Boolean(store.settings?.pos?.allowDuplicateBatchNumbers);
     try {
-      return addBatch(product, opts);
+      return addBatch(product, { ...opts, allowDuplicate });
     } catch (err) {
       batchNoWarnings.push(
         `${product.name || 'Item'}: requested batch "${opts.batchNo}" was already in use — assigned a new batch number instead.`
@@ -815,9 +860,7 @@ router.post('/purchases', (req, res) => {
       (p) => p.id === line.productId || (line.name && p.name.toLowerCase() === String(line.name).toLowerCase())
     );
 
-    // Receiving stock for something that isn't in the catalogue yet used to just
-    // silently drop the line — no stock, no product, nothing on the invoice or
-    // in billing. Create it instead, so a purchase always lands somewhere.
+    // Receiving stock for something not yet in the catalogue used to silently drop the line — create the product instead, so a purchase always lands somewhere.
     if (!product && line.name) {
       const rate = Number(line.rate) || 0;
       product = shapeProduct(
@@ -840,18 +883,10 @@ router.post('/purchases', (req, res) => {
     }
 
     if (!product) return;
-    // A purchase line entered in a different unit than the product's base
-    // unit (e.g. receiving "2 bags" of a product tracked in kg) needs the
-    // same conversion sales already apply, otherwise stock silently drifts —
-    // "2" would get added instead of "50".
+    // A line in a different unit than the product's base unit (e.g. "2 bags" of a kg-tracked product) needs the same conversion sales apply, or stock silently drifts.
     const qty = baseQty(product, { unit: line.unit, qty: Number(line.qty) });
 
-    // Cost is stored per BASE unit everywhere it's consumed (batch costPrice,
-    // COGS, margin reports all multiply it against a base-unit quantity), so
-    // `line.rate` — quoted per the line's own unit (₹/bag, ₹/box, …) — has to
-    // be converted the same way `qty` just was, not stored as-is. Any landed
-    // cost allocated to this line is folded in here too, so the stored cost
-    // is the item's true fully-loaded per-base-unit price from day one.
+    // Cost is stored per base unit everywhere it's consumed (batch costPrice, COGS, margins), so line.rate (quoted per the line's own unit) is converted the same way qty was, with any landed cost folded in.
     const lineValue = Number(line.qty) * Number(line.rate || 0);
     const allocatedCharge =
       totalAdditionalCharges > 0
@@ -898,6 +933,22 @@ router.post('/purchases', (req, res) => {
         line.batchId = batch.id;
         line.batchNo = batch.batchNo;
       }
+    } else if (product.trackSerials) {
+      // One record per physical unit — a serial-tracked product never gets a bulk product.stock += qty bump, since recomputeSerialStock derives stock from the serials array (bumping both would double-count).
+      const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+      const serialEntries = Array.isArray(line.serials) && line.serials.length > 0 ? line.serials : [{}];
+      line.serialIds = serialEntries.map((s) => {
+        const serial = addSerialFromPurchase(product, {
+          serialNo: s.serialNo,
+          imei: s.imei,
+          refPurchaseId: purchase.id,
+          warehouseId: line.warehouseId || whKey
+        });
+        return serial.id;
+      });
+      if (line.sellPrice !== undefined && line.sellPrice !== '' && Number(line.sellPrice) > 0) {
+        product.price = Number(line.sellPrice);
+      }
     } else {
       product.stock = r2(Number(product.stock || 0) + qty);
       if (product.warehouses && typeof product.warehouses === 'object') {
@@ -913,7 +964,7 @@ router.post('/purchases', (req, res) => {
     logStockMovement(store, {
       product,
       type: 'PURCHASE',
-      qtyChange: qty,
+      qtyChange: product.trackSerials ? (line.serialIds || []).length : qty,
       reason: `Received on ${purchase.invoiceNo}`,
       refId: purchase.id,
       user: actor(req)
@@ -931,9 +982,7 @@ router.post('/purchases', (req, res) => {
     purchase.accountingError = err.message;
   }
 
-  // Cash paid to the vendor up front (at purchase entry, not the separate
-  // "settle due" screen) leaves the till just the same — the counter drawer
-  // needs to see it or its expected balance drifts from the ledger.
+  // Cash paid up front at purchase entry leaves the till just the same as via "settle due" — the drawer needs to see it or its expected balance drifts from the ledger.
   if (paid > 0 && String(purchase.paymentMode).toLowerCase() === 'cash' && store.session?.status === 'open') {
     store.session.currentCash = r2(store.session.currentCash - paid);
     store.session.cashEntries.push({
@@ -980,9 +1029,7 @@ router.post('/purchases', (req, res) => {
     if (account) vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
   }
 
-  // Mark off what this bill actually received against the purchase order —
-  // by product, not by line index, so receiving fewer/more lines than the PO
-  // still reconciles correctly line-by-line.
+  // Mark off receipt by product, not by line index, so receiving fewer/more lines than the PO still reconciles correctly.
   if (purchaseOrder) {
     lines.forEach((line) => {
       const poLine = purchaseOrder.items.find((pl) => pl.productId === line.productId);
@@ -1014,13 +1061,7 @@ router.post('/purchases', (req, res) => {
   });
 });
 
-/**
- * Vendor/header details that are safe to correct on a purchase already
- * received into stock — typos, a missed vendor GSTIN, shipping info — without
- * touching stock or the accounting ledger. Mirrors EDITABLE_DETAIL_FIELDS in
- * routes/sales.js; items, amounts and payment fields are excluded on purpose,
- * see PURCHASE_LOCKED_FIELDS below.
- */
+// Vendor/header details safe to correct on a received purchase without touching stock/ledger — mirrors EDITABLE_DETAIL_FIELDS in routes/sales.js; see PURCHASE_LOCKED_FIELDS below for what's excluded.
 const PURCHASE_EDITABLE_DETAIL_FIELDS = [
   { key: 'vendorName', label: 'Vendor Name' },
   { key: 'vendorPhone', label: 'Vendor Phone' },
@@ -1048,9 +1089,7 @@ const PURCHASE_EDITABLE_DETAIL_FIELDS = [
   { key: 'buyerOrderDate', label: 'Buyer Order Date' }
 ];
 
-// Rejected outright on a details-only edit — these feed stock received at
-// invoice cost or the ledger, so changing them here would desync inventory
-// and the books from what was actually posted on receipt.
+// Rejected outright on a details-only edit — these feed stock received at invoice cost or the ledger, so changing them would desync inventory/books from what was posted on receipt.
 const PURCHASE_LOCKED_FIELDS = [
   'items', 'subtotal', 'tax', 'discount', 'roundOff', 'totalAmount', 'additionalCharges',
   'paymentMode', 'paymentStatus', 'paidAmount', 'settlementAccountId', 'status', 'vendorId', 'poId'
@@ -1118,13 +1157,7 @@ router.put('/purchases/:id', (req, res) => {
   });
 });
 
-/**
- * Void a purchase invoice: pulls the received stock back out, reverses the
- * posted accounting voucher, and recomputes the vendor's payable — mirrors
- * how `/orders/:orderId/void` treats a sales bill. Purchases are never hard
- * deleted once posted, since that would silently break stock history and
- * the vendor ledger; voiding keeps a visible, reversible audit trail.
- */
+// Pulls received stock back out, reverses the accounting voucher, and recomputes the vendor's payable — mirrors /orders/:orderId/void. Purchases are never hard-deleted once posted; voiding keeps a reversible audit trail.
 router.post('/purchases/:id/void', (req, res) => {
   const store = req.tenantStore;
   const purchase = (store.purchases || []).find((p) => p.id === req.params.id);
@@ -1166,10 +1199,7 @@ router.post('/purchases/:id/void', (req, res) => {
       try {
         reversed.push(engine.reverseJournal(store, v.id, actor(req)).voucherNo);
       } catch (err) {
-        // "Already reversed" is expected when another voucher in this same
-        // chain already reversed it — anything else is a real failure that
-        // would otherwise leave stock restored but the ledger un-reversed
-        // with no trace anywhere.
+        // "Already reversed" is expected when another voucher in this chain already reversed it; anything else would leave stock restored but the ledger un-reversed untraced.
         if (err.message !== 'Voucher has already been reversed.') {
           console.error(`[Void purchase ${purchase.id}] Failed to reverse voucher ${v.id}:`, err.message);
         }
@@ -1189,15 +1219,7 @@ router.post('/purchases/:id/void', (req, res) => {
   res.json({ success: true, message: `Purchase ${purchase.invoiceNo} voided.`, data: { purchase, reversed } });
 });
 
-/**
- * Vendor Cash Payment — Module 6.
- *
- * Settling a supplier from the purchases screen without leaving for the Accounts
- * module. The payment posts through the same voucher path as `/accounts/payments`,
- * so the vendor ledger, the cash/bank balance and the payables report all move
- * together. Oldest invoices are marked paid first, which is how shops actually
- * apply a lump-sum payment.
- */
+// Vendor Cash Payment (Module 6): posts through the same voucher path as /accounts/payments so ledger, cash/bank and payables all move together; oldest invoices are marked paid first.
 router.post('/vendors/:id/pay', (req, res) => {
   const store = req.tenantStore;
   const vendor = (store.vendors || []).find((v) => v.id === req.params.id);
@@ -1289,15 +1311,7 @@ router.get('/vendors/payments', (req, res) => {
 
 /* -------------------------------- vendor credits (purchase returns) -------------------------------- */
 
-/**
- * Vendor Credit — return part or all of a specific purchase back to its
- * supplier. Batch-tracked lines pull from the exact batch that purchase
- * created (traced via `line.batchId`, stamped on receipt); plain-stock lines
- * decrement `product.stock`/warehouse the same way a purchase void does.
- * Always posts a real reversing journal entry (Dr Vendor / Cr Inventory /
- * Cr GST Input) — unlike the older single-batch "return to supplier" inventory
- * action, this is never accounting-silent.
- */
+// Vendor Credit: batch-tracked lines pull from the exact batch traced via line.batchId; plain-stock lines decrement like a purchase void. Always posts a real reversing journal entry — never accounting-silent.
 router.post('/purchases/:id/return', (req, res) => {
   const store = req.tenantStore;
   const purchase = (store.purchases || []).find((p) => p.id === req.params.id);
@@ -1312,15 +1326,14 @@ router.post('/purchases/:id/return', (req, res) => {
   if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found.' });
 
   const { items, reason, date } = req.body;
-  const requested = (Array.isArray(items) ? items : []).filter((l) => Number(l.qty) > 0);
+  const requested = (Array.isArray(items) ? items : []).filter(
+    (l) => Number(l.qty) > 0 || (Array.isArray(l.serialIds) && l.serialIds.length > 0)
+  );
   if (!requested.length) {
     return res.status(400).json({ success: false, message: 'Select at least one item to return.' });
   }
 
-  // Kept in the purchase line's own unit (bags, boxes, whatever it was
-  // received in) — same convention `purchase.items[].qty` already uses — so
-  // it can be compared directly against `purchaseLine.qty` without a base-unit
-  // detour. Only the actual stock/batch mutation below needs base units.
+  // Kept in the purchase line's own unit, same as purchase.items[].qty, so it compares directly against purchaseLine.qty without a base-unit detour; only the actual stock/batch mutation below needs base units.
   const alreadyCredited = (productId, batchId) =>
     (store.vendorCredits || [])
       .filter((vc) => vc.purchaseId === purchase.id && vc.status !== 'VOID')
@@ -1337,16 +1350,38 @@ router.post('/purchases/:id/return', (req, res) => {
   // line further down the list can't leave earlier lines half-applied.
   const plan = [];
   for (const reqLine of requested) {
+    const product = store.products.find((p) => p.id === reqLine.productId);
+    if (!product) {
+      return res.status(400).json({ success: false, message: `Product no longer exists in the catalogue.` });
+    }
+
+    // Serial-tracked returns are per-unit, not per-quantity — a serial can only ever be IN_STOCK once, so that status check alone rules out double-returning it (no vendorCredits scan needed).
+    if (product.trackSerials) {
+      const serialIds = Array.isArray(reqLine.serialIds) ? reqLine.serialIds : [];
+      if (!serialIds.length) {
+        return res.status(400).json({ success: false, message: `${product.name}: select at least one serial to return.` });
+      }
+      const serials = [];
+      for (const sid of serialIds) {
+        const serial = (product.serials || []).find((s) => s.id === sid);
+        if (!serial || serial.refPurchaseId !== purchase.id) {
+          return res.status(400).json({ success: false, message: `${product.name}: selected serial was not received on this purchase.` });
+        }
+        if (serial.status !== 'IN_STOCK') {
+          return res.status(400).json({ success: false, message: `${product.name}: serial ${serial.serialNo} is already sold or returned.` });
+        }
+        serials.push(serial);
+      }
+      plan.push({ product, isSerial: true, serials });
+      continue;
+    }
+
     const qty = r2(Number(reqLine.qty));
     const purchaseLine = (purchase.items || []).find(
       (pl) => pl.productId === reqLine.productId && (pl.batchId || null) === (reqLine.batchId || null)
     );
     if (!purchaseLine) {
       return res.status(400).json({ success: false, message: `No matching line found on this purchase for the selected item.` });
-    }
-    const product = store.products.find((p) => p.id === reqLine.productId);
-    if (!product) {
-      return res.status(400).json({ success: false, message: `Product no longer exists in the catalogue.` });
     }
 
     const maxReturnable = r2(Number(purchaseLine.qty) - alreadyCredited(reqLine.productId, purchaseLine.batchId));
@@ -1376,7 +1411,45 @@ router.post('/purchases/:id/return', (req, res) => {
 
   // Pass 2: apply.
   const creditLines = [];
-  plan.forEach(({ product, purchaseLine, batch, qty, baseQtyToRemove }) => {
+  plan.forEach((entry) => {
+    if (entry.isSerial) {
+      const { product, serials } = entry;
+      serials.forEach((serial) => {
+        returnSerialToVendor(product, serial.id, reason || 'Returned to supplier', actor(req));
+        logStockMovement(store, {
+          product,
+          type: 'RETURN',
+          qtyChange: -1,
+          reason: `Returned to supplier (${vendor.name}) — ${reason || 'Purchase Return'} — Serial ${serial.serialNo}`,
+          refId: purchase.id,
+          user: actor(req)
+        });
+      });
+
+      const purchaseLine = (purchase.items || []).find((pl) => pl.productId === product.id) || {};
+      const qty = serials.length;
+      const rate = Number(purchaseLine.rate || 0);
+      const taxRate = Number(purchaseLine.taxRate || 0);
+      const lineSubtotal = r2(qty * rate);
+      const lineTax = r2((lineSubtotal * taxRate) / 100);
+      creditLines.push({
+        productId: product.id,
+        productName: product.name,
+        unit: purchaseLine.unit || product.unit,
+        serialIds: serials.map((s) => s.id),
+        serialNos: serials.map((s) => s.serialNo),
+        qty,
+        baseQty: qty,
+        rate,
+        taxRate,
+        lineSubtotal,
+        lineTax,
+        lineTotal: r2(lineSubtotal + lineTax)
+      });
+      return;
+    }
+
+    const { product, purchaseLine, batch, qty, baseQtyToRemove } = entry;
     if (product.trackBatches) {
       writeOffBatch(product, batch.id, baseQtyToRemove, reason || 'Returned to supplier', actor(req));
     } else {
@@ -1494,9 +1567,7 @@ router.post('/vendor-credits/:id/void', (req, res) => {
   (vc.items || []).forEach((line) => {
     const product = store.products.find((p) => p.id === line.productId);
     if (!product) return;
-    // `line.qty` is in the original purchase line's unit (bags, boxes, …) for
-    // display; stock/batches are tracked in base units, so restoration must
-    // use the base-unit amount actually removed, not the display quantity.
+    // line.qty is in the purchase line's display unit; restoration must use the base-unit amount actually removed (line.baseQty), since stock/batches track base units.
     const qty = Number(line.baseQty ?? line.qty) || 0;
 
     if (product.trackBatches && line.batchId) {
@@ -1591,11 +1662,7 @@ router.get('/purchase-orders', (req, res) => {
   });
 });
 
-/**
- * Creates a purchase order — a commitment to a vendor before anything has
- * been received. No stock or accounting moves yet; that only happens when a
- * purchase is later recorded against it via `POST /purchases` with `poId`.
- */
+// A commitment to a vendor before anything is received — no stock/accounting moves until a purchase is later recorded against it via POST /purchases with poId.
 router.post('/purchase-orders', (req, res) => {
   const store = req.tenantStore;
   const { vendorId, vendorName, items, expectedDate, notes, date } = req.body;

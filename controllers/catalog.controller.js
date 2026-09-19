@@ -301,11 +301,11 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
   let serials = trackSerials ? shapeSerials(payload, existing) : (existing?.trackSerials ? existing.serials || [] : []);
 
   if (trackSerials) {
-    stock = serials.filter((s) => s.status !== 'SOLD').length;
+    stock = serials.filter((s) => s.status === 'IN_STOCK').length;
     const defaultWh = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
     const whMap = {};
     serials.forEach((s) => {
-      if (s.status === 'SOLD') return;
+      if (s.status !== 'IN_STOCK') return;
       const whId = s.warehouseId || defaultWh;
       whMap[whId] = (whMap[whId] || 0) + 1;
     });
@@ -352,6 +352,11 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     price,
     mrp: num(payload.mrp, existing?.mrp ?? price),
     purchasePrice,
+    // Margin isn't used in any pricing math itself (Selling Price stays the
+    // one source of truth billing reads) — it's stored purely so re-opening
+    // Add/Edit Product shows the same margin the user configured last time,
+    // instead of it resetting blank.
+    marginPercent: payload.marginPercent !== undefined ? String(payload.marginPercent) : (existing?.marginPercent ?? ''),
     wholesalePrice: num(payload.wholesalePrice, existing?.wholesalePrice ?? price),
     specialPrice: num(payload.specialPrice, existing?.specialPrice ?? price),
     // Whole-number units (pcs, box, dozen, ...) can't carry fractional stock —

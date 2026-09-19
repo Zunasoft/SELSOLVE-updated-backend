@@ -1,18 +1,9 @@
-/**
- * Auto-posting rules — the bridge between shop-floor events and the ledger.
- *
- * Nothing in the POS writes to the journal directly. Sales, purchases,
- * expenses, receipts and payments all funnel through the helpers here so that
- * the accounting treatment of a transaction lives in exactly one place.
- */
+// Nothing in the POS writes to the journal directly — every event funnels through the helpers here so accounting treatment lives in exactly one place.
 
 const engine = require('./engine');
 const { r2, bySystemKey, resolveAccount, ensurePartyAccount, postJournal } = engine;
 
-/**
- * GST is split CGST/SGST for intra-state supply and booked wholly to IGST for
- * inter-state supply — the standard Indian retail treatment.
- */
+// GST splits CGST/SGST for intra-state supply, wholly to IGST for inter-state — standard Indian retail treatment.
 function splitGst(amount, interState = false) {
   const total = r2(amount);
   if (total === 0) return { cgst: 0, sgst: 0, igst: 0, total: 0 };
@@ -49,18 +40,8 @@ function settlementAccount(store, paymentMode, explicitAccountId) {
 
 const isCreditSale = (mode) => String(mode || '').toLowerCase().includes('credit');
 
-/* ------------------------------------------------------------------ *
- * Sales
- * ------------------------------------------------------------------ */
-
-/**
- * Sale voucher.
- *   Dr Cash / Bank / Customer        gross collected
- *   Dr Discount Allowed              discount given
- *      Cr Sales                      gross item value
- *      Cr GST Payable                tax collected
- *      Cr/Dr Rounding Off            invoice rounding
- */
+// Sales
+// Dr Cash/Bank/Customer + Discount Allowed = Cr Sales + GST Payable +/- Rounding Off.
 function postSale(store, order, { customer, interState = false, createdBy } = {}) {
   const subtotal = r2(order.subtotal);
   const discount = r2(order.discount);
@@ -92,20 +73,12 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
     });
   }
 
-  // Split the settlement between what was actually collected (Cash/Bank) and
-  // what's still owed (customer AR) — order.paidAmount/balanceDue drive this,
-  // not just paymentMethod, so a "Partial Payment" sale (paymentMethod =
-  // 'Cash' for the upfront portion, with a real balance left over) no longer
-  // books the *entire* total to Cash while leaving the unpaid remainder off
-  // the books entirely. When paidAmount isn't set on the order (e.g. the
-  // legacy quotation-convert path, which is always settled in full at
-  // conversion), this falls back to treating it as fully collected.
+  // paidAmount/balanceDue (not paymentMethod alone) drive the Cash-vs-AR split, so a partial-payment sale doesn't book the entire total to Cash; missing paidAmount (legacy quotation-convert path) falls back to fully collected.
   if (total > 0) {
     const paidPortion = r2(Math.max(0, Math.min(total, Number(order.paidAmount ?? total))));
     let duePortion = r2(Math.max(0, total - paidPortion));
     if (duePortion > 0 && !customer) {
-      // No party to carry the receivable on — fold it back into the
-      // settlement line rather than silently dropping it from the books.
+      // No party to carry the receivable on, so fold it back into the settlement line instead of dropping it from the books.
       duePortion = 0;
     }
     const settledPortion = r2(total - duePortion);
@@ -122,11 +95,7 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
     }
 
     if (settledPortion > 0) {
-      // A split/multi-pay sale collected money across more than one method
-      // (e.g. half Cash, half UPI) — book each method's share to its own
-      // ledger (Cash vs Bank) instead of dumping the whole settled amount
-      // into whichever account order.paymentMethod's composite label ('Split
-      // Payment') would otherwise resolve to.
+      // A split/multi-pay sale books each method's share to its own ledger instead of dumping it all into whatever order.paymentMethod's composite label ('Split Payment') would resolve to.
       const paymentRows = (order.payments || []).filter((p) => Number(p.amount) > 0);
       if (paymentRows.length > 1) {
         const byAccount = new Map();
@@ -179,11 +148,7 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
     lines: lines.filter((l) => l.accountId)
   });
 
-  // Cost of goods sold moves value out of inventory into the P&L. `purchasePrice`
-  // is quoted per base unit, so it must be costed against the base-unit quantity
-  // actually deducted from stock (`item.baseQty`) — not the as-sold `item.qty`,
-  // which is in whatever unit the line was billed in (e.g. grams vs. kg) and can
-  // overstate COGS by orders of magnitude otherwise.
+  // purchasePrice is per base unit, so cost must use item.baseQty, not the as-sold item.qty (e.g. grams vs kg) — else COGS can be overstated by orders of magnitude.
   const cogsAmount = r2(
     (order.items || []).reduce((sum, item) => {
       const product = (store.products || []).find((p) => p.id === item.id || p.name === item.name);
@@ -212,15 +177,7 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
   return { voucher, cogsVoucher, cogsAmount };
 }
 
-/**
- * Sales return / credit note — goods a customer sent back, reversing the
- * exact accounting a sale would have booked for that value (mirrors
- * `postPurchaseReturn` on the other side of the ledger).
- *   Dr Sales                   taxable value reversed
- *   Dr GST Payable             tax collected reversed
- *      Cr Customer / Cash      value credited back (reduces receivable, or
- *                              refunded from the till for a walk-in sale)
- */
+// Reverses the exact accounting a sale would have booked for the returned value (mirrors postPurchaseReturn on the other side of the ledger).
 function postSalesReturn(store, creditNote, { customer, interState = false, createdBy } = {}) {
   const taxable = r2(creditNote.subtotal);
   const tax = r2(creditNote.tax);
@@ -281,16 +238,8 @@ function postSalesReturn(store, creditNote, { customer, interState = false, crea
   return { voucher, cogsVoucher, cogsAmount };
 }
 
-/* ------------------------------------------------------------------ *
- * Purchases
- * ------------------------------------------------------------------ */
-
-/**
- * Purchase invoice.
- *   Dr Stock in Hand                 taxable value
- *   Dr GST Input Credit              tax paid
- *      Cr Vendor (or Cash / Bank)    invoice total
- */
+// Purchases
+// Dr Stock in Hand + GST Input Credit = Cr Vendor (or Cash/Bank).
 function postPurchase(store, purchase, { vendor, interState = false, createdBy } = {}) {
   const taxable = r2(purchase.subtotal ?? purchase.totalAmount);
   const tax = r2(purchase.tax);
@@ -340,13 +289,7 @@ function postPurchase(store, purchase, { vendor, interState = false, createdBy }
   });
 }
 
-/**
- * Vendor credit / purchase return — goods sent back to a supplier, reversing
- * the exact accounting a purchase would have booked for that value.
- *   Dr Vendor                  value credited (reduces what we owe)
- *      Cr Stock in Hand        taxable value reversed
- *      Cr GST Input Credit     tax credit reversed
- */
+// Reverses the exact accounting a purchase would have booked: Dr Vendor = Cr Stock in Hand + GST Input Credit.
 function postPurchaseReturn(store, vendorCredit, { vendor, interState = false, createdBy } = {}) {
   const taxable = r2(vendorCredit.subtotal);
   const tax = r2(vendorCredit.tax);
@@ -377,14 +320,7 @@ function postPurchaseReturn(store, vendorCredit, { vendor, interState = false, c
   });
 }
 
-/**
- * Landed cost — freight, customs, handling, etc. incurred on a purchase.
- * Capitalised straight into inventory (it's already been allocated across
- * the receiving lines' per-unit cost by the caller) rather than expensed,
- * matching standard landed-cost accounting treatment.
- *   Dr Stock in Hand          amount
- *      Cr Cash / Bank         paid immediately (freight is rarely on credit)
- */
+// Freight/customs/handling on a purchase: capitalised into inventory (already allocated per-unit by the caller) rather than expensed, per standard landed-cost treatment.
 function postLandedCost(store, purchase, { amount, settlementAccountId, paymentMode, createdBy } = {}) {
   const value = r2(amount);
   if (value <= 0) return null;
@@ -406,17 +342,8 @@ function postLandedCost(store, purchase, { amount, settlementAccountId, paymentM
   });
 }
 
-/* ------------------------------------------------------------------ *
- * Expenses & other income
- * ------------------------------------------------------------------ */
-
-/**
- * Expense.
- *   Dr Expense head          net amount
- *   Dr GST Input Credit      recoverable tax
- *      Cr Cash / Bank        when paid
- *      Cr Vendor             when left unpaid
- */
+// Expenses & other income
+// Dr Expense head + GST Input Credit = Cr Cash/Bank (paid) or Vendor (unpaid).
 function postExpense(store, expense, { vendor, createdBy } = {}) {
   const amount = r2(expense.amount);
   const tax = r2(expense.tax);
@@ -456,11 +383,7 @@ function postExpense(store, expense, { vendor, createdBy } = {}) {
   });
 }
 
-/**
- * Other income (bank interest, commission, scrap sales).
- *   Dr Cash / Bank
- *      Cr Income head
- */
+// Other income (bank interest, commission, scrap sales): Dr Cash/Bank = Cr Income head.
 function postIncome(store, income, { createdBy } = {}) {
   const amount = r2(income.amount);
   const incomeAccount =
@@ -485,14 +408,8 @@ function postIncome(store, income, { createdBy } = {}) {
   });
 }
 
-/* ------------------------------------------------------------------ *
- * Money movement
- * ------------------------------------------------------------------ */
-
-/**
- * Customer receipt — money in, dues down. A settlement discount, if any, is
- * expensed rather than netted against sales so the revenue figure stays clean.
- */
+// Money movement
+// Customer receipt: a settlement discount, if any, is expensed rather than netted against sales so revenue stays clean.
 function postReceipt(store, receipt, { customer, createdBy } = {}) {
   const amount = r2(receipt.amount);
   const discount = r2(receipt.discount);
@@ -516,10 +433,7 @@ function postReceipt(store, receipt, { customer, createdBy } = {}) {
   });
 }
 
-/**
- * Vendor payment — settling a payable, never a fresh expense. Booking it as an
- * expense here is the classic double-count, so the debit goes to the vendor.
- */
+// Vendor payment settles a payable, never a fresh expense — booking it as an expense would double-count, so the debit goes to the vendor.
 function postPayment(store, payment, { vendor, createdBy } = {}) {
   const amount = r2(payment.amount);
   const discount = r2(payment.discount);
@@ -543,11 +457,7 @@ function postPayment(store, payment, { vendor, createdBy } = {}) {
   });
 }
 
-/**
- * Vendor repayment / refund — vendor pays money back into cash drawer (clearing debt/balance).
- *   Dr Cash / Bank        money received
- *      Cr Vendor Account  debt / payable cleared
- */
+// Vendor repayment/refund: Dr Cash/Bank = Cr Vendor Account (debt cleared).
 function postVendorRefund(store, { amount, vendor, notes, createdBy } = {}) {
   const value = r2(amount);
   const partyAccount = ensurePartyAccount(store, vendor, 'VENDOR');
@@ -568,10 +478,7 @@ function postVendorRefund(store, { amount, vendor, notes, createdBy } = {}) {
   });
 }
 
-/**
- * Applies a vendor payment against that vendor's oldest unpaid/partial purchase invoices.
- * Matches both by vendorId and vendorName for robust alignment.
- */
+// Applies against the vendor's oldest unpaid/partial invoices first; matches by both vendorId and vendorName for robust alignment.
 function applyVendorPaymentToPurchases(store, vendor, amount, discount = 0) {
   let remaining = r2(Number(amount || 0) + Number(discount || 0));
   const settled = [];
@@ -622,10 +529,7 @@ function postFundTransfer(store, transfer, { createdBy } = {}) {
   });
 }
 
-/**
- * Opening balance. The contra leg is Opening Balance Equity, which keeps the
- * trial balance square while balances are still being entered.
- */
+// The contra leg is Opening Balance Equity, keeping the trial balance square while balances are still being entered.
 function postOpeningBalance(store, { accountId: accId, amount, side, date, createdBy }) {
   const account = resolveAccount(store, accId);
   if (!account) throw new Error('Account not found.');
@@ -652,10 +556,34 @@ function postOpeningBalance(store, { accountId: accId, amount, side, date, creat
   });
 }
 
-/**
- * Stock adjustment. Increases capitalise into inventory against the equity
- * suspense; shrinkage and damage are written off to the P&L.
- */
+// Deliberately its own type/refType rather than reusing postOpeningBalance — reusing it would make every later correction keep summing into "Opening Balance" on the statement, inflating it with each edit.
+function postBalanceAdjustment(store, { accountId: accId, amount, side, date, createdBy, narration }) {
+  const account = resolveAccount(store, accId);
+  if (!account) throw new Error('Account not found.');
+  const value = r2(amount);
+  if (value === 0) throw new Error('Adjustment amount must be non-zero.');
+
+  const equity = bySystemKey(store, 'OPENING_EQUITY');
+  const isDebit = String(side).toUpperCase() === 'DR';
+
+  return postJournal(store, {
+    type: 'BALANCE_ADJUSTMENT',
+    date: date || new Date().toISOString(),
+    narration: narration || `Balance adjustment — ${account.name}`,
+    refType: 'BALANCE_ADJUSTMENT',
+    refId: account.id,
+    partyId: account.partyId,
+    createdBy,
+    lines: [
+      isDebit
+        ? { accountId: account.id, debit: value, partyId: account.partyId }
+        : { accountId: account.id, credit: value, partyId: account.partyId },
+      isDebit ? { accountId: equity.id, credit: value } : { accountId: equity.id, debit: value }
+    ]
+  });
+}
+
+// Increases capitalise into inventory against the equity suspense; shrinkage/damage are written off to the P&L.
 function postStockAdjustment(store, adjustment, { createdBy } = {}) {
   const value = r2(adjustment.value);
   if (value === 0) return null;
@@ -703,5 +631,6 @@ module.exports = {
   postVendorRefund,
   postFundTransfer,
   postOpeningBalance,
+  postBalanceAdjustment,
   postStockAdjustment
 };

@@ -1,10 +1,4 @@
-/**
- * Accounts module REST API — mounted at /api/pos/accounts.
- *
- * Balances are never stored: every figure returned here is derived live from
- * the journal, so the Chart of Accounts, the party ledgers and the financial
- * statements can never drift out of agreement with one another.
- */
+// Accounts module REST API (/api/pos/accounts) — balances are never stored, every figure is derived live from the journal so nothing can drift out of agreement.
 
 const express = require('express');
 const engine = require('./engine');
@@ -34,9 +28,7 @@ const {
 
 const router = express.Router();
 
-/* ------------------------------------------------------------------ *
- * Shared helpers
- * ------------------------------------------------------------------ */
+// Shared helpers
 
 router.use((req, res, next) => {
   ensureAccounting(req.tenantStore);
@@ -84,9 +76,7 @@ function buildAccountTree(store, opts) {
     .map((a) => shape(a, 0));
 }
 
-/* ------------------------------------------------------------------ *
- * Dashboard
- * ------------------------------------------------------------------ */
+// Dashboard
 
 router.get('/dashboard', (req, res) => {
   const store = req.tenantStore;
@@ -169,9 +159,7 @@ router.get('/dashboard', (req, res) => {
   });
 });
 
-/* ------------------------------------------------------------------ *
- * Chart of Accounts
- * ------------------------------------------------------------------ */
+// Chart of Accounts
 
 router.get('/chart', (req, res) => {
   const store = req.tenantStore;
@@ -245,9 +233,7 @@ router.get('/ledger/:accountId', (req, res) => {
   res.json({ success: true, data: ledger });
 });
 
-/* ------------------------------------------------------------------ *
- * Receivables & payables
- * ------------------------------------------------------------------ */
+// Receivables & payables
 
 const partyView = (store, list, type) =>
   list.map((p) => {
@@ -291,9 +277,7 @@ router.get('/vendors', (req, res) => {
   });
 });
 
-/* ------------------------------------------------------------------ *
- * Bank & cash accounts
- * ------------------------------------------------------------------ */
+// Bank & cash accounts
 
 const liquidView = (store, systemKey) =>
   (store.accounts || [])
@@ -396,9 +380,7 @@ router.post('/cash', (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ *
- * Journal
- * ------------------------------------------------------------------ */
+// Journal
 
 router.get('/journal', (req, res) => {
   const store = req.tenantStore;
@@ -456,9 +438,7 @@ router.post('/journal/:id/reverse', (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ *
- * Income
- * ------------------------------------------------------------------ */
+// Income
 
 router.get('/income', (req, res) => {
   const store = req.tenantStore;
@@ -501,9 +481,7 @@ router.post('/income', (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ *
- * Expenses
- * ------------------------------------------------------------------ */
+// Expenses
 
 router.get('/expenses', (req, res) => {
   const store = req.tenantStore;
@@ -555,9 +533,7 @@ router.post('/expenses', (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ *
- * Receipts & payments
- * ------------------------------------------------------------------ */
+// Receipts & payments
 
 router.get('/receipts', (req, res) => {
   res.json({ success: true, data: req.tenantStore.receipts || [] });
@@ -590,9 +566,7 @@ router.post('/receipts', (req, res) => {
     record.voucherNo = voucher.voucherNo;
     store.receipts.unshift(record);
 
-    // Keep the legacy POS fields aligned with the ledger — an overpayment can
-    // push the balance negative (a real advance), so both sides must be
-    // resynced together or `customer.advance` is left stale at its old value.
+    // An overpayment can push the balance negative (a real advance), so outstanding/advance must be resynced together or customer.advance is left stale.
     const account = (store.accounts || []).find(
       (a) => a.partyId === customer.id && a.partyType === 'CUSTOMER'
     );
@@ -662,9 +636,7 @@ router.post('/payments', (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ *
- * Fund transfers
- * ------------------------------------------------------------------ */
+// Fund transfers
 
 router.get('/transfers', (req, res) => {
   const store = req.tenantStore;
@@ -707,15 +679,38 @@ router.post('/transfers', (req, res) => {
     record.voucherNo = voucher.voucherNo;
     store.transfers.unshift(record);
 
+    // The POS session's own `currentCash` must stay in sync with this Cash ledger account, or a transfer would silently throw off the shift-close variance.
+    const cashAccount = bySystemKey(store, 'CASH');
+    if (cashAccount && store.session?.status === 'open') {
+      const total = r2(Number(amount) + Number(charges || 0));
+      if (fromAccountId === cashAccount.id) {
+        store.session.currentCash = r2(store.session.currentCash - total);
+        store.session.cashEntries.push({
+          type: 'OUT',
+          amount: total,
+          reason: `Transfer to ${record.toName || 'account'}${reference ? ` (${reference})` : ''}`,
+          time: record.date,
+          user: actor(req)
+        });
+      } else if (toAccountId === cashAccount.id) {
+        store.session.currentCash = r2(store.session.currentCash + Number(amount));
+        store.session.cashEntries.push({
+          type: 'IN',
+          amount: Number(amount),
+          reason: `Transfer from ${record.fromName || 'account'}${reference ? ` (${reference})` : ''}`,
+          time: record.date,
+          user: actor(req)
+        });
+      }
+    }
+
     res.status(201).json({ success: true, message: `Transfer ${voucher.voucherNo} posted.`, data: record });
   } catch (err) {
     fail(res, err);
   }
 });
 
-/* ------------------------------------------------------------------ *
- * Opening balances
- * ------------------------------------------------------------------ */
+// Opening balances
 
 router.get('/opening-balances', (req, res) => {
   const store = req.tenantStore;
@@ -784,9 +779,7 @@ router.post('/opening-balances', (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ *
- * Reconciliation
- * ------------------------------------------------------------------ */
+// Reconciliation
 
 router.get('/reconciliation/:accountId', (req, res) => {
   const store = req.tenantStore;
@@ -858,9 +851,7 @@ router.post('/reconciliation', (req, res) => {
   });
 });
 
-/* ------------------------------------------------------------------ *
- * Reports
- * ------------------------------------------------------------------ */
+// Reports
 
 router.get('/reports/trial-balance', (req, res) => {
   res.json({ success: true, data: trialBalance(req.tenantStore, period(req)) });

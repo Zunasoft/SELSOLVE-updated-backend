@@ -1,7 +1,4 @@
-/**
- * Billing, held bills, counter sessions and table management —
- * Modules 3, 17, 18 and 19 of the SOW.
- */
+// Billing, held bills, counter sessions and table management — Modules 3, 17, 18 and 19 of the SOW.
 
 const express = require('express');
 const { logStockMovement } = require('../store');
@@ -16,13 +13,7 @@ const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const r2 = engine.r2;
 
-/**
- * A bill line in a whole-number unit (pcs, box, dozen, ...) can't carry a
- * fractional quantity — "2.5 pcs" doesn't mean anything on a shop floor. The
- * cart already blocks this at entry, but every write path that can land a
- * line here re-checks it, the same way the qty>0/price>=0 guard beside this
- * does, so a bypassed/scripted request can't slip a fractional PCS line in.
- */
+// "2.5 pcs" is meaningless on a shop floor; the cart blocks it at entry, but every write path re-checks it so a bypassed/scripted request can't slip a fractional whole-unit line in.
 const findFractionalQtyItem = (items) =>
   (items || []).find((i) => {
     const unit = i.unit || i.saleUnit || 'pcs';
@@ -32,10 +23,7 @@ const findFractionalQtyItem = (items) =>
 
 /* --------------------------------- init --------------------------------- */
 
-/**
- * Everything the terminal needs to boot. The store was already loaded from the
- * tenant's own database by `resolveTenantDb`, so this reads straight from it.
- */
+// The store was already loaded from the tenant's own database by resolveTenantDb, so this reads straight from it.
 router.get('/init', (req, res) => {
   const store = req.tenantStore;
 
@@ -165,23 +153,7 @@ router.delete('/bills/held/:id', (req, res) => {
 
 /* -------------------------------- checkout -------------------------------- */
 
-/**
- * Deduct warehouse stock safely. First consumes from shop floor (wh_shop),
- * and if insufficient, takes the remaining quantity from the main warehouse (wh_main).
- * Always recalculates total product.stock from warehouses.
- *
- * Batch-tracked products skip the warehouse split entirely and deduct FEFO
- * from `product.batches` instead — that stock isn't warehouse-scoped yet.
- * Returns which batches were drawn from (or null for a non-batch product),
- * so the caller can record it on the sale line for traceability.
- *
- * Serial-tracked products work the same way, but on a single unit instead of
- * a quantity: the cashier's chosen serial (`preferredSerialId`, from the
- * "which one am I selling" picker in Billing — the serial equivalent of the
- * batch picker) is marked sold, or the oldest unit still in stock if none was
- * specified. Warranty, if the product has it, starts counting from `saleDate`
- * right here — the moment of sale, not the moment it was catalogued.
- */
+// Consumes shop floor (wh_shop) first, then wh_main. Batch-tracked products deduct FEFO from product.batches instead (not warehouse-scoped yet); serial-tracked products mark one unit (preferredSerialId or oldest in stock) sold, with warranty starting from saleDate.
 function deductWarehouseStock(product, qtyToDeduct, preferredBatchId, preferredSerialId, orderId, saleDate) {
   const deduct = Number(qtyToDeduct) || 0;
   if (deduct <= 0) return null;
@@ -219,17 +191,7 @@ function deductWarehouseStock(product, qtyToDeduct, preferredBatchId, preferredS
   return null;
 }
 
-/**
- * Mirrors `deductWarehouseStock` for void/delete. When `batchesSold` (the
- * exact batches a sale drew from, recorded on the order line) is available,
- * it restores into those same batches rather than re-running FEFO — putting
- * stock back exactly where it came from. Falls back to a labeled placeholder
- * batch for legacy orders that predate batch tracking.
- *
- * A serial-tracked line restores the exact unit it sold (`serialSoldId`,
- * recorded on the order line) back to IN_STOCK and clears its warranty
- * window — a voided/returned sale never really started that clock.
- */
+// Mirrors deductWarehouseStock for void/delete: restores into the exact recorded batchesSold (falling back to a placeholder for legacy orders), and puts a serial-tracked unit back to IN_STOCK with its warranty window cleared.
 function restoreWarehouseStock(product, qtyToRestore, batchesSold, serialSoldId) {
   const restore = Number(qtyToRestore) || 0;
   if (restore <= 0) return;
@@ -272,11 +234,7 @@ function findProductInStore(store, item) {
   });
 }
 
-/**
- * Deduct sold quantities. A composite product consumes its recipe ingredients
- * instead of its own (notional) stock, which is what keeps raw-material
- * inventory honest for bakeries and kitchens.
- */
+// A composite product consumes its recipe ingredients instead of its own (notional) stock, keeping raw-material inventory honest for bakeries/kitchens.
 function deductStock(store, items, orderId, user) {
   const shortages = [];
 
@@ -370,15 +328,7 @@ function deductStock(store, items, orderId, user) {
   return shortages;
 }
 
-/**
- * Read-only mirror of `deductStock`'s traversal (composite ingredients,
- * combo components, plain/batch/serial stock) — used only when the shop has
- * "Allow Billing Below Zero Stock" turned off, to refuse the whole checkout
- * up front. `deductStock` itself mutates as it walks the cart, so checking
- * for shortages *during* that pass would mean some lines are already
- * deducted by the time a later line is found to be short; this runs first,
- * touches nothing, and the checkout is rejected before any stock moves.
- */
+// Read-only mirror of deductStock's traversal, used only when "Allow Billing Below Zero Stock" is off — runs first and touches nothing, so the checkout is rejected before any stock moves rather than partway through deductStock's mutation.
 function findStockShortages(store, items) {
   const shortages = [];
 
@@ -420,9 +370,7 @@ function findStockShortages(store, items) {
       return;
     }
 
-    // `product.stock` is kept in sync as the true available count for every
-    // stock style this app has — plain, batch-summed (consumeBatchesFEFO)
-    // and serial-summed (recomputeSerialStock) — so one check covers all three.
+    // product.stock is kept in sync as the true available count for plain, batch-summed and serial-summed stock alike, so one check covers all three.
     if (Number(product.stock || 0) < soldQty) {
       shortages.push({ name: product.name, available: Number(product.stock || 0), needed: soldQty });
     }
@@ -450,11 +398,7 @@ router.post('/orders', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Cart is empty.' });
   }
 
-  // A negative or zero quantity (or a negative price) would flip stock deduction
-  // into an addition and quietly shrink or invert the bill total — verified live
-  // against this tenant's data: an unguarded qty:-1 line raised stock instead of
-  // lowering it and posted a -₹10 "COMPLETED" sale. Reject it before anything else
-  // in this request touches stock or the ledger.
+  // A negative/zero qty or negative price flips stock deduction into an addition and inverts the bill total — verified live: an unguarded qty:-1 line raised stock and posted a -₹10 "COMPLETED" sale.
   const badItem = (items || []).find((i) => !(Number(i.qty) > 0) || Number(i.price) < 0);
   if (badItem) {
     return res.status(400).json({
@@ -504,10 +448,7 @@ router.post('/orders', async (req, res) => {
     });
   }
 
-  /* ----------------------------- loyalty redemption -----------------------------
-   * Points come off the bill before it is posted, so the ledger, the drawer and
-   * the printed receipt all agree on what the customer actually paid.
-   */
+  // Loyalty redemption: points come off the bill before it is posted, so the ledger, the drawer and the printed receipt all agree on what the customer actually paid.
   const pos = store.settings.pos || {};
   let loyaltyRedeemed = 0;
   let pointsRedeemed = 0;
@@ -539,15 +480,12 @@ router.post('/orders', async (req, res) => {
     customer.loyaltyPoints = available - pointsRedeemed;
   }
 
-  /* ---------------------- Customer Advance / Store Credit ---------------------- */
+  // Customer Advance / Store Credit
   let advanceRedeemed = 0;
   if (customer && Number(redeemAdvanceAmount) > 0) {
     const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
     const ledgerBal = account ? engine.accountBalance(store, account.id) : 0;
-    // Trust the ledger balance alone — falling back to `customer.advance` here
-    // meant a stale/desynced stored field (e.g. after a void that never resynced
-    // it) could let a sale redeem an advance that no longer actually exists on
-    // the account, under-collecting cash for the difference.
+    // Trust the ledger balance alone — a stale customer.advance (e.g. after a void that never resynced it) could let a sale redeem an advance that no longer exists, under-collecting cash.
     const availableAdvance = Math.max(0, -ledgerBal);
     const maxApplicable = Math.max(0, r2(Number(total) - loyaltyRedeemed));
     advanceRedeemed = Math.min(r2(Number(redeemAdvanceAmount)), maxApplicable, r2(availableAdvance));
@@ -555,11 +493,7 @@ router.post('/orders', async (req, res) => {
 
   const payableTotal = r2(Math.max(0, Number(total) - loyaltyRedeemed - advanceRedeemed));
 
-  // Multi-pay / split-tender: several amounts collected across different
-  // methods (e.g. half Cash, half UPI) for the same bill. Each entry is kept
-  // as its own line in order.payments below so cash-drawer sync and the
-  // ledger split (postSale) can tell exactly how much of each method was
-  // actually collected, instead of lumping the whole total under one mode.
+  // Multi-pay/split-tender: each method's amount is kept as its own line in order.payments so cash-drawer sync and postSale's ledger split know exactly how much of each was collected.
   const splitEntries = Array.isArray(splitPayments)
     ? splitPayments
         .map((p) => ({
@@ -586,10 +520,7 @@ router.post('/orders', async (req, res) => {
   } else if (requestedStatus === 'PARTIALLY_PAID' || requestedStatus === 'PARTIAL') {
     initialPaid = Math.min(payableTotal, Math.max(0, r2(Number(req.body.paidAmount ?? req.body.amountPaid ?? 0))));
   } else if (posting.isCreditSale(paymentMethod)) {
-    // A Credit (Udhar) checkout with no explicit paidAmount/status means nothing
-    // was collected upfront — falling through to "default is full payment" here
-    // marked every plain credit sale PAID/balanceDue:0 the moment it was created,
-    // so the customer's real receivable was permanently hidden from the invoice.
+    // A Credit (Udhar) checkout with no explicit paidAmount means nothing was collected upfront — falling through to "full payment" would hide the customer's real receivable.
     initialPaid = 0;
   } else {
     // Default checkout is full payment
@@ -742,11 +673,7 @@ router.post('/orders', async (req, res) => {
     order.loyaltyBalance = customer.loyaltyPoints;
   }
 
-  // Credit only the cash actually collected — for a split payment (e.g. half
-  // Cash, half UPI) the top-level order.paymentMethod is the composite label
-  // 'Split Payment', so it no longer tells us whether cash changed hands.
-  // order.payments carries each method separately and is the source of truth
-  // everywhere else (void/delete already read it the same way).
+  // Credit only cash actually collected — a split payment's top-level order.paymentMethod is the composite label 'Split Payment', so order.payments (per-method) is the source of truth here, as void/delete already treat it.
   const cashCollected = (order.payments || [])
     .filter((p) => String(p.paymentMethod).toLowerCase() === 'cash')
     .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
@@ -933,12 +860,7 @@ router.post('/orders/:orderId/pay', async (req, res) => {
     });
   }
 
-  // Post the money actually collected to the books — Cash/Bank up, the
-  // customer's receivable down by the same amount — and resync the cached
-  // outstanding/advance fields off the resulting ledger balance. Without this
-  // the sale voucher's original AR debit was never reduced, so `/pay` moved
-  // the invoice to PAID on screen while the customer's udhar balance stayed
-  // stuck at the pre-payment figure forever.
+  // Post the money collected to the books (Cash/Bank up, receivable down) and resync outstanding/advance off the ledger — without this, /pay moved the invoice to PAID while the udhar balance stayed stuck at its pre-payment figure.
   if (order.customerId) {
     const customer = (store.customers || []).find((c) => c.id === order.customerId);
     if (customer) {
@@ -986,9 +908,7 @@ router.post('/orders/:orderId/issue', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Invoice is already issued.' });
   }
 
-  // Same guard as POST /orders — a draft can be edited via PUT before being
-  // issued, so re-check its (possibly since-edited) items here too, right
-  // before stock is deducted.
+  // Same guard as POST /orders — a draft can be edited via PUT before being issued, so re-check its (possibly since-edited) items right before stock is deducted.
   const badItem = (order.items || []).find((i) => !(Number(i.qty) > 0) || Number(i.price) < 0);
   if (badItem) {
     return res.status(400).json({
@@ -1106,14 +1026,7 @@ router.post('/orders/:orderId/issue', async (req, res) => {
   });
 });
 
-/**
- * Header/party details that are safe to correct on an already-issued
- * invoice or bill (typos, a wrong phone number, missed shipping info) without
- * touching stock or the accounting ledger. Items, quantities, prices and
- * totals are deliberately excluded here — those must go through Void or a
- * Sales Return (credit note) so stock and the books stay reconciled; see
- * LOCKED_FIELDS_ON_ISSUED below.
- */
+// Header/party details safe to correct on an issued invoice without touching stock/ledger; items, quantities, prices and totals are deliberately excluded — see LOCKED_FIELDS_ON_ISSUED below.
 const EDITABLE_DETAIL_FIELDS = [
   { key: 'customerName', label: 'Customer Name' },
   { key: 'customerPhone', label: 'Customer Phone' },
@@ -1143,9 +1056,7 @@ const EDITABLE_DETAIL_FIELDS = [
   { key: 'paymentRef', label: 'Payment Reference' }
 ];
 
-// Rejected outright on an issued invoice's details-only edit — these all feed
-// stock deduction or the ledger, so changing them here would desync inventory
-// and the books from what was actually posted at checkout.
+// Rejected outright on an issued invoice's details-only edit — these all feed stock deduction or the ledger, so changing them would desync inventory/books from what was posted at checkout.
 const LOCKED_FIELDS_ON_ISSUED = [
   'items', 'subtotal', 'tax', 'discount', 'roundOff', 'total', 'grossTotal',
   'paymentMethod', 'paidAmount', 'balanceDue', 'status', 'paymentStatus'
@@ -1366,10 +1277,7 @@ router.delete('/orders/:orderId', (req, res) => {
           try {
             engine.reverseJournal(store, v.id, actor(req));
           } catch (err) {
-            // "Already reversed" is expected when another voucher in this
-            // same chain already reversed it — anything else is a real
-            // failure that would otherwise leave stock/status changed but
-            // the ledger un-reversed with no trace anywhere.
+            // "Already reversed" is expected when another voucher in this chain already reversed it; anything else would leave stock/status changed but the ledger un-reversed untraced.
             if (err.message !== 'Voucher has already been reversed.') {
               console.error(`[Delete Invoice ${order.orderId}] Failed to reverse voucher ${v.id}:`, err.message);
             }
@@ -1491,20 +1399,14 @@ router.post('/orders/:orderId/void', (req, res) => {
       try {
         reversed.push(engine.reverseJournal(store, v.id, actor(req)).voucherNo);
       } catch (err) {
-        // "Already reversed" is expected when another voucher in this same
-        // chain already reversed it — anything else is a real failure that
-        // would otherwise leave stock restored but the ledger un-reversed
-        // with no trace anywhere.
+        // "Already reversed" is expected when another voucher in this chain already reversed it; anything else would leave stock restored but the ledger un-reversed untraced.
         if (err.message !== 'Voucher has already been reversed.') {
           console.error(`[Void ${order.orderId}] Failed to reverse voucher ${v.id}:`, err.message);
         }
       }
     });
 
-  // Deduct only the cash actually collected, not the full invoice total — a
-  // partially-paid order (rest on customer credit) tagged paymentMethod:'Cash'
-  // for its upfront tender would otherwise pull cash never physically
-  // received out of the drawer. Mirrors the DELETE /orders/:orderId handler.
+  // Deduct only the cash actually collected, not the full total — a partial order tagged paymentMethod:'Cash' would otherwise pull cash never physically received. Mirrors DELETE /orders/:orderId.
   const paidCash = (order.payments || [])
     .filter((p) => String(p.paymentMethod).toLowerCase() === 'cash')
     .reduce((sum, p) => sum + (Number(p.amount) || 0), 0) || (order.paymentMethod === 'Cash' ? Number(order.paidAmount || 0) : 0);
@@ -1526,11 +1428,7 @@ router.post('/orders/:orderId/void', (req, res) => {
     const balance = (customer.loyaltyPoints || 0) - (order.loyaltyEarned || 0) + (order.pointsRedeemed || 0);
     customer.loyaltyPoints = Math.max(0, balance);
 
-    // The journal reversal above already moved the ledger back to where it was
-    // before this sale; resync the cached outstanding/advance fields to match —
-    // otherwise they keep showing the pre-void figures (mirrors the resync
-    // /purchases/:id/void already does for vendor.outstandingPayable), and a
-    // later sale's advance-redemption check trusts these fields going stale.
+    // The journal reversal above already moved the ledger back; resync cached outstanding/advance so a later advance-redemption check doesn't trust stale pre-void figures (mirrors /purchases/:id/void).
     const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
     if (account) {
       const currentBal = engine.accountBalance(store, account.id);
@@ -1548,13 +1446,7 @@ router.post('/orders/:orderId/void', (req, res) => {
 
 /* -------------------------------- credit notes (sales returns) -------------------------------- */
 
-/**
- * Sales Credit Note — return part of a specific invoice without voiding the
- * whole thing. Mirrors `/purchases/:id/return` on the vendor side: restores
- * stock (batch-aware, composite/combo-aware, same unwind logic as void) and
- * posts a real reversing journal entry, rather than silently adjusting
- * numbers with no ledger trace.
- */
+// Sales Credit Note — returns part of an invoice without voiding it all. Mirrors /purchases/:id/return: restores stock and posts a real reversing journal entry rather than silently adjusting numbers.
 router.post('/orders/:orderId/return', (req, res) => {
   const store = req.tenantStore;
   const order = store.orders.find((o) => o.orderId === req.params.orderId);
@@ -1574,10 +1466,7 @@ router.post('/orders/:orderId/return', (req, res) => {
 
   const customer = order.customerId ? (store.customers || []).find((c) => c.id === order.customerId) : null;
 
-  // Order lines don't carry a single batchId (FEFO can spread one line across
-  // several batches), so — unlike vendor credits — returns are tracked per
-  // product line only; restoring into the specific batches happens below via
-  // the line's own recorded `batchesSold`.
+  // FEFO can spread one order line across several batches, so — unlike vendor credits — returns are tracked per product line, restoring into the line's own recorded batchesSold below.
   const alreadyCredited = (productId) =>
     (store.creditNotes || [])
       .filter((cn) => cn.orderId === order.orderId && cn.status !== 'VOID')
@@ -1656,9 +1545,7 @@ router.post('/orders/:orderId/return', (req, res) => {
           });
         });
       } else {
-        // Restore into the exact batches this line originally drew from, in
-        // the same order, up to the quantity being returned — rather than a
-        // fresh FEFO pick, which would put stock into the wrong lot.
+        // Restore into the exact batches this line originally drew from, in order, up to the returned quantity — a fresh FEFO pick would put stock into the wrong lot.
         let partialBatchesSold;
         if (product.trackBatches && Array.isArray(orderLine.batchesSold) && orderLine.batchesSold.length) {
           let remaining = baseQtyToRestore;
@@ -1851,36 +1738,128 @@ router.get('/sessions', (req, res) => {
   res.json({ success: true, data: req.tenantStore.sessions || [] });
 });
 
+const DENOM_VALUES = { '2000': 2000, '500': 500, '200': 200, '100': 100, '50': 50, '20': 20, '10': 10, coins: 1 };
+const denomTotal = (d) => {
+  if (!d || typeof d !== 'object') return 0;
+  return Object.keys(DENOM_VALUES).reduce((sum, k) => sum + (Number(d[k]) || 0) * DENOM_VALUES[k], 0);
+};
+
+// Records a lump-sum locker movement from a counter open/close (exact notes aren't known then); the note-by-note breakdown is reconciled separately via POST /company-locker/recount.
+function moveLockerCash(store, { type, amount, sessionId, note, user }) {
+  const value = r2(Math.abs(Number(amount) || 0));
+  if (value <= 0) return;
+  if (!store.companyLocker) {
+    store.companyLocker = { balance: 0, denominations: { '2000': 0, '500': 0, '200': 0, '100': 0, '50': 0, '20': 0, '10': 0, coins: 0 }, history: [] };
+  }
+  store.companyLocker.balance = r2((store.companyLocker.balance || 0) + (type === 'DEPOSIT' ? value : -value));
+  if (!Array.isArray(store.companyLocker.history)) store.companyLocker.history = [];
+  store.companyLocker.history.unshift({
+    id: `lock_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+    type,
+    amount: value,
+    balanceAfter: store.companyLocker.balance,
+    sessionId: sessionId || null,
+    note: note || '',
+    user: user || 'Owner',
+    date: new Date().toISOString()
+  });
+  if (store.companyLocker.history.length > 500) store.companyLocker.history.pop();
+}
+
+router.get('/company-locker', (req, res) => {
+  const store = req.tenantStore;
+  const locker = store.companyLocker || { balance: 0, denominations: {}, history: [] };
+  res.json({ success: true, data: locker });
+});
+
+// Physical recount: the owner counts actual notes/coins in the safe — the one place the locker's note-by-note breakdown, not just its lump balance, is ever authoritative.
+router.post('/company-locker/recount', (req, res) => {
+  const store = req.tenantStore;
+  const denominations = req.body.denominations || null;
+  if (!denominations || typeof denominations !== 'object') {
+    return res.status(400).json({ success: false, message: 'Enter the note and coin counts to record.' });
+  }
+  if (!store.companyLocker) {
+    store.companyLocker = { balance: 0, denominations: {}, history: [] };
+  }
+  const newTotal = r2(denomTotal(denominations));
+  const oldBalance = r2(store.companyLocker.balance || 0);
+  const variance = r2(newTotal - oldBalance);
+
+  store.companyLocker.balance = newTotal;
+  store.companyLocker.denominations = denominations;
+  if (!Array.isArray(store.companyLocker.history)) store.companyLocker.history = [];
+  store.companyLocker.history.unshift({
+    id: `lock_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+    type: 'RECOUNT',
+    amount: newTotal,
+    variance,
+    balanceAfter: newTotal,
+    sessionId: null,
+    note: req.body.notes || 'Physical recount',
+    user: actor(req),
+    date: new Date().toISOString()
+  });
+  if (store.companyLocker.history.length > 500) store.companyLocker.history.pop();
+
+  res.json({
+    success: true,
+    message: `Locker recount saved. ${variance === 0 ? 'Matched previous balance.' : variance > 0 ? `+₹${variance.toFixed(2)} more than expected.` : `−₹${Math.abs(variance).toFixed(2)} less than expected.`}`,
+    data: store.companyLocker
+  });
+});
+
 router.post('/session/open', (req, res) => {
   const store = req.tenantStore;
   const denominations = req.body.denominations || null;
-  let openingCash = Number(req.body.openingCash) || 0;
+  const ownerDenominations = req.body.ownerDenominations || null;
 
-  if (denominations && typeof denominations === 'object') {
-    const dTotal =
-      (Number(denominations['2000'] || 0) * 2000) +
-      (Number(denominations['500'] || 0) * 500) +
-      (Number(denominations['200'] || 0) * 200) +
-      (Number(denominations['100'] || 0) * 100) +
-      (Number(denominations['50'] || 0) * 50) +
-      (Number(denominations['20'] || 0) * 20) +
-      (Number(denominations['10'] || 0) * 10) +
-      (Number(denominations['coins'] || 0));
-    if (dTotal > 0 || openingCash === 0) {
-      openingCash = dTotal;
-    }
+  // Opening float is split between company cash (drawn from the locker) and the owner's personal contribution; each side accepts either an explicit amount or a denomination breakdown, and openingCash is always their sum (mirrors ownerCashTaken/companyCashRemaining at close).
+  const companyCashInput = req.body.companyCashInput !== undefined
+    ? r2(Math.max(0, Number(req.body.companyCashInput) || 0))
+    : (denominations && typeof denominations === 'object' ? r2(denomTotal(denominations)) : null);
+  const ownerCashInput = req.body.ownerCashInput !== undefined
+    ? r2(Math.max(0, Number(req.body.ownerCashInput) || 0))
+    : (ownerDenominations && typeof ownerDenominations === 'object' ? r2(denomTotal(ownerDenominations)) : null);
+
+  let openingCash = Number(req.body.openingCash) || 0;
+  if (!openingCash && (companyCashInput !== null || ownerCashInput !== null)) {
+    openingCash = r2((companyCashInput || 0) + (ownerCashInput || 0));
   }
 
+  const lockerBalance = r2(store.companyLocker?.balance || 0);
+  if (companyCashInput > lockerBalance + 0.009) {
+    return res.status(400).json({
+      success: false,
+      message: `Company Locker only has ₹${lockerBalance.toFixed(2)} available — can't draw ₹${companyCashInput.toFixed(2)} from it.`
+    });
+  }
+
+  const sessionId = `sess_${Date.now()}`;
+
   store.session = {
-    id: `sess_${Date.now()}`,
+    id: sessionId,
     status: 'open',
     openedAt: new Date().toISOString(),
     openedBy: req.body.user || actor(req),
     openingCash: r2(openingCash),
     currentCash: r2(openingCash),
     openingDenominations: denominations,
+    ownerDenominations,
+    companyCashInput,
+    ownerCashInput,
     cashEntries: []
   };
+
+  if (companyCashInput > 0) {
+    moveLockerCash(store, {
+      type: 'WITHDRAWAL',
+      amount: companyCashInput,
+      sessionId,
+      note: 'Counter opening float',
+      user: req.body.user || actor(req)
+    });
+  }
 
   res.json({ success: true, message: 'POS counter session opened.', data: store.session });
 });
@@ -1909,11 +1888,17 @@ router.post('/session/close', (req, res) => {
 
   const sessionOrders = (store.orders || []).filter((o) => o.sessionId === store.session.id && o.status !== 'VOID');
 
+  // Split so a shop can reconcile the owner's take separately, rather than one lump "counted cash" that hides whether the owner walked off with part of it.
+  const ownerCashTaken = r2(Math.max(0, Number(req.body.ownerCashTaken) || 0));
+  const companyCashRemaining = r2(Math.max(0, countedCash - ownerCashTaken));
+
   Object.assign(store.session, {
     status: 'closed',
     closedAt: new Date().toISOString(),
     closedBy: req.body.user || actor(req),
     countedCash: r2(countedCash),
+    ownerCashTaken,
+    companyCashRemaining,
     closingDenominations: denominations,
     expectedCash: r2(store.session.currentCash),
     variance: r2(countedCash - store.session.currentCash),
@@ -1921,6 +1906,16 @@ router.post('/session/close', (req, res) => {
     salesTotal: r2(sessionOrders.reduce((s, o) => s + (o.total || 0), 0)),
     notes: req.body.notes || ''
   });
+
+  if (companyCashRemaining > 0) {
+    moveLockerCash(store, {
+      type: 'DEPOSIT',
+      amount: companyCashRemaining,
+      sessionId: store.session.id,
+      note: 'Counter closing — remainder stored',
+      user: req.body.user || actor(req)
+    });
+  }
 
   store.sessions.unshift({ ...store.session });
 
@@ -1955,11 +1950,7 @@ router.post('/session/cash-entry', async (req, res) => {
     vendorObj = (store.vendors || []).find((v) => v.id === vendorId || (v.name && person && v.name.toLowerCase() === person.toLowerCase())) || null;
   }
 
-  // There's no such thing as "unofficial" cash — every rupee that lands in the
-  // drawer from someone who isn't already a known customer/vendor gets that
-  // person turned into a real customer (matched by phone if they've paid in
-  // before) so the money always has a party, a ledger account and a paper
-  // trail behind it, instead of a free-text name nobody can look up later.
+  // No "unofficial" cash: an unknown payer gets turned into a real customer (matched by phone if seen before) so the money always has a party and ledger account, not just a free-text name.
   let newlyCreatedCustomer = false;
   if (!customerObj && !vendorObj && partyType === 'OTHER' && effectiveType === 'IN' && String(phone || '').trim()) {
     const cleanPhone = String(phone).trim();
@@ -2031,9 +2022,7 @@ router.post('/session/cash-entry', async (req, res) => {
   store.session.cashEntries.push(entry);
 
   let voucherNo = null;
-  // Every cash movement — customer receipt, vendor settlement, expense, or a
-  // plain fund transfer — posts to the double-entry ledger. There's no more
-  // "unofficial" bucket that skips the books.
+  // Every cash movement posts to the double-entry ledger — no "unofficial" bucket skips the books.
   try {
     const cash = engine.bySystemKey(store, 'CASH');
     if (customerObj && effectiveType === 'IN') {
@@ -2082,15 +2071,16 @@ router.post('/session/cash-entry', async (req, res) => {
         vendorObj.outstanding = r2((vendorObj.outstanding || 0) - value);
       }
     } else if (isExpense) {
-      const expenseAcc = (store.accounts || []).find((a) => a.type === 'EXPENSE') || { id: 'acc_gen_expense' };
-      const voucher = posting.postDirectExpense(
+      const expenseAcc = (store.accounts || []).find((a) => a.type === 'EXPENSE' && !a.isGroup);
+      const voucher = posting.postExpense(
         store,
         {
           id: `exp_${Date.now()}`,
-          accountId: expenseAcc.id,
-          paidFromAccountId: cash.id,
+          accountId: expenseAcc?.id,
+          systemKey: expenseAcc ? undefined : 'STORE_SUPPLIES',
           amount: value,
-          taxAmount: 0,
+          tax: 0,
+          paymentMode: 'Cash',
           notes: `${expenseCategory ? `[${expenseCategory}] ` : ''}${entry.purpose} (Recipient: ${person || 'N/A'})`,
           date: new Date().toISOString()
         },
@@ -2099,7 +2089,9 @@ router.post('/session/cash-entry', async (req, res) => {
       voucherNo = voucher.voucherNo;
     } else {
       const bank = (store.accounts || []).find((a) => a.systemKey === 'BANK');
-      const counter = accountId ? engine.resolveAccount(store, accountId) : bank;
+      // No customer/vendor/expense and no explicit or bank account — treat as the owner's own capital injection (IN) or drawing (OUT) so it always reaches the books rather than silently skipping the ledger.
+      const equityFallback = engine.bySystemKey(store, effectiveType === 'IN' ? 'CAPITAL' : 'DRAWINGS');
+      const counter = accountId ? engine.resolveAccount(store, accountId) : (bank || equityFallback);
       if (counter && counter.id !== cash.id) {
         const voucher = posting.postFundTransfer(
           store,
@@ -2118,7 +2110,8 @@ router.post('/session/cash-entry', async (req, res) => {
       }
     }
   } catch (err) {
-    /* the drawer entry still stands even if double-entry posting fails */
+    // The drawer entry still stands even if double-entry posting fails, but log it — a silently-null voucherNo previously hid a real bug here.
+    console.error('[session/cash-entry] ledger posting failed:', err.message);
   }
 
   res.json({
@@ -2231,9 +2224,7 @@ router.post('/tables/merge', (req, res) => {
   res.json({ success: true, message: `${source.name} merged into ${target.name}.`, data: targetBill });
 });
 
-/* ------------------------------------------------------------------ *
- * Quotations / Estimates
- * ------------------------------------------------------------------ */
+// Quotations / Estimates
 
 router.get('/quotations', (req, res) => {
   const store = req.tenantStore;
@@ -2294,10 +2285,7 @@ router.post('/quotations', (req, res) => {
 
   const billing = store.settings.billing || {};
   const year = new Date().getFullYear();
-  // A count of the live array collides once any quotation is deleted (its slot's
-  // number gets reissued to the next one created) — verified live: create 3, delete
-  // #2, create another, and the new one reuses #2's number. A monotonic counter
-  // persisted on settings, mirroring invoice numbering, can't go backwards.
+  // A count of the live array would reissue a deleted quotation's number to the next one created (verified live) — a monotonic counter persisted on settings, mirroring invoice numbering, can't go backwards.
   const nextNo = Number(billing.nextQuotationNo) || 1001;
   billing.nextQuotationNo = nextNo + 1;
   const quotationNo = `QT-${year}-${String(nextNo).padStart(4, '0')}`;
@@ -2361,9 +2349,7 @@ router.put('/quotations/:id', (req, res) => {
   const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id);
   if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
 
-  // A converted quotation's numbers were already carried onto a real, posted
-  // invoice — editing them afterward would silently desync the two records with
-  // nothing to signal the mismatch, so the quotation is frozen once converted.
+  // Converted quotation's numbers already carried onto a real posted invoice — editing them after would silently desync the two records, so it's frozen once converted.
   if (quotation.status === 'CONVERTED') {
     return res.status(400).json({
       success: false,
@@ -2420,9 +2406,7 @@ router.delete('/quotations/:id', (req, res) => {
   const quotation = (store.quotations || []).find((qt) => qt.id === req.params.id || qt.quotationNo === req.params.id);
   if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
 
-  // Once converted, the quotation is the audit trail back to a real posted
-  // invoice (see the PUT guard above) — deleting it would sever that trail while
-  // leaving the invoice's "Converted from Quotation ..." note pointing at nothing.
+  // Once converted, the quotation is the audit trail back to the invoice — deleting it would leave the invoice's "Converted from Quotation ..." note pointing at nothing.
   if (quotation.status === 'CONVERTED') {
     return res.status(400).json({
       success: false,
@@ -2494,11 +2478,7 @@ router.post('/quotations/:id/convert', async (req, res) => {
     cashier: actor(req),
     sessionId: store.session?.id || null,
     date: new Date().toISOString(),
-    // A quotation conversion has no partial/credit option in the UI — it's
-    // always settled in full at conversion time (see the cash-drawer credit
-    // below). Without paidAmount/balanceDue/paymentStatus, the invoice list's
-    // paid/due derivation (which reads those fields, not `status`) treated
-    // every converted invoice as fully UNPAID.
+    // Conversion always settles in full — the invoice list's paid/due derivation reads paidAmount/balanceDue/paymentStatus, not `status`, so these must be set or every converted invoice shows as UNPAID.
     status: 'COMPLETED',
     paymentStatus: 'PAID',
     paidAmount: quotation.total,

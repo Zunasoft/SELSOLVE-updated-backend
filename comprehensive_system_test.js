@@ -138,7 +138,7 @@ async function runAllTests() {
    * SECTION 2: Category Management & Color Theme Customization
    * ------------------------------------------------------------------ */
   section('SECTION 2: Category Management with Distinct Colors');
-  
+
   // 1. Create Bakery category with Orange color
   const catBakery = await request('POST', '/categories', {
     name: 'Bakery & Fresh Breads',

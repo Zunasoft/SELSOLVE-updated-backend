@@ -1,12 +1,4 @@
-/**
- * Double-entry accounting engine.
- *
- * Every financial event in Selsolve — a POS sale, a purchase invoice, an
- * expense, a receipt, a fund transfer, an opening balance — becomes a balanced
- * journal voucher here. Nothing mutates an account balance directly; balances
- * are always derived from the journal, which keeps the books auditable and
- * makes every report reproducible from the same source of truth.
- */
+// Nothing mutates an account balance directly; every balance is derived from the journal so the books stay auditable and reports are reproducible.
 
 const { NORMAL_SIDE, buildChartOfAccounts, accountId } = require('./coa');
 
@@ -27,10 +19,7 @@ const VOUCHER_PREFIX = {
   STOCK: 'STK'
 };
 
-/* ------------------------------------------------------------------ *
- * Store bootstrap
- * ------------------------------------------------------------------ */
-
+// Store bootstrap
 /** Attach accounting collections to a tenant store (idempotent). */
 function ensureAccounting(store) {
   if (!store.accounts || store.accounts.length === 0) {
@@ -48,10 +37,7 @@ function nextVoucherNo(store, type) {
   return `${prefix}-${String(store.voucherCounters[prefix]).padStart(5, '0')}`;
 }
 
-/* ------------------------------------------------------------------ *
- * Account lookup helpers
- * ------------------------------------------------------------------ */
-
+// Account lookup helpers
 const getAccount = (store, id) => (store.accounts || []).find((a) => a.id === id) || null;
 
 const bySystemKey = (store, key) => (store.accounts || []).find((a) => a.systemKey === key) || null;
@@ -77,11 +63,7 @@ function accountTreeIds(store, id) {
   return out;
 }
 
-/**
- * Party sub-ledgers live under Accounts Receivable / Accounts Payable so that
- * every customer and vendor has a real ledger account, not just a number on a
- * row. Created on demand the first time a party is transacted with.
- */
+// Party sub-ledgers live under AR/AP so every customer/vendor has a real ledger account; created on demand on first transaction.
 function ensurePartyAccount(store, party, partyType) {
   ensureAccounting(store);
   const existing = (store.accounts || []).find(
@@ -149,16 +131,8 @@ function createAccount(store, payload) {
   return account;
 }
 
-/* ------------------------------------------------------------------ *
- * Journal posting
- * ------------------------------------------------------------------ */
-
-/**
- * Post a balanced voucher. Lines with a zero net effect are dropped so callers
- * can pass optional legs (GST, discount, rounding) without pre-filtering.
- * Throws when debits and credits disagree — an unbalanced book is never worth
- * saving, so the caller must fix the entry rather than silently absorb it.
- */
+// Journal posting
+// Zero-net lines are dropped so callers can pass optional legs (GST, discount, rounding) unfiltered; throws on imbalance rather than silently absorbing it.
 function postJournal(store, entry) {
   ensureAccounting(store);
 
@@ -252,9 +226,7 @@ function reverseJournal(store, voucherId, createdBy) {
   return reversal;
 }
 
-/* ------------------------------------------------------------------ *
- * Balances & ledgers
- * ------------------------------------------------------------------ */
+// Balances & ledgers
 
 const dayKey = (d) => {
   if (!d) return '';
@@ -296,11 +268,7 @@ function accountMovements(store, { from, to } = {}) {
   return map;
 }
 
-/**
- * Signed balance in the account's own natural direction: positive means the
- * account sits on its normal side (a customer who owes you, cash you hold).
- * Rolls up children so group accounts report a meaningful total.
- */
+// Signed balance in the account's own normal direction (positive = normal side, e.g. a customer who owes you); rolls up children for group totals.
 function accountBalance(store, id, { from, to } = {}) {
   const account = getAccount(store, id);
   if (!account) return 0;
@@ -334,6 +302,8 @@ function accountLedger(store, id, { from, to } = {}) {
 
   const rows = [];
   let opening = 0;
+  // `opening` is the date-filtered carry-forward; `openingBalance` tracks the account's actual day-one balance from the OPENING journal entry, unaffected by any date filter.
+  let openingBalance = 0;
 
   const sorted = [...(store.journal || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
 
@@ -341,6 +311,10 @@ function accountLedger(store, id, { from, to } = {}) {
     v.lines.forEach((l) => {
       if (!ids.has(l.accountId)) return;
       const signed = isDebitNormal ? l.debit - l.credit : l.credit - l.debit;
+
+      if (v.refType === 'OPENING_BALANCE') {
+        openingBalance += signed;
+      }
 
       if (from && dayKey(v.date) < dayKey(from)) {
         opening += signed;
@@ -373,6 +347,7 @@ function accountLedger(store, id, { from, to } = {}) {
     account,
     normalSide: isDebitNormal ? 'DR' : 'CR',
     opening: r2(opening),
+    openingBalance: r2(openingBalance),
     closing: running,
     totalDebit: r2(entries.reduce((s, e) => s + e.debit, 0)),
     totalCredit: r2(entries.reduce((s, e) => s + e.credit, 0)),
@@ -380,9 +355,7 @@ function accountLedger(store, id, { from, to } = {}) {
   };
 }
 
-/* ------------------------------------------------------------------ *
- * Financial statements
- * ------------------------------------------------------------------ */
+// Financial statements
 
 /** Trial balance across every posting account, with a balanced-books check. */
 function trialBalance(store, { from, to } = {}) {
@@ -474,10 +447,7 @@ function profitAndLoss(store, { from, to } = {}) {
   };
 }
 
-/**
- * Balance Sheet as at a date. Current-period profit is folded into equity so
- * the statement balances without requiring a year-end closing entry.
- */
+// Current-period profit is folded into equity so the sheet balances without a year-end closing entry.
 function balanceSheet(store, { asOf } = {}) {
   const to = asOf || new Date().toISOString();
 
@@ -522,11 +492,7 @@ const liquidAccounts = (store) =>
     (a) => !a.isGroup && (a.systemKey === 'CASH' || a.systemKey === 'BANK' || a.isLiquid)
   );
 
-/**
- * Cash Flow — direct method. Every voucher touching a cash or bank ledger is
- * classified by the counter-leg it faces, which keeps the statement honest
- * without asking the user to tag anything.
- */
+// Direct method: each voucher touching cash/bank is classified by its counter-leg, so no manual tagging is needed.
 function cashFlow(store, { from, to } = {}) {
   const liquidIds = new Set(liquidAccounts(store).map((a) => a.id));
 

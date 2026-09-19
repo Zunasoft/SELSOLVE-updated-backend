@@ -93,7 +93,7 @@ router.put('/settings/:section', async (req, res) => {
         'loyaltyMinRedeemPoints',
         'loyaltyMaxRedeemPercent'
       ];
-      
+
       const otherSection = section === 'loyalty' ? 'pos' : 'loyalty';
       if (!store.settings[otherSection]) store.settings[otherSection] = {};
 
