@@ -42,7 +42,7 @@ const isCreditSale = (mode) => String(mode || '').toLowerCase().includes('credit
 
 // Sales
 // Dr Cash/Bank/Customer + Discount Allowed = Cr Sales + GST Payable +/- Rounding Off.
-function postSale(store, order, { customer, interState = false, createdBy } = {}) {
+function postSale(store, order, { customer, interState = false, createdBy, note } = {}) {
   const subtotal = r2(order.subtotal);
   const discount = r2(order.discount);
   const tax = r2(order.tax);
@@ -139,7 +139,7 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
   const voucher = postJournal(store, {
     type: 'SALES',
     date: order.date,
-    narration: `Sale ${order.orderId} — ${order.customerName || 'Walk-in Customer'} (${order.paymentMethod})`,
+    narration: `Sale ${order.orderId} — ${order.customerName || 'Walk-in Customer'} (${order.paymentMethod})${note ? ` — ${note}` : ''}`,
     refType: 'ORDER',
     refId: order.orderId,
     partyId,
@@ -163,7 +163,7 @@ function postSale(store, order, { customer, interState = false, createdBy } = {}
     cogsVoucher = postJournal(store, {
       type: 'SALES',
       date: order.date,
-      narration: `Cost of goods sold for ${order.orderId}`,
+      narration: `Cost of goods sold for ${order.orderId}${note ? ` — ${note}` : ''}`,
       refType: 'ORDER_COGS',
       refId: order.orderId,
       createdBy,
@@ -240,7 +240,7 @@ function postSalesReturn(store, creditNote, { customer, interState = false, crea
 
 // Purchases
 // Dr Stock in Hand + GST Input Credit = Cr Vendor (or Cash/Bank).
-function postPurchase(store, purchase, { vendor, interState = false, createdBy } = {}) {
+function postPurchase(store, purchase, { vendor, interState = false, createdBy, note } = {}) {
   const taxable = r2(purchase.subtotal ?? purchase.totalAmount);
   const tax = r2(purchase.tax);
   const total = r2(purchase.totalAmount ?? taxable + tax);
@@ -280,7 +280,7 @@ function postPurchase(store, purchase, { vendor, interState = false, createdBy }
   return postJournal(store, {
     type: 'PURCHASE',
     date: purchase.date,
-    narration: `Purchase ${purchase.invoiceNo} — ${purchase.vendorName || 'Vendor'}`,
+    narration: `Purchase ${purchase.invoiceNo} — ${purchase.vendorName || 'Vendor'}${note ? ` — ${note}` : ''}`,
     refType: 'PURCHASE',
     refId: purchase.id,
     partyId,

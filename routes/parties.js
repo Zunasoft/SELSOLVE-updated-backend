@@ -1089,13 +1089,44 @@ const PURCHASE_EDITABLE_DETAIL_FIELDS = [
   { key: 'buyerOrderDate', label: 'Buyer Order Date' }
 ];
 
-// Rejected outright on a details-only edit — these feed stock received at invoice cost or the ledger, so changing them would desync inventory/books from what was posted on receipt.
+// Rejected outright on a purchase edit — payment fields must go through the vendor payment flows, not a silent overwrite here.
 const PURCHASE_LOCKED_FIELDS = [
-  'items', 'subtotal', 'tax', 'discount', 'roundOff', 'totalAmount', 'additionalCharges',
   'paymentMode', 'paymentStatus', 'paidAmount', 'settlementAccountId', 'status', 'vendorId', 'poId'
 ];
 
-function logPurchaseEdit(store, purchase, changes, user) {
+// Diffs old vs new purchase lines by productId (falling back to name) — mirrors buildItemDiffs in routes/sales.js.
+function buildPurchaseItemDiffs(oldItems, newItems) {
+  const changes = [];
+  const oldByKey = new Map();
+  (oldItems || []).forEach((it) => oldByKey.set(it.productId || it.name, it));
+  const matchedOldKeys = new Set();
+
+  (newItems || []).forEach((newIt) => {
+    const key = newIt.productId || newIt.name;
+    const oldIt = oldByKey.get(key);
+    if (!oldIt) {
+      changes.push({ field: `item:${key}`, label: `Item: ${newIt.name}`, oldValue: '—', newValue: `Added — Qty ${newIt.qty} @ ₹${newIt.rate}` });
+      return;
+    }
+    matchedOldKeys.add(key);
+    [['qty', 'Qty'], ['rate', 'Rate'], ['taxRate', 'Tax %']].forEach(([f, label]) => {
+      if (Number(oldIt[f] || 0) !== Number(newIt[f] || 0)) {
+        changes.push({ field: `item:${key}:${f}`, label: `Item: ${newIt.name} — ${label}`, oldValue: oldIt[f], newValue: newIt[f] });
+      }
+    });
+  });
+
+  (oldItems || []).forEach((oldIt) => {
+    const key = oldIt.productId || oldIt.name;
+    if (!matchedOldKeys.has(key)) {
+      changes.push({ field: `item:${key}`, label: `Item: ${oldIt.name}`, oldValue: `Qty ${oldIt.qty} @ ₹${oldIt.rate}`, newValue: 'Removed' });
+    }
+  });
+
+  return changes;
+}
+
+function logPurchaseEdit(store, purchase, changes, user, reason) {
   if (!changes.length) return null;
   const now = new Date().toISOString();
   const entry = {
@@ -1103,6 +1134,7 @@ function logPurchaseEdit(store, purchase, changes, user) {
     purchaseId: purchase.id,
     editedBy: user,
     editedAt: now,
+    reason: reason || undefined,
     changes
   };
 
@@ -1133,26 +1165,175 @@ router.put('/purchases/:id', (req, res) => {
   if (lockedKeysPresent.length > 0) {
     return res.status(400).json({
       success: false,
-      message: `Items and amounts on a received purchase can't be edited directly — void the purchase or raise a Return instead. (Blocked field${lockedKeysPresent.length > 1 ? 's' : ''}: ${lockedKeysPresent.join(', ')})`
+      message: `Payment details on a received purchase can't be edited directly — use the vendor payment flows instead. (Blocked field${lockedKeysPresent.length > 1 ? 's' : ''}: ${lockedKeysPresent.join(', ')})`
     });
   }
 
-  const changes = [];
+  const user = actor(req);
+  let itemChanges = [];
+  let amountChanges = [];
+
+  if (Array.isArray(req.body.items)) {
+    const newLinesRaw = req.body.items;
+    if (newLinesRaw.length === 0) {
+      return res.status(400).json({ success: false, message: 'A purchase must have at least one item.' });
+    }
+    const fractionalLine = newLinesRaw.find((i) => {
+      const unit = i.unit || 'pcs';
+      const qty = Number(i.qty);
+      return isWholeNumberUnit(unit) && Number.isFinite(qty) && qty % 1 !== 0;
+    });
+    if (fractionalLine) {
+      return res.status(400).json({
+        success: false,
+        message: `"${fractionalLine.name || 'Item'}" is received in ${fractionalLine.unit} — quantity must be a whole number.`
+      });
+    }
+
+    const oldItems = purchase.items || [];
+
+    // Serial/batch-tracked lines are excluded from item editing — serials may already be sold and batches may already be partially consumed by the time an edit happens, so unwinding them safely isn't a simple restore/re-add. Void + re-enter instead for these.
+    const trackedNames = [...oldItems, ...newLinesRaw]
+      .map((line) => store.products.find((p) => p.id === line.productId))
+      .filter((p) => p && (p.trackBatches || p.trackSerials))
+      .map((p) => p.name);
+    if (trackedNames.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Can't edit items on this purchase — it involves serial/batch-tracked product(s) (${[...new Set(trackedNames)].join(', ')}). Void the purchase and re-enter it instead.`
+      });
+    }
+
+    const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+
+    // Restore stock for the old items first (mirrors /purchases/:id/void's plain-stock branch).
+    oldItems.forEach((line) => {
+      const product = store.products.find((p) => p.id === line.productId);
+      if (!product) return;
+      const qty = baseQty(product, { unit: line.unit, qty: Number(line.qty) || 0 });
+      product.stock = r2(Number(product.stock || 0) - qty);
+      if (product.warehouses && typeof product.warehouses === 'object') {
+        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - qty);
+        product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      }
+      logStockMovement(store, { product, type: 'RETURN', qtyChange: -qty, reason: `Edit of purchase ${purchase.invoiceNo} (previous items removed)`, refId: purchase.id, user });
+    });
+
+    // Reverse every journal voucher tied to this purchase before reposting the corrected amounts.
+    (store.journal || [])
+      .filter((v) => v.refId === purchase.id && !v.isReversed && !v.reversalOf)
+      .forEach((v) => {
+        try {
+          engine.reverseJournal(store, v.id, user);
+        } catch (err) {
+          if (err.message !== 'Voucher has already been reversed.') {
+            console.error(`[Edit purchase ${purchase.id}] Failed to reverse voucher ${v.id}:`, err.message);
+          }
+        }
+      });
+
+    const newSubtotal = req.body.subtotal !== undefined ? r2(req.body.subtotal) : purchase.subtotal;
+    const newTax = req.body.tax !== undefined ? r2(req.body.tax) : purchase.tax;
+    const newDiscount = req.body.discount !== undefined ? r2(req.body.discount) : purchase.discount;
+    const newRoundOff = req.body.roundOff !== undefined ? r2(req.body.roundOff) : purchase.roundOff;
+    const newTotal = req.body.totalAmount !== undefined ? r2(req.body.totalAmount) : r2(newSubtotal + newTax);
+    const totalAdditionalCharges = purchase.totalAdditionalCharges || 0;
+
+    const newLines = newLinesRaw.map((line) => {
+      let product = store.products.find((p) => p.id === line.productId || (line.name && p.name.toLowerCase() === String(line.name).toLowerCase()));
+      if (!product && line.name) {
+        const rate = Number(line.rate) || 0;
+        product = shapeProduct(store, {
+          name: line.name, unit: line.unit || 'pcs', hsn: line.hsn || '', taxRate: Number(line.taxRate) || 0,
+          purchasePrice: rate, price: rate > 0 ? Math.round(rate / 0.7) : 0, stock: 0
+        }, null, user);
+        store.products.unshift(product);
+        line.productId = product.id;
+      }
+      if (!product) return { ...line };
+
+      const qty = baseQty(product, { unit: line.unit, qty: Number(line.qty) });
+      const lineValue = Number(line.qty) * Number(line.rate || 0);
+      const allocatedCharge = totalAdditionalCharges > 0
+        ? (newSubtotal > 0 ? r2(totalAdditionalCharges * (lineValue / newSubtotal)) : r2(totalAdditionalCharges / newLinesRaw.length))
+        : 0;
+      const costPerBaseUnit = qty > 0 ? r2((lineValue + allocatedCharge) / qty) : Number(line.rate) || 0;
+
+      product.stock = r2(Number(product.stock || 0) + qty);
+      if (product.warehouses && typeof product.warehouses === 'object') {
+        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) + qty);
+        product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
+      }
+      if (line.sellPrice !== undefined && line.sellPrice !== '' && Number(line.sellPrice) > 0) {
+        product.price = Number(line.sellPrice);
+      }
+      if (costPerBaseUnit) product.purchasePrice = costPerBaseUnit;
+
+      logStockMovement(store, { product, type: 'PURCHASE', qtyChange: qty, reason: `Edit of purchase ${purchase.invoiceNo} (updated items received)`, refId: purchase.id, user });
+
+      return {
+        productId: product.id,
+        name: line.name || product.name,
+        hsn: line.hsn || product.hsn || '',
+        qty: Number(line.qty) || 0,
+        unit: line.unit || 'pcs',
+        rate: Number(line.rate) || 0,
+        taxRate: Number(line.taxRate) || 0,
+        total: Number(line.total) || 0
+      };
+    });
+
+    itemChanges = buildPurchaseItemDiffs(oldItems, newLines);
+
+    if (purchase.subtotal !== newSubtotal) amountChanges.push({ field: 'subtotal', label: 'Subtotal', oldValue: purchase.subtotal, newValue: newSubtotal });
+    if (purchase.tax !== newTax) amountChanges.push({ field: 'tax', label: 'Tax', oldValue: purchase.tax, newValue: newTax });
+    if (purchase.discount !== newDiscount) amountChanges.push({ field: 'discount', label: 'Discount', oldValue: purchase.discount, newValue: newDiscount });
+    if (purchase.totalAmount !== newTotal) amountChanges.push({ field: 'totalAmount', label: 'Total', oldValue: purchase.totalAmount, newValue: newTotal });
+
+    purchase.items = newLines;
+    purchase.subtotal = newSubtotal;
+    purchase.tax = newTax;
+    purchase.discount = newDiscount;
+    purchase.roundOff = newRoundOff;
+    purchase.totalAmount = newTotal;
+
+    const vendor = purchase.vendorId ? store.vendors.find((v) => v.id === purchase.vendorId) : null;
+    try {
+      const voucher = posting.postPurchase(store, purchase, {
+        vendor,
+        interState: store.settings.tax.interState,
+        createdBy: user,
+        note: 'Purchase edit correction'
+      });
+      purchase.voucherId = voucher.id;
+      purchase.voucherNo = voucher.voucherNo;
+    } catch (err) {
+      purchase.accountingError = err.message;
+    }
+
+    if (vendor) {
+      const account = (store.accounts || []).find((a) => a.partyId === vendor.id && a.partyType === 'VENDOR');
+      if (account) vendor.outstandingPayable = Math.max(0, engine.accountBalance(store, account.id));
+    }
+  }
+
+  const headerChanges = [];
   PURCHASE_EDITABLE_DETAIL_FIELDS.forEach(({ key, label }) => {
     if (req.body[key] === undefined) return;
     const oldValue = purchase[key] ?? '';
     const newValue = req.body[key] ?? '';
     if (String(oldValue) !== String(newValue)) {
-      changes.push({ field: key, label, oldValue, newValue });
+      headerChanges.push({ field: key, label, oldValue, newValue });
       purchase[key] = req.body[key];
     }
   });
 
-  if (changes.length > 0) logPurchaseEdit(store, purchase, changes, actor(req));
+  const allChanges = [...itemChanges, ...amountChanges, ...headerChanges];
+  if (allChanges.length > 0) logPurchaseEdit(store, purchase, allChanges, user, req.body.changeReason);
 
   res.json({
     success: true,
-    message: changes.length > 0 ? `Purchase ${purchase.invoiceNo} details updated.` : 'No changes to save.',
+    message: allChanges.length > 0 ? `Purchase ${purchase.invoiceNo} updated${itemChanges.length || amountChanges.length ? ' and re-posted to the ledger' : ''}.` : 'No changes to save.',
     data: purchase
   });
 });

@@ -1026,7 +1026,7 @@ router.post('/orders/:orderId/issue', async (req, res) => {
   });
 });
 
-// Header/party details safe to correct on an issued invoice without touching stock/ledger; items, quantities, prices and totals are deliberately excluded — see LOCKED_FIELDS_ON_ISSUED below.
+// Header/party details safe to correct on an issued invoice. Items/amounts are also editable (handled separately below, since they require reversing/reposting the ledger and restoring/rededucting stock) — only payment fields stay locked, see LOCKED_FIELDS_ON_ISSUED.
 const EDITABLE_DETAIL_FIELDS = [
   { key: 'customerName', label: 'Customer Name' },
   { key: 'customerPhone', label: 'Customer Phone' },
@@ -1056,14 +1056,45 @@ const EDITABLE_DETAIL_FIELDS = [
   { key: 'paymentRef', label: 'Payment Reference' }
 ];
 
-// Rejected outright on an issued invoice's details-only edit — these all feed stock deduction or the ledger, so changing them would desync inventory/books from what was posted at checkout.
+// Rejected outright on an issued invoice's edit — how much was actually collected/how it's tracked must go through dedicated payment flows, not a silent overwrite here.
 const LOCKED_FIELDS_ON_ISSUED = [
-  'items', 'subtotal', 'tax', 'discount', 'roundOff', 'total', 'grossTotal',
   'paymentMethod', 'paidAmount', 'balanceDue', 'status', 'paymentStatus'
 ];
 
+// Diffs old vs new item lines by id (falling back to name) so an item edit describes exactly what changed per line, not just a before/after items blob.
+function buildItemDiffs(oldItems, newItems) {
+  const changes = [];
+  const oldByKey = new Map();
+  (oldItems || []).forEach((it) => oldByKey.set(it.id || it.name, it));
+  const matchedOldKeys = new Set();
+
+  (newItems || []).forEach((newIt) => {
+    const key = newIt.id || newIt.name;
+    const oldIt = oldByKey.get(key);
+    if (!oldIt) {
+      changes.push({ field: `item:${key}`, label: `Item: ${newIt.name}`, oldValue: '—', newValue: `Added — Qty ${newIt.qty} @ ₹${newIt.price}` });
+      return;
+    }
+    matchedOldKeys.add(key);
+    [['qty', 'Qty'], ['price', 'Rate'], ['taxRate', 'Tax %'], ['discount', 'Discount']].forEach(([f, label]) => {
+      if (Number(oldIt[f] || 0) !== Number(newIt[f] || 0)) {
+        changes.push({ field: `item:${key}:${f}`, label: `Item: ${newIt.name} — ${label}`, oldValue: oldIt[f], newValue: newIt[f] });
+      }
+    });
+  });
+
+  (oldItems || []).forEach((oldIt) => {
+    const key = oldIt.id || oldIt.name;
+    if (!matchedOldKeys.has(key)) {
+      changes.push({ field: `item:${key}`, label: `Item: ${oldIt.name}`, oldValue: `Qty ${oldIt.qty} @ ₹${oldIt.price}`, newValue: 'Removed' });
+    }
+  });
+
+  return changes;
+}
+
 /** Records a field-level diff on the order (for its own "Edited" history) and the tenant-wide edit log. */
-function logInvoiceEdit(store, order, changes, user) {
+function logInvoiceEdit(store, order, changes, user, reason) {
   if (!changes.length) return null;
   const now = new Date().toISOString();
   const entry = {
@@ -1071,6 +1102,7 @@ function logInvoiceEdit(store, order, changes, user) {
     orderId: order.orderId,
     editedBy: user,
     editedAt: now,
+    reason: reason || undefined,
     changes
   };
 
@@ -1102,26 +1134,192 @@ router.put('/orders/:orderId', (req, res) => {
     if (lockedKeysPresent.length > 0) {
       return res.status(400).json({
         success: false,
-        message: `Items and amounts on an issued invoice can't be edited directly — void the invoice or raise a Sales Return (credit note) instead. (Blocked field${lockedKeysPresent.length > 1 ? 's' : ''}: ${lockedKeysPresent.join(', ')})`
+        message: `Payment details on an issued invoice can't be edited directly — use Record Payment or the payment status actions instead. (Blocked field${lockedKeysPresent.length > 1 ? 's' : ''}: ${lockedKeysPresent.join(', ')})`
       });
     }
 
-    const changes = [];
+    const user = actor(req);
+    let itemChanges = [];
+    let amountChanges = [];
+
+    if (Array.isArray(req.body.items)) {
+      const newItemsRaw = req.body.items;
+      if (newItemsRaw.length === 0) {
+        return res.status(400).json({ success: false, message: 'An invoice must have at least one item.' });
+      }
+      const badItem = newItemsRaw.find((i) => !(Number(i.qty) > 0) || Number(i.price) < 0);
+      if (badItem) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid quantity or price for "${badItem.name || badItem.id || 'item'}". Quantity must be greater than zero and price cannot be negative.`
+        });
+      }
+      const fractionalItem = findFractionalQtyItem(newItemsRaw);
+      if (fractionalItem) {
+        return res.status(400).json({
+          success: false,
+          message: `"${fractionalItem.name || fractionalItem.id || 'Item'}" is billed in ${fractionalItem.unit || fractionalItem.saleUnit} — quantity must be a whole number.`
+        });
+      }
+
+      const oldItems = order.items || [];
+
+      // Restore stock for the old items first (mirrors /orders/:orderId/void's restore loop) so the shortage check below sees true availability.
+      oldItems.forEach((item) => {
+        const product = findProductInStore(store, item);
+        if (!product) return;
+        const soldQty = baseQty(product, item);
+        const isComposite = product.isComposite || product.productType === 'composite';
+        const recipe = (store.recipes || []).find((r) => r.productId === product.id);
+        const ingredients = recipe?.ingredients || product.recipe?.ingredients || product.recipeItems || [];
+
+        if (isComposite && ingredients.length > 0) {
+          const yieldQty = Number(recipe?.yieldQty) || Number(product.recipeYieldQty) || 1;
+          ingredients.forEach((ing) => {
+            const raw = store.products.find((p) => p.id === ing.productId || (p.name && ing.name && p.name.trim().toLowerCase() === ing.name.trim().toLowerCase()));
+            if (!raw) return;
+            const reqPerUnit = (Number(ing.qty) || 0) / yieldQty;
+            const returned = Math.round(reqPerUnit * soldQty * 10000) / 10000;
+            restoreWarehouseStock(raw, returned);
+            logStockMovement(store, { product: raw, type: 'RETURN', qtyChange: returned, reason: `Edit of ${order.orderId} (restored from ${product.name})`, refId: order.orderId, user });
+          });
+          return;
+        }
+
+        const isCombo = product.isCombo || product.productType === 'combo';
+        const comboItems = product.comboItems || product.bundleItems || [];
+        if (isCombo && comboItems.length > 0) {
+          comboItems.forEach((ci) => {
+            const comp = store.products.find((p) => p.id === ci.productId || p.id === ci.id);
+            if (!comp) return;
+            const compQty = Number(ci.qty || ci.quantity || 1);
+            const returned = Math.round(compQty * soldQty * 10000) / 10000;
+            restoreWarehouseStock(comp, returned);
+            logStockMovement(store, { product: comp, type: 'RETURN', qtyChange: returned, reason: `Edit of ${order.orderId} (restored from combo ${product.name})`, refId: order.orderId, user });
+          });
+          return;
+        }
+
+        restoreWarehouseStock(product, soldQty, item.batchesSold, item.serialId);
+        logStockMovement(store, { product, type: 'RETURN', qtyChange: soldQty, reason: `Edit of ${order.orderId} (previous items restored)`, refId: order.orderId, user });
+      });
+
+      if (negativeStockBlocked(store)) {
+        const preCheckShortages = findStockShortages(store, newItemsRaw);
+        if (preCheckShortages.length) {
+          return res.status(400).json({
+            success: false,
+            message: `Not enough stock to apply this edit: ${preCheckShortages.map((s) => `${s.name} (have ${s.available}, need ${s.needed})`).join('; ')}. Turn on "Allow Billing Below Zero Stock" in Settings, or adjust stock first.`,
+            shortages: preCheckShortages
+          });
+        }
+      }
+      deductStock(store, newItemsRaw, order.orderId, user);
+
+      // Reverse every journal voucher tied to this order (sale + COGS) before reposting the corrected amounts.
+      (store.journal || [])
+        .filter((v) => v.refId === order.orderId && !v.isReversed && !v.reversalOf)
+        .forEach((v) => {
+          try {
+            engine.reverseJournal(store, v.id, user);
+          } catch (err) {
+            if (err.message !== 'Voucher has already been reversed.') {
+              console.error(`[Edit ${order.orderId}] Failed to reverse voucher ${v.id}:`, err.message);
+            }
+          }
+        });
+
+      const newOrderItems = newItemsRaw.map((i) => {
+        const product = findProductInStore(store, i);
+        return {
+          id: i.id || `item_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          name: i.name || i.printName || 'Item',
+          printName: i.printName || i.name || 'Item',
+          barcode: i.barcode || '',
+          qty: Number(i.qty) || 1,
+          unit: i.unit || i.saleUnit || 'pcs',
+          price: Number(i.price) || 0,
+          taxRate: Number(i.taxRate) || 0,
+          total: Number(i.total) || Math.round((Number(i.qty) || 1) * (Number(i.price) || 0) * 100) / 100,
+          discount: Number(i.discount) || 0,
+          hsn: i.hsn || (product ? product.hsn : '') || '',
+          baseQty: product ? baseQty(product, i) : (Number(i.qty) || 1),
+          batchesSold: Array.isArray(i.batchesSold) ? i.batchesSold : [],
+          serialId: i.serialId || undefined,
+          serialNo: i.serialNo || undefined,
+          warrantyEndDate: i.warrantyEndDate || undefined
+        };
+      });
+
+      itemChanges = buildItemDiffs(oldItems, newOrderItems);
+
+      // Redemptions (loyalty/advance) already applied at checkout stay fixed — only the gross total moves with an item edit.
+      const redemptions = r2((order.loyaltyRedeemed || 0) + (order.advanceRedeemed || 0));
+      const newGrossTotal = req.body.total !== undefined ? r2(req.body.total) : order.grossTotal;
+      const newSubtotal = req.body.subtotal !== undefined ? r2(req.body.subtotal) : order.subtotal;
+      const newTax = req.body.tax !== undefined ? r2(req.body.tax) : order.tax;
+      const newDiscount = req.body.discount !== undefined ? r2(req.body.discount) : order.discount;
+      const newRoundOff = req.body.roundOff !== undefined ? r2(req.body.roundOff) : order.roundOff;
+      const newPayableTotal = r2(Math.max(0, newGrossTotal - redemptions));
+
+      if (order.subtotal !== newSubtotal) amountChanges.push({ field: 'subtotal', label: 'Subtotal', oldValue: order.subtotal, newValue: newSubtotal });
+      if (order.tax !== newTax) amountChanges.push({ field: 'tax', label: 'Tax', oldValue: order.tax, newValue: newTax });
+      if (order.discount !== newDiscount) amountChanges.push({ field: 'discount', label: 'Discount', oldValue: order.discount, newValue: newDiscount });
+      if (order.total !== newPayableTotal) amountChanges.push({ field: 'total', label: 'Total', oldValue: order.total, newValue: newPayableTotal });
+
+      order.items = newOrderItems;
+      order.subtotal = newSubtotal;
+      order.tax = newTax;
+      order.discount = newDiscount;
+      order.roundOff = newRoundOff;
+      order.grossTotal = newGrossTotal;
+      order.total = newPayableTotal;
+      order.balanceDue = r2(Math.max(0, newPayableTotal - (order.paidAmount || 0)));
+      order.status = order.paidAmount >= newPayableTotal && newPayableTotal > 0 ? 'PAID' : order.paidAmount > 0 ? 'PARTIALLY_PAID' : 'UNPAID';
+      order.paymentStatus = order.status;
+
+      const customer = order.customerId ? (store.customers || []).find((c) => c.id === order.customerId) : null;
+      try {
+        const accounting = posting.postSale(store, order, {
+          customer,
+          interState: store.settings.tax.interState,
+          createdBy: user,
+          note: 'Invoice edit correction'
+        });
+        order.voucherNo = accounting?.voucher?.voucherNo || order.voucherNo;
+        order.voucherId = accounting?.voucher?.id || order.voucherId;
+        order.cogs = accounting?.cogsAmount || 0;
+      } catch (err) {
+        order.accountingError = err.message;
+      }
+
+      if (customer) {
+        const account = (store.accounts || []).find((a) => a.partyId === customer.id && a.partyType === 'CUSTOMER');
+        if (account) {
+          const currentBal = engine.accountBalance(store, account.id);
+          customer.outstanding = Math.max(0, currentBal);
+          customer.advance = Math.max(0, -currentBal);
+        }
+      }
+    }
+
+    const headerChanges = [];
     EDITABLE_DETAIL_FIELDS.forEach(({ key, label }) => {
       if (req.body[key] === undefined) return;
       const oldValue = order[key] ?? '';
       const newValue = req.body[key] ?? '';
       if (String(oldValue) !== String(newValue)) {
-        changes.push({ field: key, label, oldValue, newValue });
+        headerChanges.push({ field: key, label, oldValue, newValue });
         order[key] = req.body[key];
       }
     });
 
-    if (changes.length > 0) logInvoiceEdit(store, order, changes, actor(req));
+    const allChanges = [...itemChanges, ...amountChanges, ...headerChanges];
+    if (allChanges.length > 0) logInvoiceEdit(store, order, allChanges, user, req.body.changeReason);
 
     return res.json({
       success: true,
-      message: changes.length > 0 ? `Invoice #${order.orderId} details updated.` : 'No changes to save.',
+      message: allChanges.length > 0 ? `Invoice #${order.orderId} updated${itemChanges.length || amountChanges.length ? ' and re-posted to the ledger' : ''}.` : 'No changes to save.',
       data: { ...order, company: store.settings.company, billing: store.settings.billing }
     });
   }
