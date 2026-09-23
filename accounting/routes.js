@@ -679,6 +679,24 @@ router.post('/transfers', (req, res) => {
     record.voucherNo = voucher.voucherNo;
     store.transfers.unshift(record);
 
+    // A transfer touching the Locker account belongs in its own quick-view history too, not just the formal ledger.
+    const lockerAccount = bySystemKey(store, 'COMPANY_LOCKER');
+    if (lockerAccount && (fromAccountId === lockerAccount.id || toAccountId === lockerAccount.id) && store.companyLocker) {
+      if (!Array.isArray(store.companyLocker.history)) store.companyLocker.history = [];
+      store.companyLocker.history.unshift({
+        id: `lock_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+        type: toAccountId === lockerAccount.id ? 'DEPOSIT' : 'WITHDRAWAL',
+        amount: r2(amount),
+        balanceAfter: r2(accountBalance(store, lockerAccount.id)),
+        sessionId: null,
+        note: `Fund transfer ${toAccountId === lockerAccount.id ? 'from' : 'to'} ${toAccountId === lockerAccount.id ? record.fromName : record.toName}${reference ? ` (${reference})` : ''}`,
+        user: actor(req),
+        date: record.date
+      });
+      if (store.companyLocker.history.length > 500) store.companyLocker.history.pop();
+      store.companyLocker.balance = r2(accountBalance(store, lockerAccount.id));
+    }
+
     // The POS session's own `currentCash` must stay in sync with this Cash ledger account, or a transfer would silently throw off the shift-close variance.
     const cashAccount = bySystemKey(store, 'CASH');
     if (cashAccount && store.session?.status === 'open') {

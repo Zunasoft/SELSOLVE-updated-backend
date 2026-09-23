@@ -18,6 +18,7 @@ const DEFAULT_COA = [
   ['1100', 'Current Assets', 'ASSET', true, '1000', 'CURRENT_ASSETS'],
   ['1110', 'Cash in Hand', 'ASSET', true, '1100', 'CASH_GROUP'],
   ['1111', 'Main Cash Counter', 'ASSET', false, '1110', 'CASH'],
+  ['1112', 'Company Locker', 'ASSET', false, '1110', 'COMPANY_LOCKER'],
   ['1120', 'Bank Accounts', 'ASSET', true, '1100', 'BANK_GROUP'],
   // Seeded so settlementAccount() in posting.js has a BANK leaf immediately; otherwise non-cash payments post to Cash until a shop manually adds a bank account.
   ['1121', 'Primary Bank Account', 'ASSET', false, '1120', 'BANK'],
@@ -108,8 +109,8 @@ function buildChartOfAccounts() {
   }));
 }
 
-/** Cash / bank accounts are the only ones that belong in the Cash Flow statement. */
-const LIQUID_SYSTEM_KEYS = ['CASH', 'BANK'];
+/** Cash / bank / locker accounts are the only ones that belong in the Cash Flow statement or Fund Transfer's account picker. */
+const LIQUID_SYSTEM_KEYS = ['CASH', 'BANK', 'COMPANY_LOCKER'];
 
 module.exports = {
   TYPES,

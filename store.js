@@ -147,9 +147,6 @@ function defaultSettings() {
       invoicePrefix: 'INV',
       nextInvoiceNo: 1001,
       nextQuotationNo: 1001,
-      taxInclusive: true,
-      defaultTaxRate: 0,
-      applyCess: false,
       footerNote: 'Thank you for shopping with us! Visit again.',
       terms: 'Goods once sold cannot be returned without receipt.',
       printReceiptAfterSale: true,
@@ -208,7 +205,11 @@ function defaultSettings() {
       interState: false,
       stateGstName: 'SGST',
       centralGstName: 'CGST',
-      integratedGstName: 'IGST'
+      integratedGstName: 'IGST',
+      enableGst: true,
+      taxMode: 'EXCLUSIVE',
+      defaultTaxRate: 0,
+      gstScheme: 'REGULAR'
     },
     hardware: {
       posPrinter: { name: 'Thermal Receipt Printer', status: 'READY', paperWidth: '80mm', autoCut: true, enabled: true },
@@ -221,12 +222,24 @@ function defaultSettings() {
         status: 'DISCONNECTED',
         comPort: 'COM3',
         baudRate: 9600,
-        // Weight-embedded barcodes printed by a counter scale: 2xxxxx + grams.
-        embeddedBarcodePrefix: '21',
+        // Weight-embedded barcode syntax: an ordered list of segments a scale-printed label is built from — prefix + product-code tail + weight (as an integer scaled by 10^precision). Configurable in Settings > Hardware; this is the shape a fresh tenant starts with, matching the old hardcoded prefix '21' + 5-digit SKU + 5-digit grams format exactly.
+        barcodeSegments: [
+          { id: 'seg_prefix', type: 'prefix', length: 2, value: '21' },
+          { id: 'seg_sku', type: 'sku', length: 5 },
+          { id: 'seg_weight', type: 'weight', length: 5, precision: 3 }
+        ],
         enabled: true
       },
       poleDisplay: { name: 'VFD Customer Display', status: 'READY', welcomeText: 'Welcome!', enabled: true },
       kotPrinter: { name: 'Kitchen Thermal Printer', status: 'READY', paperWidth: '80mm', enabled: false }
+    },
+    // Barcode Generation (Zoho Books-style): auto-assigns a sequential prefix+number
+    // barcode to new products that don't already have one, instead of a random 10-digit code.
+    barcode: {
+      autoGenerate: true,
+      prefix: '',
+      digits: 6,
+      symbology: 'CODE128'
     },
     pos: {
       allowNegativeStock: true,

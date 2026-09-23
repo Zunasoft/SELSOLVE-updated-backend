@@ -26,6 +26,30 @@ const num = (v, fallback = 0) => {
 const randomBarcode = () => Math.floor(1000000000 + Math.random() * 9000000000).toString();
 
 /**
+ * Barcode Generation (Zoho Books-style): a persistent prefix+sequential-number
+ * counter lives on the store, seeded from the highest existing barcode that
+ * matches the configured prefix so a freshly-loaded store never collides with
+ * barcodes assigned earlier. Configurable in Settings > Barcode.
+ */
+function generateBarcode(store) {
+  const cfg = store.settings?.barcode || {};
+  const prefix = cfg.prefix ? String(cfg.prefix) : '';
+  const digits = Number(cfg.digits) || 6;
+  if (!Number.isFinite(store.barcodeSeq)) {
+    const existingMax = (store.products || []).reduce((max, p) => {
+      const code = String(p.barcode || '');
+      if (prefix && !code.startsWith(prefix)) return max;
+      const digitsPart = code.slice(prefix.length).replace(/\D/g, '');
+      const n = digitsPart ? parseInt(digitsPart, 10) : 0;
+      return n > max ? n : max;
+    }, 0);
+    store.barcodeSeq = existingMax;
+  }
+  store.barcodeSeq += 1;
+  return `${prefix}${String(store.barcodeSeq).padStart(digits, '0')}`;
+}
+
+/**
  * Alternate units — Module 4 "Multiple Units".
  *
  * A product is stocked in one base unit; everything else is a conversion from
@@ -199,7 +223,11 @@ exports.generateSku = generateSku;
 const cleanSku = (value) => String(value ?? '').replace(/\D/g, '');
 
 function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
-  const barcode = payload.barcode || existing?.barcode || payload.defaultBarcode || randomBarcode();
+  const barcode =
+    payload.barcode ||
+    existing?.barcode ||
+    payload.defaultBarcode ||
+    (store.settings?.barcode?.autoGenerate === false ? randomBarcode() : generateBarcode(store));
   const enteredSku = payload.sku !== undefined ? cleanSku(payload.sku) : '';
   const sku = enteredSku !== ''
     ? enteredSku

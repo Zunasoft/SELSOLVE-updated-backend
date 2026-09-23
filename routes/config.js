@@ -209,14 +209,112 @@ router.post('/hardware/weight', (req, res) => {
 });
 
 /**
- * Decode a weight-embedded barcode produced by a counter weighing scale.
- * Layout: <prefix><item code><weight in grams><check digit>, which is what
- * every Indian counter scale prints for loose goods.
+ * Weight-embedded barcode syntax — a configurable ordered list of segments (Settings > Barcode) a
+ * scale-printed label is built from. Segment types:
+ *   - prefix:   fixed marker digits (checked against a configured `value`) — the old, simple shape.
+ *   - sku:      the product-code tail used to find the matching product.
+ *   - weight:   a single scaled integer weight (legacy shape — scaled by 10^precision).
+ *   - unitFlag: a measuring-unit indicator — one printed character (W/P/D/B, or whatever the shop
+ *               uses) selects which of that segment's `units[]` entries applies, and THAT unit's own
+ *               `length`/`precision` is what the following digits are read as. This is what lets one
+ *               barcode format handle a weighed item (e.g. "W" + 3-digit-kg + 3-digit-gram) and a
+ *               piece-counted item (e.g. "P" + 3-digit count) side by side, since which unit's field
+ *               widths apply is decided by the character actually scanned, not fixed in advance.
+ * Falls back to the old hardcoded prefix '21' + 5 + 5(precision 3) shape for a tenant that never configured it.
  */
+const DEFAULT_BARCODE_SEGMENTS = [
+  { type: 'prefix', length: 2, value: '21' },
+  { type: 'sku', length: 5 },
+  { type: 'weight', length: 5, precision: 3 }
+];
+
+const getBarcodeSegments = (store) => {
+  const segments = store.settings?.hardware?.weighingScale?.barcodeSegments;
+  return Array.isArray(segments) && segments.length ? segments : DEFAULT_BARCODE_SEGMENTS;
+};
+
+/** Walks the configured segments against a scanned code; returns null if it doesn't match this shop's format at all. */
+function decodeEmbeddedBarcode(store, code) {
+  const segments = getBarcodeSegments(store);
+
+  let pos = 0;
+  let skuTail = null;
+  let quantity = null;
+
+  for (const seg of segments) {
+    const len = Number(seg.length) || 0;
+    if (!len || pos + len > code.length) return null;
+    const chunk = code.slice(pos, pos + len);
+    pos += len;
+
+    if (seg.type === 'prefix') {
+      const expected = seg.value !== undefined && seg.value !== '' ? String(seg.value).padStart(len, '0') : null;
+      if (expected && chunk !== expected) return null;
+    } else if (seg.type === 'sku') {
+      skuTail = chunk;
+    } else if (seg.type === 'weight') {
+      const raw = Number(chunk);
+      if (!Number.isFinite(raw)) return null;
+      quantity = raw / Math.pow(10, Number(seg.precision) || 0);
+    } else if (seg.type === 'unitFlag') {
+      const flagVal = chunk.trim().toUpperCase();
+      const unit = (seg.units || []).find((u) => u.enabled && String(u.code || '').toUpperCase() === flagVal);
+      if (!unit) return null;
+      const uLen = Number(unit.length) || 0;
+      if (!uLen || pos + uLen > code.length) return null;
+      const uChunk = code.slice(pos, pos + uLen);
+      pos += uLen;
+      const raw = Number(uChunk);
+      if (!Number.isFinite(raw)) return null;
+      quantity = raw / Math.pow(10, Number(unit.precision) || 0);
+    }
+  }
+
+  if (!skuTail || !Number.isFinite(quantity)) return null;
+
+  const product = (store.products || []).find(
+    (p) => String(p.barcode).slice(-skuTail.length) === skuTail || (p.barcodes || []).some((b) => String(b).slice(-skuTail.length) === skuTail)
+  );
+  if (!product) return null;
+  return { product, quantity: Math.round(quantity * 1000) / 1000 };
+}
+
+/** The write side of the same syntax — used when printing a weight-embedded label. */
+function encodeEmbeddedBarcode(store, product, qty) {
+  const segments = getBarcodeSegments(store);
+  const q = Number(qty) || 0;
+
+  return segments
+    .map((seg) => {
+      const len = Number(seg.length) || 0;
+      if (seg.type === 'prefix') return String(seg.value || '').padStart(len, '0').slice(-len);
+      if (seg.type === 'sku') return String(product.barcode || '').slice(-len).padStart(len, '0');
+      if (seg.type === 'weight') {
+        const raw = Math.round(q * Math.pow(10, Number(seg.precision) || 0));
+        return String(Math.max(0, raw)).padStart(len, '0').slice(-len);
+      }
+      if (seg.type === 'unitFlag') {
+        // Pick whichever enabled unit best matches this product: prefer a fractional
+        // (precision > 0) unit for weighed items, a whole-count unit otherwise.
+        const enabled = (seg.units || []).filter((u) => u.enabled);
+        const unit =
+          enabled.find((u) => (product.requiresWeight ? Number(u.precision) > 0 : Number(u.precision) === 0)) ||
+          enabled[0];
+        if (!unit) return ''.padStart(len, '0');
+        const flag = String(unit.code || '').slice(0, len).padEnd(len, ' ');
+        const uLen = Number(unit.length) || 0;
+        const raw = Math.round(q * Math.pow(10, Number(unit.precision) || 0));
+        const uChunk = String(Math.max(0, raw)).padStart(uLen, '0').slice(-uLen);
+        return flag + uChunk;
+      }
+      return ''.padStart(len, '0');
+    })
+    .join('');
+}
+
 router.get('/hardware/decode-barcode/:code', (req, res) => {
   const store = req.tenantStore;
   const code = String(req.params.code).trim();
-  const prefix = store.settings.hardware.weighingScale?.embeddedBarcodePrefix || '21';
 
   const direct = (store.products || []).find(
     (p) => p.barcode === code || (p.barcodes || []).includes(code)
@@ -225,25 +323,17 @@ router.get('/hardware/decode-barcode/:code', (req, res) => {
     return res.json({ success: true, data: { product: direct, quantity: 1, embedded: false } });
   }
 
-  if (code.length >= 12 && code.startsWith(prefix)) {
-    const itemCode = code.slice(prefix.length, prefix.length + 5);
-    const grams = Number(code.slice(prefix.length + 5, prefix.length + 10));
-    const product = (store.products || []).find(
-      (p) => String(p.barcode).slice(-5) === itemCode || (p.barcodes || []).some((b) => String(b).slice(-5) === itemCode)
-    );
-
-    if (product && Number.isFinite(grams)) {
-      const quantity = Math.round((grams / 1000) * 1000) / 1000;
-      return res.json({
-        success: true,
-        data: {
-          product,
-          quantity,
-          embedded: true,
-          amount: Math.round(quantity * product.price * 100) / 100
-        }
-      });
-    }
+  const decoded = decodeEmbeddedBarcode(store, code);
+  if (decoded) {
+    return res.json({
+      success: true,
+      data: {
+        product: decoded.product,
+        quantity: decoded.quantity,
+        embedded: true,
+        amount: Math.round(decoded.quantity * decoded.product.price * 100) / 100
+      }
+    });
   }
 
   res.status(404).json({ success: false, message: 'No product matches that barcode.' });
@@ -263,7 +353,6 @@ router.post('/hardware/barcode-label', (req, res) => {
   // shop's settings document is; neither is guaranteed to be present.
   const hardware = store.settings.hardware || {};
   const labelPrinter = hardware.barcodePrinter || hardware.labelPrinter || {};
-  const prefix = hardware.weighingScale?.embeddedBarcodePrefix || '21';
 
   res.json({
     success: true,
@@ -271,9 +360,9 @@ router.post('/hardware/barcode-label', (req, res) => {
     data: {
       productName: product.printName || product.regionalName || product.name,
       barcode: product.barcode,
-      // Weight-embedded EAN-13 style payload: prefix + item + weight in grams.
+      // Weight-embedded payload built from the tenant's configured barcode segments.
       encoded: product.requiresWeight
-        ? `${prefix}${String(product.barcode).slice(-5)}${String(Math.round(qty * 1000)).padStart(5, '0')}`
+        ? encodeEmbeddedBarcode(store, product, qty)
         : product.barcode,
       unit: product.unit,
       quantity: qty,

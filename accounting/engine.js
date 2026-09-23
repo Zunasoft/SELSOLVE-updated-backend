@@ -1,6 +1,6 @@
 // Nothing mutates an account balance directly; every balance is derived from the journal so the books stay auditable and reports are reproducible.
 
-const { NORMAL_SIDE, buildChartOfAccounts, accountId } = require('./coa');
+const { NORMAL_SIDE, buildChartOfAccounts, accountId, LIQUID_SYSTEM_KEYS } = require('./coa');
 
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -24,6 +24,11 @@ const VOUCHER_PREFIX = {
 function ensureAccounting(store) {
   if (!store.accounts || store.accounts.length === 0) {
     store.accounts = buildChartOfAccounts();
+  } else {
+    // A system account added to DEFAULT_COA after this tenant's chart was first built (e.g. Company Locker) needs to be backfilled, not just seeded for brand-new tenants.
+    const existingCodes = new Set(store.accounts.map((a) => a.code));
+    const missing = buildChartOfAccounts().filter((a) => !existingCodes.has(a.code));
+    if (missing.length) store.accounts.push(...missing);
   }
   if (!Array.isArray(store.journal)) store.journal = [];
   if (!store.voucherCounters) store.voucherCounters = {};
@@ -489,7 +494,7 @@ function balanceSheet(store, { asOf } = {}) {
 
 const liquidAccounts = (store) =>
   (store.accounts || []).filter(
-    (a) => !a.isGroup && (a.systemKey === 'CASH' || a.systemKey === 'BANK' || a.isLiquid)
+    (a) => !a.isGroup && (LIQUID_SYSTEM_KEYS.includes(a.systemKey) || a.isLiquid)
   );
 
 // Direct method: each voucher touching cash/bank is classified by its counter-leg, so no manual tagging is needed.

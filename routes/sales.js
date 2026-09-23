@@ -1942,68 +1942,115 @@ const denomTotal = (d) => {
   return Object.keys(DENOM_VALUES).reduce((sum, k) => sum + (Number(d[k]) || 0) * DENOM_VALUES[k], 0);
 };
 
-// Records a lump-sum locker movement from a counter open/close (exact notes aren't known then); the note-by-note breakdown is reconciled separately via POST /company-locker/recount.
-function moveLockerCash(store, { type, amount, sessionId, note, user }) {
-  const value = r2(Math.abs(Number(amount) || 0));
-  if (value <= 0) return;
+// The Company Locker is a real ledger account (systemKey COMPANY_LOCKER) — its balance is always derived from the journal, never tracked separately, so Fund Transfer / Cash Flow / the trial balance all agree with what the Counter and Locker tab show.
+function ensureLockerStore(store) {
   if (!store.companyLocker) {
     store.companyLocker = { balance: 0, denominations: { '2000': 0, '500': 0, '200': 0, '100': 0, '50': 0, '20': 0, '10': 0, coins: 0 }, history: [] };
   }
-  store.companyLocker.balance = r2((store.companyLocker.balance || 0) + (type === 'DEPOSIT' ? value : -value));
   if (!Array.isArray(store.companyLocker.history)) store.companyLocker.history = [];
-  store.companyLocker.history.unshift({
+  return store.companyLocker;
+}
+
+const syncLockerBalance = (store) => {
+  engine.ensureAccounting(store);
+  const account = engine.bySystemKey(store, 'COMPANY_LOCKER');
+  const locker = ensureLockerStore(store);
+  locker.balance = account ? r2(engine.accountBalance(store, account.id)) : locker.balance;
+  return locker;
+};
+
+// Records a lump-sum locker movement from a counter open/close (exact notes aren't known then) as a real Cash <-> Locker fund transfer; the note-by-note breakdown is reconciled separately via POST /company-locker/recount.
+function moveLockerCash(store, { type, amount, sessionId, note, user }) {
+  const value = r2(Math.abs(Number(amount) || 0));
+  if (value <= 0) return;
+  engine.ensureAccounting(store);
+  const cashAccount = engine.bySystemKey(store, 'CASH');
+  const lockerAccount = engine.bySystemKey(store, 'COMPANY_LOCKER');
+  const locker = ensureLockerStore(store);
+
+  if (cashAccount && lockerAccount) {
+    // WITHDRAWAL = locker -> counter till (Dr Cash, Cr Locker); DEPOSIT = counter till -> locker (Dr Locker, Cr Cash).
+    const fromAccountId = type === 'DEPOSIT' ? cashAccount.id : lockerAccount.id;
+    const toAccountId = type === 'DEPOSIT' ? lockerAccount.id : cashAccount.id;
+    try {
+      posting.postFundTransfer(
+        store,
+        { id: `lockmv_${Date.now()}`, fromAccountId, toAccountId, amount: value, charges: 0, notes: note || `Counter ${type === 'DEPOSIT' ? 'closing' : 'opening'} locker movement`, date: new Date().toISOString() },
+        { createdBy: user || 'Owner' }
+      );
+    } catch (err) {
+      console.error('[moveLockerCash] ledger posting failed:', err.message);
+    }
+  }
+
+  locker.balance = lockerAccount ? r2(engine.accountBalance(store, lockerAccount.id)) : r2((locker.balance || 0) + (type === 'DEPOSIT' ? value : -value));
+  locker.history.unshift({
     id: `lock_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
     type,
     amount: value,
-    balanceAfter: store.companyLocker.balance,
+    balanceAfter: locker.balance,
     sessionId: sessionId || null,
     note: note || '',
     user: user || 'Owner',
     date: new Date().toISOString()
   });
-  if (store.companyLocker.history.length > 500) store.companyLocker.history.pop();
+  if (locker.history.length > 500) locker.history.pop();
 }
 
 router.get('/company-locker', (req, res) => {
   const store = req.tenantStore;
-  const locker = store.companyLocker || { balance: 0, denominations: {}, history: [] };
+  const locker = syncLockerBalance(store);
   res.json({ success: true, data: locker });
 });
 
-// Physical recount: the owner counts actual notes/coins in the safe — the one place the locker's note-by-note breakdown, not just its lump balance, is ever authoritative.
+// Physical recount: the owner counts actual notes/coins in the safe — the one place the locker's note-by-note breakdown, not just its lump balance, is ever authoritative. Any variance from the ledger's expected balance posts as a real balance-adjustment entry, not a silent overwrite.
 router.post('/company-locker/recount', (req, res) => {
   const store = req.tenantStore;
   const denominations = req.body.denominations || null;
   if (!denominations || typeof denominations !== 'object') {
     return res.status(400).json({ success: false, message: 'Enter the note and coin counts to record.' });
   }
-  if (!store.companyLocker) {
-    store.companyLocker = { balance: 0, denominations: {}, history: [] };
-  }
+  engine.ensureAccounting(store);
+  const lockerAccount = engine.bySystemKey(store, 'COMPANY_LOCKER');
+  const locker = ensureLockerStore(store);
+
   const newTotal = r2(denomTotal(denominations));
-  const oldBalance = r2(store.companyLocker.balance || 0);
+  const oldBalance = lockerAccount ? r2(engine.accountBalance(store, lockerAccount.id)) : r2(locker.balance || 0);
   const variance = r2(newTotal - oldBalance);
 
-  store.companyLocker.balance = newTotal;
-  store.companyLocker.denominations = denominations;
-  if (!Array.isArray(store.companyLocker.history)) store.companyLocker.history = [];
-  store.companyLocker.history.unshift({
+  if (variance !== 0 && lockerAccount) {
+    try {
+      posting.postBalanceAdjustment(store, {
+        accountId: lockerAccount.id,
+        amount: Math.abs(variance),
+        side: variance > 0 ? 'DR' : 'CR',
+        createdBy: actor(req),
+        narration: `Company Locker physical recount — ${req.body.notes || 'variance adjustment'}`
+      });
+    } catch (err) {
+      console.error('[company-locker/recount] ledger posting failed:', err.message);
+    }
+  }
+
+  locker.balance = lockerAccount ? r2(engine.accountBalance(store, lockerAccount.id)) : newTotal;
+  locker.denominations = denominations;
+  locker.history.unshift({
     id: `lock_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
     type: 'RECOUNT',
     amount: newTotal,
     variance,
-    balanceAfter: newTotal,
+    balanceAfter: locker.balance,
     sessionId: null,
     note: req.body.notes || 'Physical recount',
     user: actor(req),
     date: new Date().toISOString()
   });
-  if (store.companyLocker.history.length > 500) store.companyLocker.history.pop();
+  if (locker.history.length > 500) locker.history.pop();
 
   res.json({
     success: true,
     message: `Locker recount saved. ${variance === 0 ? 'Matched previous balance.' : variance > 0 ? `+₹${variance.toFixed(2)} more than expected.` : `−₹${Math.abs(variance).toFixed(2)} less than expected.`}`,
-    data: store.companyLocker
+    data: locker
   });
 });
 
