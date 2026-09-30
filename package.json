@@ -10,7 +10,10 @@
     "test:tenants": "node scripts/e2e-tenant-isolation.js",
     "test:session": "node scripts/e2e-session-codes.js",
     "db:inspect": "node scripts/inspect-master-leak.js",
-    "db:cleanup": "node scripts/cleanup-master-leak.js"
+    "db:cleanup": "node scripts/cleanup-master-leak.js",
+    "test:hardware": "node scripts/hardware-virtual-test.js",
+    "test:barcode-sync": "node scripts/test-barcode-format-sync.js",
+    "test:purchase-returns": "node scripts/e2e-purchase-returns.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -19,7 +22,8 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.4.1",
     "multer": "^2.2.0",
-    "nodemailer": "^9.0.3"
+    "nodemailer": "^9.0.3",
+    "serialport": "^13.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.2"

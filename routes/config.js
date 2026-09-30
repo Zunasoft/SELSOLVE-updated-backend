@@ -7,6 +7,9 @@ const express = require('express');
 const { ROLE_PERMISSIONS, ASSIGNABLE_ROLES, PERMISSION_KEYS, MODULE_KEYS, effectivePermissions } = require('../store');
 const { FEATURE_CATALOG, resolveTenantFeatures } = require('../modules/features');
 const { setRecipe, removeRecipe, decorateRecipe } = require('../modules/recipes');
+const { validateBarcode, encodeBarcodeFormat, maxLabelQuantity } = require('../modules/barcodeFormat');
+const scaleManager = require('../modules/scaleManager');
+const { openCashDrawer, listPrinters, printTestPage, printerState, drawerState } = require('../modules/printerManager');
 
 const router = express.Router();
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
@@ -64,6 +67,17 @@ router.put('/settings/:section', async (req, res) => {
   try {
     const store = req.tenantStore;
     const section = req.params.section;
+
+    // Array-shaped, not object-shaped — the generic `{...existing, ...req.body}` merge below is
+    // built for object sections and would mangle an array, so this one just replaces it wholesale.
+    if (section === 'barcodeFormat') {
+      const fields = Array.isArray(req.body?.fields) ? req.body.fields : Array.isArray(req.body) ? req.body : null;
+      if (!fields || !fields.some((f) => f.type === 'id') || !fields.some((f) => f.type === 'value')) {
+        return res.status(400).json({ success: false, message: 'Barcode format needs at least an id field and a value field.' });
+      }
+      store.settings.barcodeFormat = fields;
+      return res.json({ success: true, message: 'Barcode format saved.', data: store.settings.barcodeFormat });
+    }
 
     if (!store.settings[section]) {
       if (section === 'loyalty' || section === 'pos') {
@@ -130,67 +144,411 @@ router.get('/hardware', (req, res) => {
   res.json({ success: true, data: req.tenantStore.settings.hardware });
 });
 
+// Numeric fields arrive as strings from <input type="number">; the serial/TCP libraries need numbers.
+const HARDWARE_NUMERIC_FIELDS = ['baudRate', 'dataBits', 'stopBits', 'port', 'pollIntervalMs', 'decimals', 'stabilityTolerance', 'confirmReadings'];
+// Set by the server from real test results only — never taken from the client.
+const HARDWARE_SERVER_FIELDS = ['status', 'lastTestedAt', 'lastTestResult', 'lastReading', 'lastReadAt'];
+
+function sanitiseHardwarePatch(body) {
+  const patch = { ...(body || {}) };
+  for (const key of HARDWARE_SERVER_FIELDS) delete patch[key];
+  for (const key of HARDWARE_NUMERIC_FIELDS) {
+    if (patch[key] === undefined) continue;
+    if (patch[key] === '' || patch[key] === null) {
+      // An emptied tuning field means "automatic" — it must clear the saved value, not keep the old one.
+      if (key === 'stabilityTolerance' || key === 'confirmReadings') patch[key] = null;
+      else delete patch[key];
+      continue;
+    }
+    const n = Number(patch[key]);
+    if (!Number.isFinite(n)) return { error: `${key} must be a number.` };
+    patch[key] = n;
+  }
+  for (const key of ['comPort', 'host', 'shareName', 'pollCommand', 'weightPattern', 'printerName']) {
+    if (typeof patch[key] === 'string') patch[key] = patch[key].trim();
+  }
+  if (patch.weightPattern) {
+    try {
+      new RegExp(patch.weightPattern, 'i');
+    } catch {
+      return { error: 'Weight pattern is not a valid regular expression.' };
+    }
+  }
+  return { patch };
+}
+
 router.put('/hardware/:device', (req, res) => {
   const hardware = req.tenantStore.settings.hardware;
   const device = req.params.device;
   if (!hardware[device]) {
     return res.status(404).json({ success: false, message: `Unknown device "${device}".` });
   }
-  hardware[device] = { ...hardware[device], ...req.body };
-  res.json({ success: true, message: `${hardware[device].name} configuration saved.`, data: hardware[device] });
+  const { patch, error } = sanitiseHardwarePatch(req.body);
+  if (error) return res.status(400).json({ success: false, message: error });
+
+  // Release the scale's COM port / socket so the new settings (or a disable) take effect immediately.
+  // Skipped when nothing about the connection changed (the Settings page re-saves before every test),
+  // so a good live connection isn't torn down and its stability count reset.
+  if (device === 'weighingScale') {
+    const next = { ...hardware[device], ...patch };
+    if (next.enabled === false || scaleManager.connectionKey(next) !== scaleManager.connectionKey(hardware[device])) {
+      scaleManager.closeFor(hardware[device]);
+    }
+  }
+
+  hardware[device] = { ...hardware[device], ...patch };
+  res.json({ success: true, message: `${HARDWARE_LABELS[device] || hardware[device].name} settings saved.`, data: hardware[device] });
 });
 
+const SCALE_REASON_MESSAGES = {
+  NO_COM_PORT: 'No COM port configured for the scale in Settings → Hardware.',
+  NO_HOST: 'No host/port configured for the scale in Settings → Hardware.',
+  NO_READING_YET: 'Scale is connected but has not sent a reading yet. Check baud rate / read mode.',
+  STALE: 'Scale reading is stale.',
+  OVERLOAD: 'Scale is overloaded.',
+  CONNECTION_ERROR: 'Could not connect to the scale.'
+};
+
+const markTested = (device, ok) => {
+  device.status = ok ? 'connected' : 'error';
+  device.lastTestedAt = new Date().toISOString();
+  device.lastTestResult = ok ? 'OK' : 'FAILED';
+};
+
 /**
- * Device pairing / connection test. Physical I/O happens in the Android client;
- * the server records the pairing so configuration follows the tenant.
+ * Device connection test. The cash drawer and weighing scale have a real server-side connection
+ * (modules/printerManager.js, modules/scaleManager.js), so their test performs the real hardware
+ * action. Receipt/label printers print through the OS print driver and the scanner is a keyboard,
+ * so the server can't reach them — their test says how to check them instead of claiming success.
  */
-router.post('/hardware/:device/test', (req, res) => {
+router.post('/hardware/:device/test', async (req, res) => {
   const hardware = req.tenantStore.settings.hardware;
-  const device = hardware[req.params.device];
+  const key = req.params.device;
+  const device = hardware[key];
   if (!device) return res.status(404).json({ success: false, message: 'Unknown device.' });
 
-  device.status = 'connected';
-  device.lastTestedAt = new Date().toISOString();
-  device.lastTestResult = 'OK';
+  if (key === 'cashDrawer') {
+    const result = await openCashDrawer(device);
+    if (!result.ok) {
+      markTested(device, false);
+      return res.status(400).json({ success: false, message: result.message || 'Could not open the cash drawer.', data: device });
+    }
+    if (!result.simulated) markTested(device, true);
+    return res.json({
+      success: true,
+      message: result.simulated
+        ? 'Simulated mode — no drawer was opened. Pick a real connection to test the hardware.'
+        : 'Drawer kick-out pulse sent — the drawer should have opened.',
+      data: device
+    });
+  }
+
+  if (key === 'weighingScale') {
+    if (device.connectionType === 'serial' || device.connectionType === 'network') {
+      const reading = await scaleManager.waitForReading(device, { timeoutMs: 3000 });
+      if (!reading.ok) {
+        markTested(device, false);
+        return res.status(400).json({
+          success: false,
+          message: reading.message || SCALE_REASON_MESSAGES[reading.reason] || 'Scale is not responding.',
+          reason: reading.reason,
+          data: device
+        });
+      }
+      markTested(device, true);
+      return res.json({
+        success: true,
+        message: `Scale responded: ${reading.weight} ${reading.unit}${reading.stable ? ' (stable)' : ' (settling)'}.`,
+        data: device
+      });
+    }
+    if (device.connectionType === 'keyboard-wedge') {
+      return res.json({ success: true, message: 'Keyboard-wedge scale: press the scale\'s send/print key with the POS weight box focused — the reading types in.', data: device });
+    }
+    return res.json({ success: true, message: 'Simulated mode — no real scale is read. Pick USB/Serial or Network to test the hardware.', data: device });
+  }
+
+  // Printers: check Windows has the chosen printer online, then print a real test page on it.
+  if (key === 'posPrinter' || key === 'barcodePrinter' || key === 'labelPrinter') {
+    const status = printerState(device.printerName, await listPrinters());
+    if (status.state !== 'connected') {
+      markTested(device, false);
+      return res.status(400).json({ success: false, message: status.detail, data: device });
+    }
+    const result = await printTestPage(device.printerName, [`Device: ${HARDWARE_LABELS[key] || key}`]);
+    markTested(device, result.ok);
+    return res.status(result.ok ? 200 : 400).json({ success: result.ok, message: result.message, data: device });
+  }
 
   const detail = {
-    printer: 'Test receipt sent to the thermal printer.',
-    weighingScale: 'Scale responded — stable weight read successfully.',
-    barcodeScanner: 'Scanner is in HID mode and ready to accept scans.',
-    barcodePrinter: 'Test label sent to the barcode printer.',
-    cashDrawer: 'Drawer kick-out pulse sent.'
-  }[req.params.device];
+    barcodeScanner: 'Scan any barcode into the test box on this card to check the scanner.'
+  }[key];
 
-  res.json({ success: true, message: detail || 'Device responded successfully.', data: device });
+  res.json({ success: true, message: detail || 'Configuration saved; this device has no server-side test.', data: device });
+});
+
+const HARDWARE_LABELS = {
+  posPrinter: 'Printer',
+  barcodePrinter: 'Barcode Label Printer',
+  labelPrinter: 'Barcode Label Printer',
+  barcodeScanner: 'Barcode Scanner',
+  weighingScale: 'Weighing Scale',
+  cashDrawer: 'Cash Drawer'
+};
+
+/**
+ * Live status of every device, worked out now — never the stored `status`, which older settings
+ * hold as a fixed "READY"/"CONNECTED" whether or not anything is plugged in. Printers and the
+ * drawer's printer are checked with Windows, the scale by its COM port and data, and the scanner
+ * honestly reported as untestable from here (it is a keyboard).
+ */
+router.get('/hardware/status', async (req, res) => {
+  const hw = req.tenantStore.settings.hardware || {};
+  const off = { state: 'off', label: 'Off', detail: 'Switched off.' };
+  const [printers, ports] = await Promise.all([listPrinters(), scaleManager.listSerialPorts()]);
+  const comPorts = ports.map((p) => p.path);
+
+  const scaleStatus = async (cfg = {}) => {
+    const type = cfg.connectionType;
+    if (type === 'keyboard-wedge') {
+      return { state: 'unknown', label: 'Keyboard scale', detail: 'Types its weight into Billing — press its send key there to test.' };
+    }
+    if (type !== 'serial' && type !== 'network') {
+      return { state: 'not_connected', label: 'Not connected', detail: 'Plug the scale in and press Detect scale, or weights are typed by hand.' };
+    }
+    if (type === 'serial' && !comPorts.includes(cfg.comPort)) {
+      return { state: 'not_found', label: 'Not found', detail: `${cfg.comPort || 'The COM port'} is not on this PC — is the scale plugged in?` };
+    }
+    const r = await scaleManager.waitForReading(cfg, { timeoutMs: 2000 });
+    if (r.ok) return { state: 'connected', label: 'Connected', detail: `Reading ${r.weight} ${r.unit}${r.stable ? ' (stable)' : ''}.` };
+    if (r.reason === 'NO_READING_YET' || r.reason === 'STALE') {
+      return { state: 'offline', label: 'No data', detail: r.message || 'Connected, but the scale is not sending weights — check it is switched on and the baud rate.' };
+    }
+    return { state: 'offline', label: 'Error', detail: r.message || 'Could not reach the scale.' };
+  };
+
+  const [posPrinter, barcodePrinter, cashDrawer, weighingScale] = await Promise.all([
+    hw.posPrinter?.enabled === false ? off : printerState(hw.posPrinter?.printerName, printers),
+    hw.barcodePrinter?.enabled === false ? off : printerState(hw.barcodePrinter?.printerName, printers),
+    hw.cashDrawer?.enabled === false ? off : drawerState(hw.cashDrawer, printers, comPorts),
+    hw.weighingScale?.enabled === false ? off : scaleStatus(hw.weighingScale)
+  ]);
+  const barcodeScanner = hw.barcodeScanner?.enabled === false
+    ? off
+    : { state: 'unknown', label: 'On', detail: 'A scanner acts as a keyboard, so it can’t be detected until it scans — use the test box.' };
+
+  res.json({
+    success: true,
+    data: {
+      devices: { posPrinter, barcodePrinter, cashDrawer, weighingScale, barcodeScanner },
+      printers: printers.printers,
+      printersSupported: printers.supported
+    }
+  });
 });
 
 /**
  * Stable weight read for the POS weight display.
  *
- * The Android client talks to the scale over serial and posts the reading back;
- * on desktop and web there is no serial port, so the server answers with a
- * simulated stable read so the billing flow can be exercised end to end.
- * `enabled` defaults to on — a shop that has not touched hardware settings still
- * gets a working weight button rather than a silent 400.
+ * `connectionType: 'serial'` reads a real USB-to-RS232 scale via modules/scaleManager.js;
+ * `'network'` reads a TCP-attached scale the same way; `'keyboard-wedge'` needs no server-side
+ * read at all (the scale types its own reading into the focused input, like a scanner) — this
+ * route is only ever polled for the first two. With no scale set up ('none', or the legacy
+ * 'simulated') it answers NOT_CONNECTED. `weight` is in `unit` and is signed — a negative value
+ * means the scale needs re-zeroing, and the POS refuses to bill it.
  */
-router.get('/hardware/weight', (req, res) => {
+router.get('/hardware/weight', async (req, res) => {
   const scale = req.tenantStore.settings.hardware.weighingScale || {};
   if (scale.enabled === false) {
     return res.status(400).json({ success: false, message: 'Weighing scale is disabled in Settings → Hardware.' });
   }
 
-  const weight = Number((Math.random() * (3.5 - 0.15) + 0.15).toFixed(3));
+  if (scale.connectionType === 'serial' || scale.connectionType === 'network') {
+    const reading = await scaleManager.waitForReading(scale, {
+      timeoutMs: 2500,
+      requireStable: req.query.stable === '1'
+    });
+    if (!reading.ok) {
+      return res.status(reading.reason === 'NO_READING_YET' ? 503 : 400).json({
+        success: false,
+        message: reading.message || SCALE_REASON_MESSAGES[reading.reason] || 'Scale is not responding.',
+        reason: reading.reason
+      });
+    }
+    return res.json({
+      success: true,
+      data: {
+        weight: reading.weight,
+        unit: reading.unit,
+        stable: reading.stable,
+        simulated: false,
+        comPort: scale.comPort || null,
+        raw: reading.raw,
+        readAt: reading.readAt
+      }
+    });
+  }
+
+  // A keyboard-wedge scale types its own reading — answering here with the simulated value would
+  // hand the cashier a random weight to bill.
+  if (scale.connectionType === 'keyboard-wedge') {
+    return res.status(400).json({
+      success: false,
+      reason: 'KEYBOARD_WEDGE',
+      message: 'This scale types its reading itself — click the quantity box and press the scale\'s send key.'
+    });
+  }
+
+  // No scale set up ('none', or the old 'simulated' default). This used to answer with a random
+  // "simulated" weight, which a cashier could bill — a real counter must never get a made-up weight.
+  res.status(400).json({
+    success: false,
+    reason: 'NOT_CONNECTED',
+    message: 'No weighing scale is connected — plug it in and use Settings → Hardware → Detect scale, or type the weight.'
+  });
+});
+
+/**
+ * Finds a scale on this PC's COM ports by listening for weight data (modules/scaleManager.js
+ * detectScales) and, when exactly one is found, sets it up and switches it on. Billing calls this
+ * while no scale is set up, so plugging one in is enough; Settings calls it with `force`.
+ */
+router.post('/hardware/weight/detect', async (req, res) => {
+  const hardware = req.tenantStore.settings.hardware;
+  const scale = hardware.weighingScale || {};
+  const result = await scaleManager.detectScales({ force: Boolean(req.body && req.body.force) });
+
+  let applied = false;
+  if (result.found.length === 1) {
+    const f = result.found[0];
+    const alreadySet = scale.connectionType === 'serial' && scale.comPort === f.path && Number(scale.baudRate) === f.baudRate;
+    if (!alreadySet) {
+      scaleManager.closeFor(scale);
+      hardware.weighingScale = {
+        ...scale,
+        connectionType: 'serial',
+        comPort: f.path,
+        baudRate: f.baudRate,
+        dataBits: f.dataBits,
+        parity: f.parity,
+        stopBits: f.stopBits,
+        readMode: 'continuous',
+        enabled: true,
+        status: 'connected',
+        lastTestedAt: new Date().toISOString(),
+        lastTestResult: 'OK'
+      };
+      applied = true;
+    }
+  }
+
   res.json({
     success: true,
-    data: {
-      weight,
-      unit: 'kg',
-      stable: true,
-      simulated: scale.status !== 'connected',
-      comPort: scale.comPort || null,
-      readAt: new Date().toISOString()
-    }
+    message: result.found.length === 1
+      ? `Weighing scale found on ${result.found[0].path} (${result.found[0].baudRate} baud) — switched on.`
+      : result.found.length > 1
+        ? `${result.found.length} scales found — pick one in Settings → Hardware.`
+        : 'No scale found. Check it is plugged in and switched on; a scale that only answers a request command must be set up by hand.',
+    data: { ...result, applied, scale: hardware.weighingScale }
   });
+});
+
+/**
+ * Live scale readings as Server-Sent Events, for the POS weight box to auto-fill from while it is
+ * open. One long-lived request instead of polling GET /hardware/weight — every request hydrates the
+ * whole tenant store from MongoDB, which is far too heavy to repeat several times a second. A reading
+ * is pushed only when it changes; the client closes the stream when the weight box closes.
+ */
+const WEIGHT_STREAM_INTERVAL_MS = 150;
+const WEIGHT_STREAM_MAX_MS = 10 * 60 * 1000;
+
+router.get('/hardware/weight/stream', (req, res) => {
+  const scale = req.tenantStore.settings.hardware.weighingScale || {};
+  if (scale.enabled === false) {
+    return res.status(400).json({ success: false, message: 'Weighing scale is disabled in Settings → Hardware.' });
+  }
+  if (scale.connectionType !== 'serial' && scale.connectionType !== 'network') {
+    return res.status(400).json({ success: false, message: 'Live weight needs a USB/Serial or Network scale in Settings → Hardware.' });
+  }
+
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+
+  let last = '';
+  const push = () => {
+    const r = scaleManager.getLiveReading(scale);
+    // What the scale is really sending, so Settings can show it flowing (updates with every new line).
+    const d = scaleManager.getDiagnostics(scale);
+    const feed = { bytes: d.bytesReceived || 0, rawLines: (d.rawLines || []).map((l) => l.line), display: scaleManager.displayWeight(scale) };
+    // Before the first settle, show the moving weight as "Settling…" (stable:false — billing refuses it)
+    // rather than a blank "Waiting for scale…".
+    const settling = !r.ok && r.reason === 'NO_READING_YET' && d.connected && !d.error && d.lastWeight !== null && d.lastWeight !== undefined;
+    const payload = r.ok
+      ? { ok: true, weight: r.weight, unit: r.unit, stable: r.stable, ...feed }
+      : settling
+        ? { ok: true, weight: d.lastWeight, unit: scale.unit || 'kg', stable: false, ...feed }
+      : { ok: false, reason: r.reason, message: r.message || SCALE_REASON_MESSAGES[r.reason] || 'Scale is not responding.', ...feed };
+    const json = JSON.stringify(payload);
+    if (json !== last) {
+      last = json;
+      res.write(`data: ${json}\n\n`);
+    }
+  };
+
+  push();
+  const timer = setInterval(push, WEIGHT_STREAM_INTERVAL_MS);
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 15000);
+  // A tab left open on the weight box shouldn't hold a stream forever; the client reconnects if it's still open.
+  const lifetime = setTimeout(() => res.end(), WEIGHT_STREAM_MAX_MS);
+  req.on('close', () => {
+    clearInterval(timer);
+    clearInterval(heartbeat);
+    clearTimeout(lifetime);
+  });
+});
+
+/** Raw lines the scale has been sending — for working out a new scale's data format in Settings. */
+router.get('/hardware/weight/diagnostics', (req, res) => {
+  const scale = req.tenantStore.settings.hardware.weighingScale || {};
+  res.json({ success: true, data: scaleManager.getDiagnostics(scale) });
+});
+
+/** Parses a sample line with the saved scale format (optionally overridden) — lets Settings check a format without hardware. */
+router.post('/hardware/weight/parse-test', (req, res) => {
+  const scale = req.tenantStore.settings.hardware.weighingScale || {};
+  const { line, ...overrides } = req.body || {};
+  if (typeof line !== 'string' || !line.trim()) {
+    return res.status(400).json({ success: false, message: 'Paste a sample line from the scale.' });
+  }
+  const { patch, error } = sanitiseHardwarePatch(overrides);
+  if (error) return res.status(400).json({ success: false, message: error });
+
+  const parsed = scaleManager.parseScaleLine(scaleManager.decodeEscapes(line).toString('latin1'), { ...scale, ...patch });
+  if (!parsed) return res.json({ success: true, data: { matched: false } });
+  res.json({ success: true, data: { matched: true, ...parsed } });
+});
+
+/** Lists real COM ports present on this machine, for a Settings → Hardware port picker. */
+router.get('/hardware/serial-ports', async (req, res) => {
+  const ports = await scaleManager.listSerialPorts();
+  res.json({ success: true, data: ports });
+});
+
+/**
+ * Fires the drawer-kick pulse. Called automatically right after a cash sale completes (frontend,
+ * best-effort — a failed kick never blocks or unwinds a sale), and also exposed for a manual
+ * "Open Drawer" button and the Settings "Test Connection" flow.
+ */
+router.post('/hardware/cash-drawer/open', async (req, res) => {
+  const drawer = req.tenantStore.settings.hardware.cashDrawer;
+  const result = await openCashDrawer(drawer);
+  if (!result.ok) return res.status(400).json({ success: false, message: result.message || 'Could not open the cash drawer.' });
+  res.json({ success: true, message: result.simulated ? 'Drawer kick simulated (no hardware connected).' : 'Drawer kick-out pulse sent.', data: result });
 });
 
 /** Record a reading taken by a real scale on the client side. */
@@ -208,132 +566,37 @@ router.post('/hardware/weight', (req, res) => {
   res.json({ success: true, data: { weight, unit: scale.unit || 'kg', stable: true, readAt: scale.lastReadAt } });
 });
 
-/**
- * Weight-embedded barcode syntax — a configurable ordered list of segments (Settings > Barcode) a
- * scale-printed label is built from. Segment types:
- *   - prefix:   fixed marker digits (checked against a configured `value`) — the old, simple shape.
- *   - sku:      the product-code tail used to find the matching product.
- *   - weight:   a single scaled integer weight (legacy shape — scaled by 10^precision).
- *   - unitFlag: a measuring-unit indicator — one printed character (W/P/D/B, or whatever the shop
- *               uses) selects which of that segment's `units[]` entries applies, and THAT unit's own
- *               `length`/`precision` is what the following digits are read as. This is what lets one
- *               barcode format handle a weighed item (e.g. "W" + 3-digit-kg + 3-digit-gram) and a
- *               piece-counted item (e.g. "P" + 3-digit count) side by side, since which unit's field
- *               widths apply is decided by the character actually scanned, not fixed in advance.
- * Falls back to the old hardcoded prefix '21' + 5 + 5(precision 3) shape for a tenant that never configured it.
- */
-const DEFAULT_BARCODE_SEGMENTS = [
-  { type: 'prefix', length: 2, value: '21' },
-  { type: 'sku', length: 5 },
-  { type: 'weight', length: 5, precision: 3 }
-];
-
-const getBarcodeSegments = (store) => {
-  const segments = store.settings?.hardware?.weighingScale?.barcodeSegments;
-  return Array.isArray(segments) && segments.length ? segments : DEFAULT_BARCODE_SEGMENTS;
-};
-
-/** Walks the configured segments against a scanned code; returns null if it doesn't match this shop's format at all. */
-function decodeEmbeddedBarcode(store, code) {
-  const segments = getBarcodeSegments(store);
-
-  let pos = 0;
-  let skuTail = null;
-  let quantity = null;
-
-  for (const seg of segments) {
-    const len = Number(seg.length) || 0;
-    if (!len || pos + len > code.length) return null;
-    const chunk = code.slice(pos, pos + len);
-    pos += len;
-
-    if (seg.type === 'prefix') {
-      const expected = seg.value !== undefined && seg.value !== '' ? String(seg.value).padStart(len, '0') : null;
-      if (expected && chunk !== expected) return null;
-    } else if (seg.type === 'sku') {
-      skuTail = chunk;
-    } else if (seg.type === 'weight') {
-      const raw = Number(chunk);
-      if (!Number.isFinite(raw)) return null;
-      quantity = raw / Math.pow(10, Number(seg.precision) || 0);
-    } else if (seg.type === 'unitFlag') {
-      const flagVal = chunk.trim().toUpperCase();
-      const unit = (seg.units || []).find((u) => u.enabled && String(u.code || '').toUpperCase() === flagVal);
-      if (!unit) return null;
-      const uLen = Number(unit.length) || 0;
-      if (!uLen || pos + uLen > code.length) return null;
-      const uChunk = code.slice(pos, pos + uLen);
-      pos += uLen;
-      const raw = Number(uChunk);
-      if (!Number.isFinite(raw)) return null;
-      quantity = raw / Math.pow(10, Number(unit.precision) || 0);
-    }
-  }
-
-  if (!skuTail || !Number.isFinite(quantity)) return null;
-
-  const product = (store.products || []).find(
-    (p) => String(p.barcode).slice(-skuTail.length) === skuTail || (p.barcodes || []).some((b) => String(b).slice(-skuTail.length) === skuTail)
-  );
-  if (!product) return null;
-  return { product, quantity: Math.round(quantity * 1000) / 1000 };
-}
-
-/** The write side of the same syntax — used when printing a weight-embedded label. */
-function encodeEmbeddedBarcode(store, product, qty) {
-  const segments = getBarcodeSegments(store);
-  const q = Number(qty) || 0;
-
-  return segments
-    .map((seg) => {
-      const len = Number(seg.length) || 0;
-      if (seg.type === 'prefix') return String(seg.value || '').padStart(len, '0').slice(-len);
-      if (seg.type === 'sku') return String(product.barcode || '').slice(-len).padStart(len, '0');
-      if (seg.type === 'weight') {
-        const raw = Math.round(q * Math.pow(10, Number(seg.precision) || 0));
-        return String(Math.max(0, raw)).padStart(len, '0').slice(-len);
-      }
-      if (seg.type === 'unitFlag') {
-        // Pick whichever enabled unit best matches this product: prefer a fractional
-        // (precision > 0) unit for weighed items, a whole-count unit otherwise.
-        const enabled = (seg.units || []).filter((u) => u.enabled);
-        const unit =
-          enabled.find((u) => (product.requiresWeight ? Number(u.precision) > 0 : Number(u.precision) === 0)) ||
-          enabled[0];
-        if (!unit) return ''.padStart(len, '0');
-        const flag = String(unit.code || '').slice(0, len).padEnd(len, ' ');
-        const uLen = Number(unit.length) || 0;
-        const raw = Math.round(q * Math.pow(10, Number(unit.precision) || 0));
-        const uChunk = String(Math.max(0, raw)).padStart(uLen, '0').slice(-uLen);
-        return flag + uChunk;
-      }
-      return ''.padStart(len, '0');
-    })
-    .join('');
-}
+// decodeBarcodeFormat / encodeBarcodeFormat now live in modules/barcodeFormat.js, shared with
+// the product form's barcode Generate button in controllers/catalog.controller.js.
 
 router.get('/hardware/decode-barcode/:code', (req, res) => {
   const store = req.tenantStore;
   const code = String(req.params.code).trim();
 
   const direct = (store.products || []).find(
-    (p) => p.barcode === code || (p.barcodes || []).includes(code)
+    (p) => p.barcode === code || p.sku === code || (p.barcodes || []).includes(code)
   );
   if (direct) {
     return res.json({ success: true, data: { product: direct, quantity: 1, embedded: false } });
   }
 
-  const decoded = decodeEmbeddedBarcode(store, code);
-  if (decoded) {
-    return res.json({
-      success: true,
-      data: {
-        product: decoded.product,
-        quantity: decoded.quantity,
-        embedded: true,
-        amount: Math.round(decoded.quantity * decoded.product.price * 100) / 100
-      }
-    });
+  // Only actually attempted as an embedded barcode when at least one weighed product exists —
+  // otherwise every plain barcode miss would surface a confusing "No weight-embedded products
+  // configured" instead of the plainer "No product matches that barcode."
+  const hasWeighedProducts = (store.products || []).some((p) => p.requiresWeight);
+  if (hasWeighedProducts) {
+    const result = validateBarcode(store, code);
+    if (result.valid) {
+      return res.json({
+        success: true,
+        data: {
+          product: result.product,
+          quantity: result.quantity,
+          embedded: true,
+          amount: Math.round(result.quantity * result.product.price * 100) / 100
+        }
+      });
+    }
   }
 
   res.status(404).json({ success: false, message: 'No product matches that barcode.' });
@@ -347,6 +610,16 @@ router.post('/hardware/barcode-label', (req, res) => {
   if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
 
   const qty = Number(weight) || Number(quantity) || 1;
+  // A quantity too big for the label's digits would print clamped to the maximum and scan as the wrong amount.
+  if (product.requiresWeight) {
+    const max = maxLabelQuantity(store, product);
+    if (max !== null && qty > max) {
+      return res.status(400).json({
+        success: false,
+        message: `Quantity ${qty} doesn't fit on this label — the most it can hold is ${max}. Increase the length in Settings → Barcode.`
+      });
+    }
+  }
   const amount = Math.round(qty * product.price * 100) / 100;
 
   // The label printer is configured under either key depending on how old the
@@ -360,9 +633,9 @@ router.post('/hardware/barcode-label', (req, res) => {
     data: {
       productName: product.printName || product.regionalName || product.name,
       barcode: product.barcode,
-      // Weight-embedded payload built from the tenant's configured barcode segments.
+      // Weight-embedded payload built from the store's shared barcode format.
       encoded: product.requiresWeight
-        ? encodeEmbeddedBarcode(store, product, qty)
+        ? encodeBarcodeFormat(store, product, qty)
         : product.barcode,
       unit: product.unit,
       quantity: qty,

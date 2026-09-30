@@ -1,0 +1,680 @@
+[
+  {
+    "id": "p_1786540064925_304",
+    "name": "DIAG_TEST_1790491293711",
+    "oldSku": "10001",
+    "newSku": "10000"
+  },
+  {
+    "id": "p_1786540127652_467",
+    "name": "Tea power",
+    "oldSku": "10002",
+    "newSku": "10001"
+  },
+  {
+    "id": "p_1786808737811_299",
+    "name": "Sugar",
+    "oldSku": "10003",
+    "newSku": "10002"
+  },
+  {
+    "id": "p_1786808899855_48",
+    "name": "Tea",
+    "oldSku": "10004",
+    "newSku": "10003"
+  },
+  {
+    "id": "p_1786859234678_219",
+    "name": "Floor Cleaner 1L",
+    "oldSku": "10005",
+    "newSku": "10004"
+  },
+  {
+    "id": "p_1786859234677_846",
+    "name": "Mop",
+    "oldSku": "10006",
+    "newSku": "10005"
+  },
+  {
+    "id": "p_1786859234677_886",
+    "name": "Plastic Bucket 20L",
+    "oldSku": "10007",
+    "newSku": "10006"
+  },
+  {
+    "id": "p_1786859234675_644",
+    "name": "LED Bulb 9W",
+    "oldSku": "10008",
+    "newSku": "10007"
+  },
+  {
+    "id": "p_1786859234675_842",
+    "name": "USB Cable Type-C",
+    "oldSku": "10009",
+    "newSku": "10008"
+  },
+  {
+    "id": "p_1786859234675_871",
+    "name": "A4 Paper 500 Sheets",
+    "oldSku": "10010",
+    "newSku": "10009"
+  },
+  {
+    "id": "p_1786859234674_277",
+    "name": "Ball Pen Blue",
+    "oldSku": "10011",
+    "newSku": "10010"
+  },
+  {
+    "id": "p_1786859234673_731",
+    "name": "Notebook 200 Pages",
+    "oldSku": "10012",
+    "newSku": "10011"
+  },
+  {
+    "id": "p_1786859234673_710",
+    "name": "Shampoo 180ml",
+    "oldSku": "10013",
+    "newSku": "10012"
+  },
+  {
+    "id": "p_1786859234673_965",
+    "name": "Bath Soap 100g",
+    "oldSku": "10014",
+    "newSku": "10013"
+  },
+  {
+    "id": "p_1786859234672_366",
+    "name": "Bread 400g",
+    "oldSku": "10015",
+    "newSku": "10014"
+  },
+  {
+    "id": "p_1786859234671_152",
+    "name": "Curd 500g",
+    "oldSku": "10016",
+    "newSku": "10015"
+  },
+  {
+    "id": "p_1786859234671_68",
+    "name": "Biscuits 100g",
+    "oldSku": "10017",
+    "newSku": "10016"
+  },
+  {
+    "id": "p_1786859234670_373",
+    "name": "Cooking Oil 1L",
+    "oldSku": "10018",
+    "newSku": "10017"
+  },
+  {
+    "id": "p_1786859234670_263",
+    "name": "Salt 1kg",
+    "oldSku": "10019",
+    "newSku": "10018"
+  },
+  {
+    "id": "p_1786859234669_661",
+    "name": "Toor Dal 1kg",
+    "oldSku": "10020",
+    "newSku": "10019"
+  },
+  {
+    "id": "p_1786859234669_347",
+    "name": "Wheat Flour 1kg",
+    "oldSku": "10021",
+    "newSku": "10020"
+  },
+  {
+    "id": "p_1786859234653_578",
+    "name": "Rice ",
+    "oldSku": "10022",
+    "newSku": "10021"
+  },
+  {
+    "id": "p_1786882885295_845",
+    "name": "Computer Maintenance Service",
+    "oldSku": "10023",
+    "newSku": "10022"
+  },
+  {
+    "id": "p_1786882885295_533",
+    "name": "AC Repair Service",
+    "oldSku": "10024",
+    "newSku": "10023"
+  },
+  {
+    "id": "p_1786882885295_271",
+    "name": "Stapler Medium",
+    "oldSku": "10025",
+    "newSku": "10024"
+  },
+  {
+    "id": "p_1786882885294_55",
+    "name": "File Folder",
+    "oldSku": "10026",
+    "newSku": "10025"
+  },
+  {
+    "id": "p_1786882885294_628",
+    "name": "Printer Paper A4 500 Sheets",
+    "oldSku": "10027",
+    "newSku": "10026"
+  },
+  {
+    "id": "p_1786882885293_337",
+    "name": "Printer Ink Black",
+    "oldSku": "10028",
+    "newSku": "10027"
+  },
+  {
+    "id": "p_1786882885293_434",
+    "name": "WiFi Router",
+    "oldSku": "10029",
+    "newSku": "10028"
+  },
+  {
+    "id": "p_1786882885292_631",
+    "name": "LAN Cable 10m",
+    "oldSku": "10030",
+    "newSku": "10029"
+  },
+  {
+    "id": "p_1786882885292_582",
+    "name": "HDMI Cable 2m",
+    "oldSku": "10031",
+    "newSku": "10030"
+  },
+  {
+    "id": "p_1786882885291_119",
+    "name": "Wireless Mouse",
+    "oldSku": "10032",
+    "newSku": "10031"
+  },
+  {
+    "id": "p_1786882885291_525",
+    "name": "Keyboard USB",
+    "oldSku": "10033",
+    "newSku": "10032"
+  },
+  {
+    "id": "p_1786882885291_432",
+    "name": "Bluetooth Speaker",
+    "oldSku": "10034",
+    "newSku": "10033"
+  },
+  {
+    "id": "p_1786882885290_912",
+    "name": "Power Bank 10000mAh",
+    "oldSku": "10035",
+    "newSku": "10034"
+  },
+  {
+    "id": "p_1786882885290_760",
+    "name": "Mobile Charger 20W",
+    "oldSku": "10036",
+    "newSku": "10035"
+  },
+  {
+    "id": "p_1786882885289_492",
+    "name": "Table Fan",
+    "oldSku": "10037",
+    "newSku": "10036"
+  },
+  {
+    "id": "p_1786882885289_347",
+    "name": "Electric Kettle 1.5L",
+    "oldSku": "10038",
+    "newSku": "10037"
+  },
+  {
+    "id": "p_1786882885288_261",
+    "name": "Lunch Box 1L",
+    "oldSku": "10039",
+    "newSku": "10038"
+  },
+  {
+    "id": "p_1786882885287_917",
+    "name": "Kitchen Knife",
+    "oldSku": "10040",
+    "newSku": "10039"
+  },
+  {
+    "id": "p_1786882885287_671",
+    "name": "Stainless Steel Spoon",
+    "oldSku": "10041",
+    "newSku": "10040"
+  },
+  {
+    "id": "p_1786882885286_611",
+    "name": "Steel Tumbler",
+    "oldSku": "10042",
+    "newSku": "10041"
+  },
+  {
+    "id": "p_1786882885286_88",
+    "name": "Plastic Storage Box 5L",
+    "oldSku": "10043",
+    "newSku": "10042"
+  },
+  {
+    "id": "p_1786882885285_357",
+    "name": "Garbage Bags 30pcs",
+    "oldSku": "10044",
+    "newSku": "10043"
+  },
+  {
+    "id": "p_1786882885285_565",
+    "name": "Dustpan",
+    "oldSku": "10045",
+    "newSku": "10044"
+  },
+  {
+    "id": "p_1786882885284_311",
+    "name": "Broom Stick",
+    "oldSku": "10046",
+    "newSku": "10045"
+  },
+  {
+    "id": "p_1786882885284_491",
+    "name": "Floor Mop Refill",
+    "oldSku": "10047",
+    "newSku": "10046"
+  },
+  {
+    "id": "p_1786882885284_628",
+    "name": "Glass Cleaner 500ml",
+    "oldSku": "10048",
+    "newSku": "10047"
+  },
+  {
+    "id": "p_1786882885283_182",
+    "name": "Phenyl 1L",
+    "oldSku": "10049",
+    "newSku": "10048"
+  },
+  {
+    "id": "p_1786882885283_71",
+    "name": "Toilet Cleaner 500ml",
+    "oldSku": "10050",
+    "newSku": "10049"
+  },
+  {
+    "id": "p_1786882885282_305",
+    "name": "Hand Wash 250ml",
+    "oldSku": "10051",
+    "newSku": "10050"
+  },
+  {
+    "id": "p_1786882885281_752",
+    "name": "Dishwash Liquid 500ml",
+    "oldSku": "10052",
+    "newSku": "10051"
+  },
+  {
+    "id": "p_1786882885281_385",
+    "name": "Detergent Liquid 1L",
+    "oldSku": "10053",
+    "newSku": "10052"
+  },
+  {
+    "id": "p_1786882885280_721",
+    "name": "Cabbage 1kg",
+    "oldSku": "10054",
+    "newSku": "10053"
+  },
+  {
+    "id": "p_1786882885279_150",
+    "name": "Beans 1kg",
+    "oldSku": "10055",
+    "newSku": "10054"
+  },
+  {
+    "id": "p_1786882885279_197",
+    "name": "Carrot 1kg",
+    "oldSku": "10056",
+    "newSku": "10055"
+  },
+  {
+    "id": "p_1786882885278_39",
+    "name": "Coriander 1kg",
+    "oldSku": "10057",
+    "newSku": "10056"
+  },
+  {
+    "id": "p_1786882885278_924",
+    "name": "Green Chilli 1kg",
+    "oldSku": "10058",
+    "newSku": "10057"
+  },
+  {
+    "id": "p_1786882885277_484",
+    "name": "Coconut 1pc",
+    "oldSku": "10059",
+    "newSku": "10058"
+  },
+  {
+    "id": "p_1786882885277_713",
+    "name": "Jaggery 1kg",
+    "oldSku": "10060",
+    "newSku": "10059"
+  },
+  {
+    "id": "p_1786882885276_926",
+    "name": "Tamarind 500g",
+    "oldSku": "10061",
+    "newSku": "10060"
+  },
+  {
+    "id": "p_1786882885276_345",
+    "name": "Mustard Seeds 100g",
+    "oldSku": "10062",
+    "newSku": "10061"
+  },
+  {
+    "id": "p_1786882885276_893",
+    "name": "Groundnut Oil 1L",
+    "oldSku": "10063",
+    "newSku": "10062"
+  },
+  {
+    "id": "p_1786882885275_433",
+    "name": "Coconut Oil 1L",
+    "oldSku": "10064",
+    "newSku": "10063"
+  },
+  {
+    "id": "p_1786882885275_558",
+    "name": "Butter 500g",
+    "oldSku": "10065",
+    "newSku": "10064"
+  },
+  {
+    "id": "p_1786882885274_594",
+    "name": "Paneer 200g",
+    "oldSku": "10066",
+    "newSku": "10065"
+  },
+  {
+    "id": "p_1786882885273_442",
+    "name": "Ghee 500ml",
+    "oldSku": "10067",
+    "newSku": "10066"
+  },
+  {
+    "id": "p_1786882885273_664",
+    "name": "Vermicelli 400g",
+    "oldSku": "10068",
+    "newSku": "10067"
+  },
+  {
+    "id": "p_1786882885272_126",
+    "name": "Poha 500g",
+    "oldSku": "10069",
+    "newSku": "10068"
+  },
+  {
+    "id": "p_1786882885271_425",
+    "name": "Maida 1kg",
+    "oldSku": "10070",
+    "newSku": "10069"
+  },
+  {
+    "id": "p_1786882885271_426",
+    "name": "Rava 1kg",
+    "oldSku": "10071",
+    "newSku": "10070"
+  },
+  {
+    "id": "p_1786882885271_410",
+    "name": "Besan 500g",
+    "oldSku": "10072",
+    "newSku": "10071"
+  },
+  {
+    "id": "p_1786882885270_764",
+    "name": "Cardamom 50g",
+    "oldSku": "10073",
+    "newSku": "10072"
+  },
+  {
+    "id": "p_1786882885270_797",
+    "name": "Tomato 1kg",
+    "oldSku": "10074",
+    "newSku": "10073"
+  },
+  {
+    "id": "p_1786882885269_101",
+    "name": "Potato 1kg",
+    "oldSku": "10075",
+    "newSku": "10074"
+  },
+  {
+    "id": "p_1786882885269_176",
+    "name": "Onion 1kg",
+    "oldSku": "10076",
+    "newSku": "10075"
+  },
+  {
+    "id": "p_1786882885268_188",
+    "name": "Garlic 1kg",
+    "oldSku": "10077",
+    "newSku": "10076"
+  },
+  {
+    "id": "p_1786882885268_5",
+    "name": "Ginger 1kg",
+    "oldSku": "10078",
+    "newSku": "10077"
+  },
+  {
+    "id": "p_1786882885267_35",
+    "name": "Black Pepper 100g",
+    "oldSku": "10079",
+    "newSku": "10078"
+  },
+  {
+    "id": "p_1786882885267_281",
+    "name": "Cumin Seeds 100g",
+    "oldSku": "10080",
+    "newSku": "10079"
+  },
+  {
+    "id": "p_1786882885266_560",
+    "name": "Chilli Powder 200g",
+    "oldSku": "10081",
+    "newSku": "10080"
+  },
+  {
+    "id": "p_1786882885266_678",
+    "name": "Turmeric Powder 200g",
+    "oldSku": "10082",
+    "newSku": "10081"
+  },
+  {
+    "id": "p_1786882885265_349",
+    "name": "Lemon 1kg",
+    "oldSku": "10083",
+    "newSku": "10082"
+  },
+  {
+    "id": "p_1786882885265_47",
+    "name": "Tea Glass",
+    "oldSku": "10084",
+    "newSku": "10083"
+  },
+  {
+    "id": "p_1786882885264_86",
+    "name": "Steel Plate",
+    "oldSku": "10085",
+    "newSku": "10084"
+  },
+  {
+    "id": "p_1786882885263_307",
+    "name": "Water Bottle 1L",
+    "oldSku": "10086",
+    "newSku": "10085"
+  },
+  {
+    "id": "p_1786882885263_723",
+    "name": "Extension Box 4 Socket",
+    "oldSku": "10087",
+    "newSku": "10086"
+  },
+  {
+    "id": "p_1786882885261_109",
+    "name": "Toothbrush",
+    "oldSku": "10088",
+    "newSku": "10087"
+  },
+  {
+    "id": "p_1786882885261_140",
+    "name": "Toothpaste 150g",
+    "oldSku": "10089",
+    "newSku": "10088"
+  },
+  {
+    "id": "p_1786882885260_692",
+    "name": "Detergent Powder 1kg",
+    "oldSku": "10090",
+    "newSku": "10089"
+  },
+  {
+    "id": "p_1786882885259_488",
+    "name": "Milk 500ml",
+    "oldSku": "10091",
+    "newSku": "10090"
+  },
+  {
+    "id": "p_1786882885257_790",
+    "name": "Sugar 1kg",
+    "oldSku": "10092",
+    "newSku": "10091"
+  },
+  {
+    "id": "p_1786882885254_256",
+    "name": "ice",
+    "oldSku": "10093",
+    "newSku": "10092"
+  },
+  {
+    "id": "p_1786882885254_142",
+    "name": "Repair",
+    "oldSku": "10094",
+    "newSku": "10093"
+  },
+  {
+    "id": "p_1786882885253_122",
+    "name": "Lemon",
+    "oldSku": "10095",
+    "newSku": "10094"
+  },
+  {
+    "id": "p_1786882885224_42",
+    "name": "Puma Sports Shoes Size 9",
+    "oldSku": "10096",
+    "newSku": "10095"
+  },
+  {
+    "id": "p_1786883581342_440",
+    "name": "Coffee Powder 200g",
+    "oldSku": "10097",
+    "newSku": "10096"
+  },
+  {
+    "id": "p_1786883581285_20",
+    "name": "Tea Powder 250g",
+    "oldSku": "10098",
+    "newSku": "10097"
+  },
+  {
+    "id": "p_1786883581278_899",
+    "name": "ABC combo",
+    "oldSku": "10099",
+    "newSku": "10098"
+  },
+  {
+    "id": "p_1787650544752_661",
+    "name": "Candy",
+    "oldSku": "10100",
+    "newSku": "10099"
+  },
+  {
+    "id": "p_1788179072147_460",
+    "name": "wheat",
+    "oldSku": "10101",
+    "newSku": "10100"
+  },
+  {
+    "id": "p_1788180204271_712",
+    "name": "egg",
+    "oldSku": "10102",
+    "newSku": "10101"
+  },
+  {
+    "id": "prod_rice_5k",
+    "name": "Royal Heritage Basmati Rice ",
+    "oldSku": "10103",
+    "newSku": "10102"
+  },
+  {
+    "id": "prod_oil_1l",
+    "name": "Fortune Sunlite Sunflower Oil (1L Pouch)",
+    "oldSku": "10104",
+    "newSku": "10103"
+  },
+  {
+    "id": "prod_tata_tea_500",
+    "name": "Tata Tea Premium (500g Pack)",
+    "oldSku": "10105",
+    "newSku": "10104"
+  },
+  {
+    "id": "prod_nescafe_100",
+    "name": "Nescafe Classic Instant Coffee (100g Jar)",
+    "oldSku": "10106",
+    "newSku": "10105"
+  },
+  {
+    "id": "prod_amul_butter_500",
+    "name": "Amul Pasteurized Butter (500g)",
+    "oldSku": "10107",
+    "newSku": "10106"
+  },
+  {
+    "id": "prod_frooti_1l",
+    "name": "Frooti Mango Drink (1L Tetra Pack)",
+    "oldSku": "10108",
+    "newSku": "10107"
+  },
+  {
+    "id": "p_1788261147270_760",
+    "name": "Ragi",
+    "oldSku": "10109",
+    "newSku": "10108"
+  },
+  {
+    "id": "p_1788262024949_960",
+    "name": "tomato",
+    "oldSku": "10110",
+    "newSku": "10109"
+  },
+  {
+    "id": "p_1789651099640_183",
+    "name": "Keyboard",
+    "oldSku": "10111",
+    "newSku": "10110"
+  },
+  {
+    "id": "p_1790494222731_963",
+    "name": "kambu",
+    "oldSku": "10112",
+    "newSku": "10111"
+  },
+  {
+    "id": "p_1790602605271_136",
+    "name": "scanner",
+    "oldSku": "10113",
+    "newSku": "10112"
+  }
+]

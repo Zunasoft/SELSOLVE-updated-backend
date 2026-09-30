@@ -14,6 +14,8 @@ router.delete('/categories/:id', catalog.deleteCategory);
 
 router.get('/products', catalog.getProducts);
 router.get('/products/lookup/:barcode', catalog.lookupProduct);
+router.post('/products/generate-barcode', catalog.generateNextBarcode);
+router.post('/products/generate-sku', catalog.generateNextSku);
 router.post('/products', catalog.createProduct);
 router.put('/products/:id', catalog.updateProduct);
 router.delete('/products/:id', catalog.deleteProduct);

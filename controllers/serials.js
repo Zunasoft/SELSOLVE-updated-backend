@@ -159,6 +159,13 @@ function restoreSerial(product, serialId) {
   return serial;
 }
 
+/** Voiding the whole purchase that brought these units in — the serial counterpart of voidPurchaseBatches. Mirrors its "just remove them" simplicity: a unit already sold is left as SOLD (voiding a purchase doesn't unwind a later sale), only units still traceable to this purchase and never sold are pulled back out. */
+function voidPurchaseSerials(product, purchaseId) {
+  if (!Array.isArray(product.serials)) return;
+  product.serials = product.serials.filter((s) => s.refPurchaseId !== purchaseId || s.status !== 'IN_STOCK');
+  recomputeSerialStock(product);
+}
+
 /**
  * Creates one serial record for a unit received on a purchase — the serial
  * counterpart of `addBatchSafely`. Called once per unit (a purchase line for
@@ -224,5 +231,6 @@ module.exports = {
   markSerialSold,
   addSerialFromPurchase,
   returnSerialToVendor,
-  restoreSerial
+  restoreSerial,
+  voidPurchaseSerials
 };

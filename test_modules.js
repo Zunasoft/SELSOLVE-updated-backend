@@ -461,8 +461,9 @@ async function run() {
 
   section('Module 13 — hardware');
 
+  // With no scale set up, the server must say so rather than invent a weight a cashier could bill.
   const weight = await request('GET', '/hardware/weight');
-  check('Weighing scale responds', weight.body.success === true, `${weight.body.data.weight} kg`);
+  check('No scale connected is reported, never a made-up weight', weight.status === 400 && weight.body.reason === 'NOT_CONNECTED', weight.body.message);
 
   const label = await request('POST', '/hardware/barcode-label', { productId: multi.body.data.id, quantity: 2 });
   check('Barcode label generated', label.body.success === true, label.body.data.encoded);

@@ -15,6 +15,7 @@ const { setRecipe, removeRecipe, decorateRecipe, recipeFromProductPayload } = re
 const { shapeBatches, writeOffBatch } = require('./batches');
 const { shapeSerials, shapeSerialCustomLabels } = require('./serials');
 const { enforceQtyPrecision, isWholeNumberUnit } = require('./unitConversion');
+const { getStoreBarcodeFormat, encodeBarcodeFormat } = require('../modules/barcodeFormat');
 
 const actor = (req) => req.headers['x-user-name'] || 'Owner';
 const num = (v, fallback = 0) => {
@@ -26,36 +27,172 @@ const num = (v, fallback = 0) => {
 const randomBarcode = () => Math.floor(1000000000 + Math.random() * 9000000000).toString();
 
 /**
- * Barcode Generation (Zoho Books-style): a persistent prefix+sequential-number
- * counter lives on the store, seeded from the highest existing barcode that
- * matches the configured prefix so a freshly-loaded store never collides with
- * barcodes assigned earlier. Configurable in Settings > Barcode.
+ * Smallest available number in [floor, 10^digits - 1] whose formatted candidate isn't already in
+ * `used` — a fresh scan against CURRENT product data every call, rather than an ever-advancing
+ * counter, so three things fall out for free:
+ *   1. No duplicates — every candidate is checked against everything actually in use right now.
+ *   2. Deleted codes get reclaimed — a product that's gone no longer blocks its old number.
+ *   3. The result never exceeds the configured digit length — once the range [floor, max] is
+ *      genuinely exhausted this throws instead of silently wrapping back into reused-looking
+ *      numbers (what padStart+slice(-digits) used to do once the count passed the digit cap).
  */
-function generateBarcode(store) {
-  const cfg = store.settings?.barcode || {};
-  const prefix = cfg.prefix ? String(cfg.prefix) : '';
-  const digits = Number(cfg.digits) || 6;
-  if (!Number.isFinite(store.barcodeSeq)) {
-    const existingMax = (store.products || []).reduce((max, p) => {
-      const code = String(p.barcode || '');
-      if (prefix && !code.startsWith(prefix)) return max;
-      const digitsPart = code.slice(prefix.length).replace(/\D/g, '');
-      const n = digitsPart ? parseInt(digitsPart, 10) : 0;
-      return n > max ? n : max;
-    }, 0);
-    store.barcodeSeq = existingMax;
+function nextAvailableCode(floor, digits, used, format, maxOverride = null, exhaustedHint = '') {
+  const max = maxOverride !== null ? maxOverride : Math.pow(10, digits) - 1;
+  for (let n = floor; n <= max; n++) {
+    const candidate = format(n);
+    if (!used.has(candidate)) return candidate;
   }
-  store.barcodeSeq += 1;
-  return `${prefix}${String(store.barcodeSeq).padStart(digits, '0')}`;
+  throw new Error(`No ${digits}-digit codes left — every value from ${floor} to ${max} is already in use.${exhaustedHint}`);
+}
+
+/** Every barcode/SKU/Product-ID currently on any product, as literal strings — the shared collision set so a generated barcode can never equal an existing SKU (or vice versa) and a generated code never matches a Product ID either. */
+function collectUsedCodes(store, extraUsed) {
+  const used = new Set();
+  (store.products || []).forEach((p) => {
+    if (p.barcode) used.add(String(p.barcode).trim());
+    if (Array.isArray(p.barcodes)) p.barcodes.forEach((b) => b && used.add(String(b).trim()));
+    if (p.customSubUnitBarcode) used.add(String(p.customSubUnitBarcode).trim());
+    if (Array.isArray(p.altUnits)) p.altUnits.forEach((u) => u?.barcode && used.add(String(u.barcode).trim()));
+    if (p.sku) used.add(String(p.sku).trim());
+    if (p.embeddedId) used.add(String(p.embeddedId).trim());
+  });
+  (extraUsed || []).forEach((x) => x && used.add(String(x).trim()));
+  return used;
 }
 
 /**
- * Alternate units — Module 4 "Multiple Units".
- *
- * A product is stocked in one base unit; everything else is a conversion from
- * it. A box of 12 pieces sells as one line at 12× the piece rate and takes 12
- * off stock, so the factor is what the billing screen multiplies by.
+ * Barcode Generation — sequential, prefix + fixed digit-length, configured in Settings > Barcode.
+ * Starts from 1 (a 5-digit store's first barcode is "00001").
  */
+function generateBarcode(store, extraUsed = []) {
+  const cfg = store.settings?.barcode || {};
+  const prefix = cfg.prefix ? String(cfg.prefix) : '';
+  const formatFields = getStoreBarcodeFormat(store);
+  const idField = formatFields.find((f) => f.type === 'id');
+  const digits = Math.max(1, Number(cfg.digits) || Number(idField?.length) || 5);
+
+  const used = collectUsedCodes(store, extraUsed);
+  // Barcodes stay in the 0xxxx… band (00001–09999 at 5 digits) so they never look like a 1xxxx SKU —
+  // running out stops here and asks for a longer barcode length instead of spilling into 1xxxx.
+  const cap = digits >= 2 ? Math.pow(10, digits - 1) - 1 : null;
+  const candidate = nextAvailableCode(
+    1, digits, used, (n) => `${prefix}${String(n).padStart(digits, '0')}`, cap,
+    ` Increase the barcode digits in Settings → Barcode to continue.`
+  );
+  store.barcodeSeq = parseInt(candidate.slice(prefix.length), 10);
+  return candidate;
+}
+exports.generateBarcode = generateBarcode;
+
+/**
+ * Weight-embedded barcode's Product ID field — draws from the SAME shared collision set as
+ * barcode/SKU (via collectUsedCodes) so it can't collide with either, but starts its own count
+ * from 1 like barcode does, independent of the SKU numbering.
+ */
+function generateEmbeddedId(store, length, extraUsed = []) {
+  const len = Math.max(1, Number(length) || 5);
+  const used = collectUsedCodes(store, extraUsed);
+  const candidate = nextAvailableCode(1, len, used, (n) => String(n).padStart(len, '0'));
+  store.embeddedIdSeq = parseInt(candidate, 10);
+  return candidate;
+}
+exports.generateEmbeddedId = generateEmbeddedId;
+
+/**
+ * SKU Generation — floors at the smallest number that fills the configured length (e.g. a 5-digit
+ * SKU field starts at 10000, so the first generated SKU is "10001") rather than at 1, so a SKU
+ * never looks like a low, barcode-shaped number ("00001") by coincidence.
+ */
+function generateSku(store, extraUsed = []) {
+  const formatFields = getStoreBarcodeFormat(store);
+  const skuField = formatFields.find((f) => f.type === 'sku');
+  const idField = formatFields.find((f) => f.type === 'id');
+  const len = Math.max(1, Number(skuField?.enabled !== false && skuField?.length ? skuField.length : (idField?.length || skuField?.length || 5)));
+
+  const used = collectUsedCodes(store, extraUsed);
+  // Starts at the smallest length-filling value (10000 for a 5-digit field).
+  const floor = Math.pow(10, len - 1);
+  // SKUs stay in the 1xxxx… band (10000–19999 at 5 digits) — running out never spills into 2xxxx,
+  // it stops and asks for a longer SKU length (Settings → Barcode) so the next range is 100000+.
+  const cap = len >= 2 ? 2 * Math.pow(10, len - 1) - 1 : null;
+  const candidate = nextAvailableCode(
+    floor, len, used, (n) => String(n).padStart(len, '0'), cap,
+    ` Increase the SKU length in Settings → Barcode to continue (a ${len + 1}-digit SKU starts at ${Math.pow(10, len)}).`
+  );
+  store.skuSeq = parseInt(candidate, 10);
+  return candidate;
+}
+exports.generateSku = generateSku;
+
+function validateProductUniqueness(store, product, excludeId = null) {
+  const otherProducts = (store.products || []).filter((p) => p.id !== excludeId);
+
+  // 1. Same-product Barcode vs SKU vs EmbeddedID collision check
+  if (product.sku) {
+    const skuClean = String(product.sku).trim();
+    if (product.barcode && String(product.barcode).trim() === skuClean) {
+      return {
+        valid: false,
+        message: `Barcode and SKU code cannot be the same ("${skuClean}"). Barcode and SKU must differ.`
+      };
+    }
+    if (Array.isArray(product.barcodes) && product.barcodes.some((b) => String(b || '').trim() === skuClean)) {
+      return {
+        valid: false,
+        message: `SKU code ("${skuClean}") cannot be identical to any Barcode on this product. They must differ.`
+      };
+    }
+    if (product.embeddedId && String(product.embeddedId).trim() === skuClean) {
+      return {
+        valid: false,
+        message: `Product ID ("${skuClean}") and SKU code cannot be the same. They must differ.`
+      };
+    }
+  }
+  if (product.barcode && product.embeddedId && String(product.barcode).trim() === String(product.embeddedId).trim()) {
+    return {
+      valid: false,
+      message: 'Barcode and Product ID cannot be the same. They must differ.'
+    };
+  }
+
+  // 2. SKU uniqueness check across all other products
+  if (product.sku) {
+    const skuClean = String(product.sku).trim();
+    const conflict = otherProducts.find((p) => String(p.sku || '').trim() === skuClean);
+    if (conflict) {
+      return {
+        valid: false,
+        message: `SKU "${skuClean}" is already in use by "${conflict.name}". Each product must have a unique SKU.`
+      };
+    }
+  }
+
+  // 3. Barcodes uniqueness check across all other products
+  const candidateBarcodes = [
+    product.barcode,
+    ...(Array.isArray(product.barcodes) ? product.barcodes : [])
+  ].map((b) => String(b || '').trim()).filter(Boolean);
+
+  for (const b of candidateBarcodes) {
+    const conflict = otherProducts.find((p) => {
+      const mainMatch = String(p.barcode || '').trim() === b;
+      const altMatch = Array.isArray(p.barcodes) && p.barcodes.some((alt) => String(alt || '').trim() === b);
+      return mainMatch || altMatch;
+    });
+    if (conflict) {
+      return {
+        valid: false,
+        message: `Barcode "${b}" is already assigned to "${conflict.name}". Barcodes must be unique across all products.`
+      };
+    }
+  }
+
+  return { valid: true };
+}
+exports.validateProductUniqueness = validateProductUniqueness;
+
+
 function shapeAltUnits(payload, existing, baseUnit) {
   const source = Array.isArray(payload.altUnits)
     ? payload.altUnits
@@ -76,7 +213,6 @@ function shapeAltUnits(payload, existing, baseUnit) {
     .map((u) => ({
       unit: String(u.unit).toLowerCase(),
       factor: Number(u.factor),
-      // Blank price/mrp means "base price/mrp × factor", which is the common case.
       price: u.price === undefined || u.price === '' ? null : Number(u.price),
       mrp: u.mrp === undefined || u.mrp === '' ? null : Number(u.mrp),
       barcode: u.barcode ? String(u.barcode).trim() : '',
@@ -84,12 +220,6 @@ function shapeAltUnits(payload, existing, baseUnit) {
     }));
 }
 
-/**
- * A product can belong to more than one category — e.g. "Egg" is both a
- * sellable Product and a Raw Material used in recipes. `categoryIds` holds
- * the full set; `categoryId` (categoryIds[0]) stays the primary category so
- * existing single-category filters, reports and price sheets keep working.
- */
 function shapeCategoryIds(payload, existing, store) {
   let ids;
   if (Array.isArray(payload.categoryIds)) {
@@ -103,21 +233,12 @@ function shapeCategoryIds(payload, existing, store) {
   } else if (existing?.categoryId) {
     ids = [existing.categoryId];
   } else {
-    ids = [store.categories[0]?.id || 'cat_1'];
+    ids = [store?.categories?.[0]?.id || 'cat_1'];
   }
   const clean = [...new Set(ids.map((id) => String(id).trim()).filter(Boolean))];
-  return clean.length ? clean : [store.categories[0]?.id || 'cat_1'];
+  return clean.length ? clean : [store?.categories?.[0]?.id || 'cat_1'];
 }
 
-/**
- * Normalizes any string or legacy label to one of the canonical product types:
- * - standard (Standard Item)
- * - raw (Raw Material)
- * - both (Both Raw Material & Standard Product)
- * - service (Service)
- * - combo (Combo Bundle)
- * - composite (Composite / Recipe)
- */
 function canonicalProductType(val) {
   if (!val) return 'standard';
   const clean = String(val).toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -133,46 +254,23 @@ function canonicalProductType(val) {
   return 'standard';
 }
 
-/**
- * Shapes product types. Items tagged as 'both' receive ['standard', 'raw'].
- */
 function shapeProductTypes(payload, existing) {
-  let raw = '';
-  if (payload.productType) {
-    raw = payload.productType;
-  } else if (Array.isArray(payload.productTypes) && payload.productTypes.length > 1) {
-    raw = 'both';
-  } else if (Array.isArray(payload.productTypes) && payload.productTypes.length === 1) {
-    raw = payload.productTypes[0];
-  } else if (typeof payload.productTypes === 'string' && payload.productTypes.trim()) {
-    raw = payload.productTypes.includes(',') ? 'both' : payload.productTypes;
-  } else if (existing?.productType) {
-    raw = existing.productType;
-  } else if (Array.isArray(existing?.productTypes) && existing.productTypes.length > 1) {
-    raw = 'both';
-  } else if (Array.isArray(existing?.productTypes) && existing.productTypes.length === 1) {
-    raw = existing.productTypes[0];
-  } else if (payload.isComposite) {
-    raw = 'composite';
-  }
-
+  const raw =
+    payload.productType ||
+    (Array.isArray(payload.productTypes) && payload.productTypes.length ? payload.productTypes[0] : null) ||
+    existing?.productType ||
+    (Array.isArray(existing?.productTypes) && existing.productTypes.length ? existing.productTypes[0] : null) ||
+    'standard';
   const type = canonicalProductType(raw);
   const types = type === 'both' ? ['standard', 'raw'] : [type];
   return types;
 }
 
-/**
- * Returns the tenant's unit definitions as an array of objects.
- * Migrates legacy flat-string arrays (`['pcs','kg',...]`) to the new
- * object format (`[{ name, subUnit, factor, locked }, ...]`) on first access.
- */
 function getTenantUnits(store) {
   if (!Array.isArray(store.units) || store.units.length === 0) {
     store.units = DEFAULT_UNITS.map((u) => ({ ...u }));
     return store.units;
   }
-
-  // Migrate: if the first element is a plain string, convert the whole array
   if (typeof store.units[0] === 'string') {
     const defaultMap = Object.fromEntries(DEFAULT_UNITS.map((u) => [u.name, u]));
     store.units = store.units.map((name) => {
@@ -181,11 +279,9 @@ function getTenantUnits(store) {
       return { name: n, subUnit: null, factor: null, locked: false };
     });
   }
-
   return store.units;
 }
 
-/** Find a unit object by name (case-insensitive). */
 function findUnit(units, name) {
   const clean = String(name).toLowerCase().trim();
   return units.find((u) => u.name === clean);
@@ -198,46 +294,30 @@ function getTenantPriceSheets(store) {
   return store.priceSheets;
 }
 
-/**
- * SKU codes are numeric-only, sequential, and grow as large as needed — no
- * padding/truncation, so the counter never runs out of room. The running
- * counter lives on the store; the first time it's needed it's seeded from
- * the highest numeric SKU already in use (falling back to a 6-digit base)
- * so a freshly-loaded store doesn't collide with SKUs assigned earlier.
- */
-function generateSku(store) {
-  if (!Number.isFinite(store.skuSeq)) {
-    const existingMax = (store.products || []).reduce((max, p) => {
-      const digits = String(p.sku || '').replace(/\D/g, '');
-      const n = digits ? parseInt(digits, 10) : 0;
-      return n > max ? n : max;
-    }, 0);
-    store.skuSeq = Math.max(existingMax, 100000);
-  }
-  store.skuSeq += 1;
-  return String(store.skuSeq);
-}
-exports.generateSku = generateSku;
 
 /** Numeric-only: any letters/symbols a user types are stripped, not stored. */
 const cleanSku = (value) => String(value ?? '').replace(/\D/g, '');
 
 function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
+  const enteredSku = payload.sku !== undefined ? cleanSku(payload.sku) : (existing?.sku ? cleanSku(existing.sku) : '');
+  const enteredBarcode = payload.barcode ? String(payload.barcode).trim() : (existing?.barcode ? String(existing.barcode).trim() : (payload.defaultBarcode ? String(payload.defaultBarcode).trim() : ''));
+  const payloadBarcodes = Array.isArray(payload.barcodes)
+    ? payload.barcodes
+    : typeof payload.barcodes === 'string'
+      ? payload.barcodes.split(',')
+      : (existing?.barcodes || []);
+  const cleanAltBarcodes = payloadBarcodes.map((b) => String(b || '').trim()).filter(Boolean);
+
   const barcode =
-    payload.barcode ||
-    existing?.barcode ||
-    payload.defaultBarcode ||
-    (store.settings?.barcode?.autoGenerate === false ? randomBarcode() : generateBarcode(store));
-  const enteredSku = payload.sku !== undefined ? cleanSku(payload.sku) : '';
+    enteredBarcode ||
+    (store.settings?.barcode?.autoGenerate === false ? randomBarcode() : generateBarcode(store, [enteredSku, ...cleanAltBarcodes]));
   const sku = enteredSku !== ''
     ? enteredSku
-    : existing?.sku || generateSku(store);
+    : existing?.sku || generateSku(store, [barcode, ...cleanAltBarcodes]);
 
   let barcodes = [];
-  if (Array.isArray(payload.barcodes) && payload.barcodes.length) {
-    barcodes = [...new Set(payload.barcodes.map((b) => String(b).trim()).filter(Boolean))];
-  } else if (typeof payload.barcodes === 'string' && payload.barcodes.trim()) {
-    barcodes = [...new Set(payload.barcodes.split(',').map((b) => b.trim()).filter(Boolean))];
+  if (cleanAltBarcodes.length) {
+    barcodes = [...new Set(cleanAltBarcodes)];
   } else if (existing?.barcodes?.length) {
     barcodes = [...existing.barcodes];
   } else {
@@ -380,11 +460,20 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
     price,
     mrp: num(payload.mrp, existing?.mrp ?? price),
     purchasePrice,
-    // Margin isn't used in any pricing math itself (Selling Price stays the
-    // one source of truth billing reads) — it's stored purely so re-opening
-    // Add/Edit Product shows the same margin the user configured last time,
-    // instead of it resetting blank.
-    marginPercent: payload.marginPercent !== undefined ? String(payload.marginPercent) : (existing?.marginPercent ?? ''),
+    // Margin isn't used in any pricing math itself (Selling Price/MRP stay the
+    // source of truth billing reads) — each is stored purely so re-opening
+    // Add/Edit Product shows the same margins the user configured last time,
+    // instead of them resetting blank. Selling Price and MRP each keep their
+    // own independent margin — they're priced differently, not off one shared number.
+    // Falls back to the old single `marginPercent` field for a product saved before the SP/MRP
+    // split — without this, every pre-existing product's configured margin would silently reset
+    // blank the first time it's opened, since the old field is never read by name otherwise.
+    marginPercentSp: payload.marginPercentSp !== undefined
+      ? String(payload.marginPercentSp)
+      : (existing?.marginPercentSp ?? existing?.marginPercent ?? ''),
+    marginPercentMrp: payload.marginPercentMrp !== undefined
+      ? String(payload.marginPercentMrp)
+      : (existing?.marginPercentMrp ?? existing?.marginPercent ?? ''),
     wholesalePrice: num(payload.wholesalePrice, existing?.wholesalePrice ?? price),
     specialPrice: num(payload.specialPrice, existing?.specialPrice ?? price),
     // Whole-number units (pcs, box, dozen, ...) can't carry fractional stock —
@@ -405,6 +494,10 @@ function shapeProduct(store, payload, existing = null, updatedBy = 'Owner') {
       : (Number(payload.nearExpiryDays) || null),
     imageUrl: payload.imageUrl ?? existing?.imageUrl ?? '',
     requiresWeight: payload.requiresWeight !== undefined ? Boolean(payload.requiresWeight) : Boolean(existing?.requiresWeight),
+    // The field SHAPE (lengths/precision) is one store-wide setting now (Settings → Barcode) —
+    // only this product's own id number and flag letter stay per-product.
+    embeddedId: payload.embeddedId !== undefined ? String(payload.embeddedId) : (existing?.embeddedId || ''),
+    weightFlag: payload.weightFlag !== undefined ? String(payload.weightFlag).slice(0, 1).toUpperCase() : (existing?.weightFlag || (['kg', 'g', 'gm', 'gms', 'gram', 'grams', 'lb', 'lbs', 'ltr', 'litre', 'l', 'ml'].includes(String(unit || '').toLowerCase()) ? 'W' : 'P')),
     taxRate: num(payload.taxRate, existing?.taxRate ?? 0),
     isComposite: productType === 'composite' || Boolean(payload.isComposite),
     comboItems: Array.isArray(payload.comboItems) ? payload.comboItems : existing?.comboItems || [],
@@ -584,14 +677,17 @@ exports.getProducts = (req, res) => {
 
   if (q) {
     const needle = String(q).toLowerCase();
+    // Only fields a user actually searches by: name, SKU, and this product's own current barcode.
+    // Not the internal `p.id` (an opaque timestamp-based key) or the legacy `p.barcodes` alternates
+    // array — both are long digit strings that can contain a short typed number by coincidence,
+    // surfacing a totally unrelated product.
     rows = rows.filter(
       (p) =>
         p.name.toLowerCase().includes(needle) ||
         (p.printName || '').toLowerCase().includes(needle) ||
         (p.regionalName || '').toLowerCase().includes(needle) ||
         (p.sku || '').toLowerCase().includes(needle) ||
-        p.id.toLowerCase().includes(needle) ||
-        (p.barcodes || [p.barcode]).some((b) => String(b).includes(needle))
+        (p.barcode && String(p.barcode).includes(needle))
     );
   }
 
@@ -624,10 +720,60 @@ exports.getProducts = (req, res) => {
 exports.lookupProduct = (req, res) => {
   const needle = req.params.barcode;
   const product = (req.tenantStore.products || []).find(
-    (p) => p.barcode === needle || p.id === needle || (p.barcodes || []).includes(needle)
+    (p) => p.barcode === needle || p.id === needle || p.sku === needle || (p.barcodes || []).includes(needle) ||
+      p.customSubUnitBarcode === needle || (p.altUnits || []).some((u) => u?.barcode === needle)
   );
-  if (!product) return res.status(404).json({ success: false, message: 'No product matches that barcode or ID.' });
+  if (!product) return res.status(404).json({ success: false, message: 'No product matches that barcode, SKU or ID.' });
   res.json({ success: true, data: product });
+};
+
+/**
+ * On-demand barcode/SKU generation for the product form's "Generate" buttons. These are PREVIEWS —
+ * clicking Generate doesn't create a product, so unlike the fallback inside shapeProduct (which
+ * always advances, because a product IS about to be saved with that value in the same request),
+ * clicking Generate twice without ever saving must not burn two numbers. Each generator here first
+ * checks whether the number it last handed out actually ended up on a saved product; if not, it
+ * hands out that same number again instead of skipping past it.
+ */
+
+/** On-demand barcode generation for the product form's "Generate" button. */
+exports.generateNextBarcode = (req, res) => {
+  const store = req.tenantStore;
+  const exclude = [
+    req.body?.sku,
+    req.body?.embeddedId,
+    ...(Array.isArray(req.body?.barcodes) ? req.body.barcodes : []),
+    ...(Array.isArray(req.body?.exclude) ? req.body.exclude : [])
+  ].filter(Boolean).map((x) => String(x).trim());
+
+  if (req.body?.requiresWeight) {
+    const fields = getStoreBarcodeFormat(store);
+    const idField = fields.find((f) => f.type === 'id');
+    const len = Math.max(1, Number(idField?.length) || 5);
+    const weightFlag = String(req.body.weightFlag || 'W').slice(0, 1).toUpperCase();
+
+    const code = generateEmbeddedId(store, len, exclude);
+    const isPiece = weightFlag === 'P';
+    const example = encodeBarcodeFormat(store, req.body, isPiece ? 12 : 1.235, { embeddedId: code, weightFlag });
+    return res.json({ success: true, data: { value: code, example } });
+  }
+
+  const code = generateBarcode(store, exclude);
+  res.json({ success: true, data: { barcode: code } });
+};
+
+/** On-demand SKU generation for the product form's "Generate" button. */
+exports.generateNextSku = (req, res) => {
+  const store = req.tenantStore;
+  const exclude = [
+    req.body?.barcode,
+    req.body?.embeddedId,
+    ...(Array.isArray(req.body?.barcodes) ? req.body.barcodes : []),
+    ...(Array.isArray(req.body?.exclude) ? req.body.exclude : [])
+  ].filter(Boolean).map((x) => String(x).trim());
+
+  const sku = generateSku(store, exclude);
+  res.json({ success: true, data: { sku } });
 };
 
 exports.createProduct = (req, res) => {
@@ -637,6 +783,10 @@ exports.createProduct = (req, res) => {
   }
 
   const product = shapeProduct(store, req.body, null, actor(req));
+  const uniqueness = validateProductUniqueness(store, product, null);
+  if (!uniqueness.valid) {
+    return res.status(400).json({ success: false, message: uniqueness.message });
+  }
   if (!Array.isArray(store.products)) store.products = [];
 
   // Composite items carry their recipe on the same form — save both together so
@@ -714,6 +864,10 @@ exports.updateProduct = (req, res) => {
   }
 
   const updated = shapeProduct(store, req.body, existing, actor(req));
+  const uniqueness = validateProductUniqueness(store, updated, existing.id);
+  if (!uniqueness.valid) {
+    return res.status(400).json({ success: false, message: uniqueness.message });
+  }
   store.products[index] = updated;
 
   // Recipe edits ride along with the product edit. `recipe: null` sent
@@ -1477,11 +1631,22 @@ exports.returnBatchToSupplier = (req, res) => {
 
 exports.getStockMovements = (req, res) => {
   const store = req.tenantStore;
-  const { productId, type, limit } = req.query;
+  const { productId, type, limit, startDate, endDate } = req.query;
 
   let rows = store.stockMovements || [];
   if (productId) rows = rows.filter((m) => m.productId === productId);
   if (type && type !== 'ALL') rows = rows.filter((m) => m.type === type);
+
+  if (startDate) {
+    const start = new Date(startDate);
+    start.setHours(0, 0, 0, 0);
+    rows = rows.filter((m) => new Date(m.timestamp || m.date) >= start);
+  }
+  if (endDate) {
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+    rows = rows.filter((m) => new Date(m.timestamp || m.date) <= end);
+  }
 
   res.json({ success: true, data: rows.slice(0, Number(limit) || 200) });
 };

@@ -36,7 +36,7 @@ const ARRAY_COLLECTIONS = [
 ];
 
 /** Singleton values, all kept as one document each in the `meta` collection. */
-const META_KEYS = ['settings', 'session', 'voucherCounters', 'units', 'customerGroups', 'companyLocker'];
+const META_KEYS = ['settings', 'session', 'voucherCounters', 'units', 'customerGroups', 'companyLocker', 'barcodeSeq', 'skuSeq', 'embeddedIdSeq'];
 
 const META_COLLECTION = 'meta';
 const PROVISION_KEY = '__provisioned';
@@ -77,7 +77,17 @@ function snapshot(store) {
     for (const row of rows) {
       const id = row?.[spec.idField];
       if (id === undefined || id === null) continue;
-      entry.set(String(id), fingerprint(row));
+      if (spec.appendOnly) {
+        // Append-only ledgers (sales, journal, stock movements, ...) are never field-updated after
+        // creation in normal use, so field-level diffing buys nothing here — a cheap hash is enough
+        // to detect "did this row change at all" and skip the deep clone's memory cost for what can
+        // be the largest collections in the store.
+        entry.set(String(id), fingerprint(row));
+      } else {
+        // The actual row content (deep-cloned via JSON round-trip) — doPersist needs the real
+        // "before" value to write only the fields that changed, not a fingerprint alone.
+        entry.set(String(id), JSON.parse(JSON.stringify(row)));
+      }
     }
     map[spec.key] = entry;
   }
@@ -174,6 +184,12 @@ async function doHydrate(dbName, store, tenant, trackBaseline = true) {
   if (meta.voucherCounters !== undefined) store.voucherCounters = meta.voucherCounters || {};
   if (Array.isArray(meta.units)) store.units = meta.units;
   if (Array.isArray(meta.customerGroups)) store.customerGroups = meta.customerGroups;
+  // Sequential SKU/barcode counters — without persisting these, a fresh store on every request
+  // would reseed from the same saved products each time, handing out the same "next" number on
+  // every Generate click until a product was actually saved with it.
+  if (Number.isFinite(meta.barcodeSeq)) store.barcodeSeq = meta.barcodeSeq;
+  if (Number.isFinite(meta.skuSeq)) store.skuSeq = meta.skuSeq;
+  if (Number.isFinite(meta.embeddedIdSeq)) store.embeddedIdSeq = meta.embeddedIdSeq;
 
   await adoptLegacyData(db, store, meta);
 
@@ -236,14 +252,60 @@ async function doPersist(dbName, store) {
           const id = row?.[spec.idField];
           if (id === undefined || id === null) continue;
           const key = String(id);
-          if (prev.get(key) === next.get(key)) continue;
-          operations.push({
-            replaceOne: {
-              filter: { [spec.idField]: id },
-              replacement: stripId(row),
-              upsert: true
+          const prevRow = prev.get(key);
+
+          if (spec.appendOnly) {
+            // prevRow is a hash here (see snapshot()), not the row itself — append-only ledgers are
+            // never field-updated after creation, so a whole-row replace on the rare changed row is
+            // fine; the point of the field-level path below is wasted on rows that don't get edited.
+            if (prevRow !== undefined && prevRow === fingerprint(row)) continue;
+            operations.push({ replaceOne: { filter: { [spec.idField]: id }, replacement: stripId(row), upsert: true } });
+            continue;
+          }
+
+          if (prevRow !== undefined && JSON.stringify(prevRow) === JSON.stringify(row)) continue;
+
+          if (prevRow === undefined) {
+            // A row this request/script is introducing for the first time — nothing else can have
+            // a concurrent claim on fields of a document that, from this store's view, doesn't exist
+            // yet, so a full replace is correct and matches an insert.
+            operations.push({
+              replaceOne: {
+                filter: { [spec.idField]: id },
+                replacement: stripId(row),
+                upsert: true
+              }
+            });
+            continue;
+          }
+
+          // An existing row that changed — write only the fields that actually differ from this
+          // store's own baseline, rather than replacing the whole document. A whole-document
+          // replaceOne here silently discarded a concurrent writer's changes to *other* fields on
+          // the same document whenever two processes touched the same tenant around the same time
+          // (no in-memory lock here is shared across processes) — field-level updates mean two
+          // writers touching DIFFERENT fields on the same document both land regardless of order.
+          // This does NOT make concurrent writes to the SAME field (e.g. two sales decrementing the
+          // same product's stock at once) safe — that's still last-write-wins and needs an atomic
+          // $inc at the call site, not a persistence-layer fix, if it ever needs closing.
+          const set = {};
+          const unset = {};
+          for (const k of new Set([...Object.keys(prevRow), ...Object.keys(row)])) {
+            if (k === '_id') continue;
+            const hasNext = Object.prototype.hasOwnProperty.call(row, k);
+            const hasPrev = Object.prototype.hasOwnProperty.call(prevRow, k);
+            if (!hasNext && hasPrev) {
+              unset[k] = '';
+            } else if (hasNext && JSON.stringify(row[k]) !== (hasPrev ? JSON.stringify(prevRow[k]) : undefined)) {
+              set[k] = row[k];
             }
-          });
+          }
+          if (!Object.keys(set).length && !Object.keys(unset).length) continue;
+
+          const update = {};
+          if (Object.keys(set).length) update.$set = set;
+          if (Object.keys(unset).length) update.$unset = unset;
+          operations.push({ updateOne: { filter: { [spec.idField]: id }, update, upsert: true } });
         }
 
         if (!spec.appendOnly) {

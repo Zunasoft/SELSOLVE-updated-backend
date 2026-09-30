@@ -212,35 +212,71 @@ function defaultSettings() {
       gstScheme: 'REGULAR'
     },
     hardware: {
-      posPrinter: { name: 'Thermal Receipt Printer', status: 'READY', paperWidth: '80mm', autoCut: true, enabled: true },
-      labelPrinter: { name: 'Barcode Label Printer', status: 'READY', labelSize: '50x25mm', enabled: true },
-      barcodePrinter: { name: 'Barcode Label Printer', status: 'READY', labelSize: '50x25mm', enabled: true },
-      barcodeScanner: { name: 'USB / Bluetooth Barcode Scanner', status: 'READY', mode: 'HID', enabled: true },
-      cashDrawer: { name: 'RJ11 Cash Drawer', status: 'CONNECTED', triggerMode: 'PRINTER', enabled: true },
-      weighingScale: {
-        name: 'Serial Weighing Scale',
-        status: 'DISCONNECTED',
-        comPort: 'COM3',
+      posPrinter: { name: 'Printer', status: 'not_tested', printerName: '', paperWidth: '80mm', autoCut: true, enabled: true },
+      labelPrinter: { name: 'Barcode Label Printer', status: 'not_tested', labelSize: '50x25mm', enabled: true },
+      barcodePrinter: { name: 'Barcode Label Printer', status: 'not_tested', printerName: '', labelSize: '50x25mm', enabled: true },
+      barcodeScanner: { name: 'Barcode Scanner', status: 'not_tested', mode: 'HID', enabled: true },
+      // Drawer has no interface of its own — it's wired via RJ11 into the receipt printer, and
+      // "opening" it means sending an ESC/POS kick-pulse command out over the SAME connection the
+      // printer uses. connectionType/comPort/baudRate/host/port below describe that connection
+      // (independent of whatever OS print driver window.print() uses for the receipt itself).
+      cashDrawer: {
+        name: 'Cash Drawer',
+        status: 'not_tested',
+        triggerMode: 'PRINTER',
+        enabled: true,
+        openOnCashOnly: true,
+        connectionType: 'none', // 'none' | 'serial' | 'network' | 'windows-share' (old settings: 'simulated' = none)
+        comPort: 'COM4',
         baudRate: 9600,
-        // Weight-embedded barcode syntax: an ordered list of segments a scale-printed label is built from — prefix + product-code tail + weight (as an integer scaled by 10^precision). Configurable in Settings > Hardware; this is the shape a fresh tenant starts with, matching the old hardcoded prefix '21' + 5-digit SKU + 5-digit grams format exactly.
-        barcodeSegments: [
-          { id: 'seg_prefix', type: 'prefix', length: 2, value: '21' },
-          { id: 'seg_sku', type: 'sku', length: 5 },
-          { id: 'seg_weight', type: 'weight', length: 5, precision: 3 }
-        ],
+        host: '',
+        port: 9100, // 9100 is the standard raw ESC/POS port most network thermal printers listen on
+        shareName: '' // 'windows-share': Windows share name of the USB receipt printer the drawer is wired into
+      },
+      weighingScale: {
+        name: 'Weighing Scale',
+        status: 'not_tested',
+        // 'none' (no scale — the weight is typed; the old 'simulated' value means the same),
+        // 'serial' (USB-to-RS232 cable, reads via comPort/baudRate), 'network' (TCP-attached scale,
+        // reads via host/port), or 'keyboard-wedge' (scale types its reading as keystrokes — no
+        // connection settings needed, it's handled by the same scan-capture input as a scanner).
+        connectionType: 'none',
+        comPort: '',
+        baudRate: 9600,
+        dataBits: 8,
+        parity: 'none', // 'none' | 'even' | 'odd' — Mettler-Toledo/Avery scales are often 7-even-1
+        stopBits: 1,
+        host: '',
+        port: 4001,
+        // Data format — see modules/scaleManager.js. readMode 'continuous' (scale streams readings)
+        // or 'poll' (sends pollCommand every pollIntervalMs, e.g. CAS "\x05", Toledo "W", MT-SICS
+        // "SI\r\n"). unit is what the POS receives; a unit printed by the scale (kg/g/lb) is converted.
+        // decimals: implied decimal places for scales that send "001234" meaning 1.234.
+        // weightPattern: optional regex override (group 1 = number, group 2 = unit).
+        readMode: 'continuous',
+        pollCommand: '',
+        pollIntervalMs: 500,
+        unit: 'kg',
+        decimals: 0,
+        weightPattern: '',
         enabled: true
       },
       poleDisplay: { name: 'VFD Customer Display', status: 'READY', welcomeText: 'Welcome!', enabled: true },
       kotPrinter: { name: 'Kitchen Thermal Printer', status: 'READY', paperWidth: '80mm', enabled: false }
     },
-    // Barcode Generation (Zoho Books-style): auto-assigns a sequential prefix+number
+    // Barcode Generation: auto-assigns a sequential prefix+number
     // barcode to new products that don't already have one, instead of a random 10-digit code.
     barcode: {
       autoGenerate: true,
       prefix: '',
-      digits: 6,
+      digits: 5,
       symbology: 'CODE128'
     },
+    // Weight-embedded barcode format — configured once for the whole store, not per product (see
+    // modules/barcodeFormat.js). Every weighed product ("Custom weight" checked on its own form)
+    // prints through this same field shape; only its own id number and W/P/custom flag letter are
+    // per-product. `undefined` here falls back to DEFAULT_BARCODE_FORMAT.
+    barcodeFormat: undefined,
     pos: {
       allowNegativeStock: true,
       enableLoyalty: true,

@@ -6,7 +6,7 @@ const posting = require('../accounting/posting');
 const { savePartyToDb } = require('../tenantProvisioner');
 const { shapeProduct } = require('../controllers/catalog.controller');
 const { addBatch, voidPurchaseBatches, writeOffBatch } = require('../controllers/batches');
-const { addSerialFromPurchase, returnSerialToVendor } = require('../controllers/serials');
+const { addSerialFromPurchase, returnSerialToVendor, restoreSerial, voidPurchaseSerials } = require('../controllers/serials');
 const { baseQty, isWholeNumberUnit } = require('../controllers/unitConversion');
 
 const router = express.Router();
@@ -952,7 +952,11 @@ router.post('/purchases', (req, res) => {
     } else {
       product.stock = r2(Number(product.stock || 0) + qty);
       if (product.warehouses && typeof product.warehouses === 'object') {
-        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+        // Receive into whichever warehouse this line specifies — batches and serials already did
+        // this (see above); plain-stock lines silently ignored line.warehouseId and always landed
+        // in the default warehouse instead, which is also why a return could never actually deduct
+        // from anywhere else.
+        const whKey = line.warehouseId || (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
         product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) + qty);
         product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
       }
@@ -1353,12 +1357,19 @@ router.post('/purchases/:id/void', (req, res) => {
     // Reverse the same converted quantity that was actually added on receipt.
     const qty = baseQty(product, { unit: line.unit, qty: Number(line.qty) || 0 });
 
-    if (product.trackBatches) {
+    if (product.trackSerials) {
+      // Numerically bumping product.stock down here (as the plain branch does) would leave the
+      // actual serial records untouched — still IN_STOCK and selectable at a sale — while the
+      // count silently disagreed with them; voidPurchaseSerials removes the units this purchase
+      // brought in (leaving any already sold alone) and recomputes stock from the real statuses.
+      voidPurchaseSerials(product, purchase.id);
+    } else if (product.trackBatches) {
       voidPurchaseBatches(product, purchase.id);
     } else {
       product.stock = r2(Number(product.stock || 0) - qty);
       if (product.warehouses && typeof product.warehouses === 'object') {
-        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+        // Same warehouse this purchase line actually received stock into, not always the default.
+        const whKey = line.warehouseId || (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
         product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - qty);
         product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
       }
@@ -1578,7 +1589,16 @@ router.post('/purchases/:id/return', (req, res) => {
         return res.status(400).json({ success: false, message: `${product.name}: batch ${purchaseLine.batchNo || ''} no longer exists (already fully consumed/removed).` });
       }
     }
-    const physicalCapBase = product.trackBatches ? Number(batch.qty) : Number(product.stock || 0);
+    // Cap by the SPECIFIC warehouse this purchase line actually received stock into, not the
+    // product's total across every warehouse — otherwise a return can be accepted even when the
+    // receiving warehouse itself doesn't have that much left (some may have been sold from there or
+    // transferred elsewhere), which would drive that warehouse's own quantity negative.
+    const returnWhKey = purchaseLine.warehouseId || (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+    const physicalCapBase = product.trackBatches
+      ? Number(batch.qty)
+      : (product.warehouses && typeof product.warehouses === 'object' && returnWhKey in product.warehouses
+          ? Number(product.warehouses[returnWhKey] || 0)
+          : Number(product.stock || 0));
 
     if (!(qty > 0) || qty > maxReturnable + 0.009 || baseQtyToRemove > physicalCapBase + 0.0001) {
       return res.status(400).json({
@@ -1587,7 +1607,7 @@ router.post('/purchases/:id/return', (req, res) => {
       });
     }
 
-    plan.push({ product, purchaseLine, batch, qty, baseQtyToRemove });
+    plan.push({ product, purchaseLine, batch, qty, baseQtyToRemove, returnWhKey });
   }
 
   // Pass 2: apply.
@@ -1630,14 +1650,16 @@ router.post('/purchases/:id/return', (req, res) => {
       return;
     }
 
-    const { product, purchaseLine, batch, qty, baseQtyToRemove } = entry;
+    const { product, purchaseLine, batch, qty, baseQtyToRemove, returnWhKey } = entry;
     if (product.trackBatches) {
       writeOffBatch(product, batch.id, baseQtyToRemove, reason || 'Returned to supplier', actor(req));
     } else {
       product.stock = r2(Number(product.stock || 0) - baseQtyToRemove);
       if (product.warehouses && typeof product.warehouses === 'object') {
-        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
-        product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) - baseQtyToRemove);
+        // Deduct from the warehouse this purchase line actually received stock into (falls back to
+        // the default when an older purchase predates warehouse tracking), not always the default —
+        // otherwise a return from a non-default warehouse silently drains the wrong one.
+        product.warehouses[returnWhKey] = r2((Number(product.warehouses[returnWhKey]) || 0) - baseQtyToRemove);
         product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
       }
     }
@@ -1659,6 +1681,7 @@ router.post('/purchases/:id/return', (req, res) => {
       unit: purchaseLine.unit || product.unit,
       batchId: purchaseLine.batchId || null,
       batchNo: purchaseLine.batchNo || null,
+      warehouseId: !product.trackBatches ? returnWhKey : null,
       qty,
       baseQty: baseQtyToRemove,
       rate: Number(purchaseLine.rate || 0),
@@ -1751,7 +1774,13 @@ router.post('/vendor-credits/:id/void', (req, res) => {
     // line.qty is in the purchase line's display unit; restoration must use the base-unit amount actually removed (line.baseQty), since stock/batches track base units.
     const qty = Number(line.baseQty ?? line.qty) || 0;
 
-    if (product.trackBatches && line.batchId) {
+    if (product.trackSerials && Array.isArray(line.serialIds) && line.serialIds.length) {
+      // A serial is a specific physical unit, not a fungible quantity — bumping product.stock by
+      // count here (as the plain-stock branch below does) would inflate the number without actually
+      // making any unit sellable again, since restoreSerial() is what flips a unit back to IN_STOCK
+      // and recomputes product.stock from the real serial statuses.
+      line.serialIds.forEach((sid) => restoreSerial(product, sid));
+    } else if (product.trackBatches && line.batchId) {
       const batch = product.batches.find((b) => b.id === line.batchId);
       if (batch) {
         batch.qty = r2(Number(batch.qty) + qty);
@@ -1774,7 +1803,10 @@ router.post('/vendor-credits/:id/void', (req, res) => {
     } else {
       product.stock = r2(Number(product.stock || 0) + qty);
       if (product.warehouses && typeof product.warehouses === 'object') {
-        const whKey = (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
+        // Restore into the same warehouse the return originally took it from (recorded on the
+        // credit line at return time), not always the default — falls back to default only for a
+        // credit line saved before this was tracked.
+        const whKey = line.warehouseId || (store.warehouses || []).find((w) => w.isDefault)?.id || 'wh_main';
         product.warehouses[whKey] = r2((Number(product.warehouses[whKey]) || 0) + qty);
         product.stock = r2(Object.values(product.warehouses).reduce((sum, val) => sum + Number(val || 0), 0));
       }
