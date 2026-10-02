@@ -26,6 +26,7 @@ router.get('/products/:id/recipe', catalog.getProductRecipe);
 
 router.get('/price-sheets', catalog.getPriceSheets);
 router.post('/price-sheets', catalog.createPriceSheet);
+router.put('/price-sheets/order', catalog.reorderPriceSheets);
 router.put('/price-sheets/:id', catalog.updatePriceSheet);
 router.delete('/price-sheets/:id', catalog.deletePriceSheet);
 

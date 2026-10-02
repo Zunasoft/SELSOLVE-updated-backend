@@ -1,7 +1,7 @@
 // Billing, held bills, counter sessions and table management — Modules 3, 17, 18 and 19 of the SOW.
 
 const express = require('express');
-const { logStockMovement } = require('../store');
+const { logStockMovement, priceSheetsView } = require('../store');
 const engine = require('../accounting/engine');
 const posting = require('../accounting/posting');
 const { decorateRecipe } = require('../modules/recipes');
@@ -93,7 +93,7 @@ router.get('/init', (req, res) => {
       heldBills: store.heldBills || [],
       tables: store.tables || [],
       settings: store.settings,
-      priceSheets: store.priceSheets || [],
+      priceSheets: priceSheetsView(store),
       users: (store.users || []).map(({ pin, ...u }) => u)
     }
   });

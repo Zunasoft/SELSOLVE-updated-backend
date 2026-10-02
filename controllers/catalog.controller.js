@@ -9,7 +9,7 @@
  * shop's catalogue into one shared collection.
  */
 
-const { logStockMovement, DEFAULT_UNITS, defaultPriceSheets, calculateProductStock } = require('../store');
+const { logStockMovement, DEFAULT_UNITS, defaultPriceSheets, calculateProductStock, sortPriceSheets, priceSheetsView, globalSheetView } = require('../store');
 const posting = require('../accounting/posting');
 const { setRecipe, removeRecipe, decorateRecipe, recipeFromProductPayload } = require('../modules/recipes');
 const { shapeBatches, writeOffBatch } = require('./batches');
@@ -287,11 +287,43 @@ function findUnit(units, name) {
   return units.find((u) => u.name === clean);
 }
 
+// The "Global Sheet" mirrors the products' own prices (see refreshGlobalSheet in store.js). It is created once, and it
+// is where price changes can be typed in directly — e.g. on the purchase screen — instead of editing stock separately.
+function ensureLocalSheet(store) {
+  const sheets = store.priceSheets;
+  const existing = sheets.find((s) => s.isLocal);
+  if (existing) {
+    // Created earlier under its first name.
+    if (existing.name === 'Local Sheet') existing.name = 'Global Sheet';
+    if (existing.code === 'LOCAL') existing.code = 'GLOBAL';
+    // Earlier versions stored a copy of the prices here; they are read from the products now, so drop the stale copy.
+    ['pricingMap', 'costMap', 'mrpMap', 'discountMap', 'marginMap'].forEach((key) => {
+      if (existing[key] && Object.keys(existing[key]).length) existing[key] = {};
+    });
+    return;
+  }
+  sheets.push({
+    id: 'ps_local',
+    name: 'Global Sheet',
+    code: 'GLOBAL',
+    customerType: 'Retail',
+    defaultDiscountPercent: 0,
+    isActive: true,
+    isLocal: true,
+    pricingMap: {},
+    costMap: {},
+    mrpMap: {},
+    discountMap: {},
+    createdAt: new Date().toISOString()
+  });
+}
+
 function getTenantPriceSheets(store) {
   if (!Array.isArray(store.priceSheets) || store.priceSheets.length === 0) {
     store.priceSheets = defaultPriceSheets();
   }
-  return store.priceSheets;
+  ensureLocalSheet(store);
+  return sortPriceSheets(store.priceSheets);
 }
 
 
@@ -968,8 +1000,8 @@ exports.getProductRecipe = (req, res) => {
 /* ----------------------------- Price Sheets Controllers ----------------------------- */
 
 exports.getPriceSheets = (req, res) => {
-  const priceSheets = getTenantPriceSheets(req.tenantStore);
-  res.json({ success: true, data: priceSheets });
+  getTenantPriceSheets(req.tenantStore); // makes sure the Global Sheet exists
+  res.json({ success: true, data: priceSheetsView(req.tenantStore) });
 };
 
 exports.createPriceSheet = (req, res) => {
@@ -987,6 +1019,7 @@ exports.createPriceSheet = (req, res) => {
     isActive: true,
     pricingMap: pricingMap || {},
     discountMap: discountMap || {},
+    sortOrder: priceSheets.reduce((max, s) => Math.max(max, Number.isFinite(s.sortOrder) ? s.sortOrder : -1), priceSheets.length - 1) + 1,
     createdAt: new Date().toISOString()
   };
 
@@ -995,19 +1028,56 @@ exports.createPriceSheet = (req, res) => {
   res.status(201).json({ success: true, message: 'Price sheet created.', data: sheet });
 };
 
+// Drag-and-drop order from the Price Sheets screen: ids top to bottom. Sheets not mentioned keep their place after the listed ones.
+exports.reorderPriceSheets = (req, res) => {
+  const priceSheets = getTenantPriceSheets(req.tenantStore);
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+  if (!ids.length) return res.status(400).json({ success: false, message: 'Send the sheet ids in the new order.' });
+
+  const listed = ids.map((id) => priceSheets.find((s) => s.id === id)).filter(Boolean);
+  const rest = priceSheets.filter((s) => !ids.includes(s.id));
+  [...listed, ...rest].forEach((sheet, index) => {
+    sheet.sortOrder = index;
+  });
+  sortPriceSheets(priceSheets);
+
+  res.json({ success: true, message: 'Price sheet order saved.', data: priceSheets.map((s) => s.id) });
+};
+
 exports.updatePriceSheet = (req, res) => {
   const priceSheets = getTenantPriceSheets(req.tenantStore);
   const sheet = priceSheets.find((s) => s.id === req.params.id);
   if (!sheet) return res.status(404).json({ success: false, message: 'Price sheet not found.' });
 
-  const { name, code, customerType, defaultDiscountPercent, isActive, pricingMap, discountMap } = req.body;
-  if (name) sheet.name = name;
-  if (code) sheet.code = code;
+  const { name, code, customerType, defaultDiscountPercent, isActive, pricingMap, discountMap, costMap, mrpMap, marginMap } = req.body;
+  if (name && !sheet.isLocal) sheet.name = name;
+  if (code && !sheet.isLocal) sheet.code = code;
+  if (sheet.isLocal) {
+    // The Global Sheet has no prices of its own: whatever is typed here becomes the product's price / cost / MRP.
+    let changed = 0;
+    [[pricingMap, 'price'], [costMap, 'purchasePrice'], [mrpMap, 'mrp']].forEach(([map, field]) => {
+      if (!map || typeof map !== 'object') return;
+      Object.entries(map).forEach(([productId, raw]) => {
+        const product = (req.tenantStore.products || []).find((p) => p.id === productId);
+        const value = Number(raw);
+        if (!product || raw === '' || raw === null || !Number.isFinite(value) || value < 0) return;
+        if ((Number(product[field]) || 0) !== value) {
+          product[field] = value;
+          product.updatedAt = new Date().toISOString();
+          changed += 1;
+        }
+      });
+    });
+    if (isActive !== undefined) sheet.isActive = Boolean(isActive);
+    sheet.updatedAt = new Date().toISOString();
+    return res.json({ success: true, message: changed ?`Updated pricing for ${changed} value(s) on the products.` : 'Nothing changed.', data: globalSheetView(req.tenantStore, sheet) });
+  }
   if (customerType) sheet.customerType = customerType;
   if (defaultDiscountPercent !== undefined) sheet.defaultDiscountPercent = Number(defaultDiscountPercent) || 0;
   if (isActive !== undefined) sheet.isActive = Boolean(isActive);
   if (pricingMap && typeof pricingMap === 'object') sheet.pricingMap = { ...pricingMap };
   if (discountMap && typeof discountMap === 'object') sheet.discountMap = { ...discountMap };
+  if (marginMap && typeof marginMap === 'object') sheet.marginMap = { ...marginMap };
 
   sheet.updatedAt = new Date().toISOString();
 
@@ -1018,6 +1088,9 @@ exports.deletePriceSheet = (req, res) => {
   const priceSheets = getTenantPriceSheets(req.tenantStore);
   const index = priceSheets.findIndex((s) => s.id === req.params.id);
   if (index < 0) return res.status(404).json({ success: false, message: 'Price sheet not found.' });
+  if (priceSheets[index].isLocal) {
+    return res.status(400).json({ success: false, message: 'The Global Sheet is built in and cannot be deleted. You can switch it off instead.' });
+  }
 
   priceSheets.splice(index, 1);
 
@@ -1075,7 +1148,10 @@ exports.updatePriceSheetGrid = (req, res) => {
     if (!product) continue;
 
     ['price', 'mrp', 'purchasePrice', 'wholesalePrice', 'specialPrice', 'taxRate'].forEach((field) => {
-      if (row[field] !== undefined && row[field] !== '') product[field] = Number(row[field]);
+      // A blank, non-numeric or negative cell is skipped — it must never turn a real price into NaN or a minus.
+      if (row[field] === undefined || row[field] === '' || row[field] === null) return;
+      const value = Number(row[field]);
+      if (Number.isFinite(value) && value >= 0) product[field] = value;
     });
     product.updatedAt = new Date().toISOString();
     count += 1;

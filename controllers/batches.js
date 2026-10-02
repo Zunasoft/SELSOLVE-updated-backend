@@ -54,7 +54,7 @@ function nextAutoBatchNo(product) {
 }
 
 // A manually-entered batch number already on file is rejected, not silently duplicated — a repeated number would make FEFO consumption, reports and purchase history ambiguous about which lot they mean.
-function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, refPurchaseId, source, warehouseId, allowDuplicate }) {
+function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, mrp, refPurchaseId, source, warehouseId, allowDuplicate }) {
   if (!Array.isArray(product.batches)) product.batches = [];
 
   let finalBatchNo = '';
@@ -77,6 +77,8 @@ function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellP
     qty: r4(qty),
     costPrice: Number(costPrice) || 0,
     sellPrice: sellPrice !== undefined && sellPrice !== null && sellPrice !== '' ? Number(sellPrice) : null,
+    // The printed MRP of this lot; blank means "use the product's MRP".
+    mrp: mrp !== undefined && mrp !== null && mrp !== '' ? Number(mrp) : null,
     refPurchaseId: refPurchaseId || null,
     warehouseId: warehouseId || 'wh_main',
     source: source || 'purchase',
@@ -258,6 +260,7 @@ function shapeBatches(payload, existing) {
         qty: r4(b.qty),
         costPrice: Number(b.costPrice) || 0,
         sellPrice: b.sellPrice !== undefined && b.sellPrice !== null && b.sellPrice !== '' ? Number(b.sellPrice) : null,
+        mrp: b.mrp !== undefined && b.mrp !== null && b.mrp !== '' ? Number(b.mrp) : null,
         refPurchaseId: b.refPurchaseId || null,
         warehouseId: b.warehouseId || 'wh_main',
         source: b.source || 'manual',

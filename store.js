@@ -343,6 +343,39 @@ function defaultWarehouses() {
   ];
 }
 
+// Price sheets show in the order the owner dragged them into (sortOrder); a sheet that was never ordered keeps its current position.
+function sortPriceSheets(list) {
+  if (!Array.isArray(list)) return list;
+  const keyed = list.map((sheet, index) => ({ sheet, key: Number.isFinite(sheet?.sortOrder) ? sheet.sortOrder : index }));
+  keyed.sort((a, b) => a.key - b.key);
+  list.splice(0, list.length, ...keyed.map((k) => k.sheet));
+  return list;
+}
+
+// The Global Sheet is a live mirror of the products' own prices. Nothing is stored on it: whenever sheets are served,
+// its selling price, cost and MRP are read straight from each product into a copy, so it can never drift, a read never
+// changes saved data, and a purchase doesn't rewrite a map as big as the catalogue. Edits made on the sheet are written
+// through to the products (catalog.controller / the purchase route) and show up here on the next read.
+function globalSheetView(store, sheet) {
+  const pricingMap = {};
+  const costMap = {};
+  const mrpMap = {};
+  (store.products || []).forEach((p) => {
+    pricingMap[p.id] = Number(p.price) || 0;
+    if (String(p.productType).toLowerCase() === 'service') return;
+    costMap[p.id] = Number(p.purchasePrice) || 0;
+    mrpMap[p.id] = Number(p.mrp) || 0;
+  });
+  // discountMap stays empty: billing applies a sheet's discount on top of its price, and this one is the plain product price.
+  return { ...sheet, pricingMap, costMap, mrpMap, discountMap: {}, marginMap: {} };
+}
+
+/** Sheets in the owner's order, as copies safe to send to a screen — the Global Sheet carries the products' current prices. */
+function priceSheetsView(store) {
+  const sorted = sortPriceSheets([...(store.priceSheets || [])]);
+  return sorted.map((sheet) => (sheet.isLocal ? globalSheetView(store, sheet) : sheet));
+}
+
 function defaultPriceSheets() {
   const now = new Date().toISOString();
   return [
@@ -612,5 +645,8 @@ module.exports = {
   genericStore,
   defaultSettings,
   defaultWarehouses,
-  defaultPriceSheets
+  defaultPriceSheets,
+  sortPriceSheets,
+  priceSheetsView,
+  globalSheetView
 };

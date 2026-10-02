@@ -909,6 +909,7 @@ router.post('/purchases', (req, res) => {
             qty: bQty,
             costPrice: costPerBaseUnit,
             sellPrice: b.sellPrice !== undefined && b.sellPrice !== '' ? b.sellPrice : line.sellPrice,
+            mrp: b.mrp !== undefined && b.mrp !== '' ? b.mrp : line.mrp,
             refPurchaseId: purchase.id,
             warehouseId: b.warehouseId || line.warehouseId || whKey
           });
@@ -927,6 +928,7 @@ router.post('/purchases', (req, res) => {
           qty,
           costPrice: costPerBaseUnit,
           sellPrice: line.sellPrice,
+          mrp: line.mrp,
           refPurchaseId: purchase.id,
           warehouseId: line.warehouseId || whKey
         });
@@ -974,6 +976,53 @@ router.post('/purchases', (req, res) => {
       user: actor(req)
     });
   });
+
+  // Price sheet edited from the purchase screen: only the changed items are sent, and they land in the
+  // sheet together with the purchase (so a failed purchase never leaves the sheet half-updated).
+  // Any number of sheets can be edited in one purchase: [{ sheetId, prices: { productId: price }, costs, mrps }].
+  // The Global Sheet mirrors the products, so what is typed for it becomes the product's own price / cost / MRP.
+  const sheetUpdates = Array.isArray(req.body.priceSheetUpdates) ? req.body.priceSheetUpdates : [];
+  const updatedSheets = [];
+  const validNumber = (raw) => {
+    const value = Number(raw);
+    return raw === '' || raw === null || raw === undefined || !Number.isFinite(value) || value < 0 ? null : value;
+  };
+  sheetUpdates.forEach((update) => {
+    const sheet = (store.priceSheets || []).find((s) => s.id === update?.sheetId);
+    if (!sheet || !update.prices || typeof update.prices !== 'object') return;
+    let changed = 0;
+
+    if (sheet.isLocal) {
+      [['prices', 'price'], ['costs', 'purchasePrice'], ['mrps', 'mrp']].forEach(([key, field]) => {
+        Object.entries(update[key] && typeof update[key] === 'object' ? update[key] : {}).forEach(([productId, raw]) => {
+          const product = store.products.find((p) => p.id === productId);
+          const value = validNumber(raw);
+          if (!product || value === null) return;
+          product[field] = r2(value);
+          changed += 1;
+        });
+      });
+    } else {
+      sheet.pricingMap = sheet.pricingMap || {};
+      sheet.discountMap = sheet.discountMap || {};
+      Object.entries(update.prices).forEach(([productId, raw]) => {
+        const value = validNumber(raw);
+        if (!store.products.some((p) => p.id === productId) || value === null) return;
+        sheet.pricingMap[productId] = r2(value);
+        // Billing applies a sheet's discount % on top of its price, so a price set here is stored exactly: discount 0, no stacking.
+        sheet.discountMap[productId] = 0;
+        if (sheet.marginMap) delete sheet.marginMap[productId];
+        changed += 1;
+      });
+    }
+
+    if (changed) {
+      sheet.updatedAt = new Date().toISOString();
+      updatedSheets.push({ sheetId: sheet.id, sheetName: sheet.name, count: changed });
+    }
+  });
+  if (updatedSheets.length) purchase.priceSheetsUpdated = updatedSheets;
+
   try {
     const voucher = posting.postPurchase(store, purchase, {
       vendor,
