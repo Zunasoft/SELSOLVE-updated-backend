@@ -1616,7 +1616,8 @@ function findBatchBarcodeConflict(store, barcode, ignoreBatchId) {
   for (const p of store.products || []) {
     if (
       p.barcode === needle || p.sku === needle || (p.barcodes || []).includes(needle) ||
-      p.customSubUnitBarcode === needle || (p.altUnits || []).some((u) => u?.barcode === needle)
+      p.customSubUnitBarcode === needle || (p.altUnits || []).some((u) => u?.barcode === needle) ||
+      p.embeddedId === needle
     ) {
       return `Barcode "${needle}" is already assigned to product "${p.name}".`;
     }
