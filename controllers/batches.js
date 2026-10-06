@@ -54,7 +54,7 @@ function nextAutoBatchNo(product) {
 }
 
 // A manually-entered batch number already on file is rejected, not silently duplicated — a repeated number would make FEFO consumption, reports and purchase history ambiguous about which lot they mean.
-function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, mrp, refPurchaseId, source, warehouseId, allowDuplicate }) {
+function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, mrp, refPurchaseId, source, warehouseId, barcode, allowDuplicate }) {
   if (!Array.isArray(product.batches)) product.batches = [];
 
   let finalBatchNo = '';
@@ -82,6 +82,8 @@ function addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellP
     refPurchaseId: refPurchaseId || null,
     warehouseId: warehouseId || 'wh_main',
     source: source || 'purchase',
+    // A batch's own scannable code — separate from the product's barcode, so a specific lot can be identified directly. Optional; null until generated.
+    barcode: barcode ? String(barcode).trim() : null,
     createdAt: new Date().toISOString()
   };
 
@@ -197,6 +199,59 @@ function voidPurchaseBatches(product, purchaseId) {
   recomputeBatchStock(product);
 }
 
+// Manual-entry batches (opening stock, corrections) are fully editable; a batch minted by a Purchase stays locked here so its qty/cost/dates never drift out of sync with the receipt that produced them — that one's corrected from the Purchase itself, or adjusted via write-off/return.
+function assertEditable(batch, product) {
+  if (!batch) throw new Error('Batch not found.');
+  if (batch.source === 'purchase') {
+    throw new Error(
+      `Batch "${batch.batchNo}" was created from a Purchase and can't be edited here. Correct it from the original Purchase, or use Write Off / Return to Supplier in Batch Tracking to adjust its quantity.`
+    );
+  }
+}
+
+/** Edits a manually-entered batch's own fields in place. Purchase-sourced batches are rejected — see assertEditable. */
+function updateBatch(product, batchId, patch) {
+  if (!Array.isArray(product.batches)) product.batches = [];
+  const batch = product.batches.find((b) => b.id === batchId);
+  assertEditable(batch, product);
+
+  if (patch.batchNo !== undefined) {
+    const batchNo = String(patch.batchNo || '').trim();
+    if (!batchNo) throw new Error('Batch number cannot be empty.');
+    if (isBatchNoTaken(product, batchNo, batch.id)) {
+      throw new Error(`Batch "${batchNo}" has already been allocated for ${product.name || 'this product'}.`);
+    }
+    batch.batchNo = batchNo;
+  }
+  if (patch.mfgDate !== undefined) batch.mfgDate = patch.mfgDate || null;
+  if (patch.expiryDate !== undefined) batch.expiryDate = patch.expiryDate || null;
+  if (patch.qty !== undefined) batch.qty = r4(patch.qty);
+  if (patch.costPrice !== undefined) batch.costPrice = Number(patch.costPrice) || 0;
+  if (patch.sellPrice !== undefined) {
+    batch.sellPrice = patch.sellPrice !== null && patch.sellPrice !== '' ? Number(patch.sellPrice) : null;
+  }
+  if (patch.mrp !== undefined) {
+    batch.mrp = patch.mrp !== null && patch.mrp !== '' ? Number(patch.mrp) : null;
+  }
+  if (patch.warehouseId !== undefined) batch.warehouseId = patch.warehouseId || 'wh_main';
+  // Uniqueness of a non-blank barcode is checked by the caller (it needs the whole store, not just this product) before patch reaches here.
+  if (patch.barcode !== undefined) batch.barcode = patch.barcode ? String(patch.barcode).trim() : null;
+
+  recomputeBatchStock(product);
+  return batch;
+}
+
+/** Removes a manually-entered batch entirely (not a partial write-off). Purchase-sourced batches are rejected — see assertEditable. */
+function deleteBatch(product, batchId) {
+  if (!Array.isArray(product.batches)) product.batches = [];
+  const batch = product.batches.find((b) => b.id === batchId);
+  assertEditable(batch, product);
+
+  product.batches = product.batches.filter((b) => b.id !== batchId);
+  recomputeBatchStock(product);
+  return batch;
+}
+
 /** Writes off (damage/expiry/etc.) a quantity from one batch. Returns the write-off record. */
 function writeOffBatch(product, batchId, qty, reason, user) {
   if (!Array.isArray(product.batches)) product.batches = [];
@@ -264,6 +319,7 @@ function shapeBatches(payload, existing) {
         refPurchaseId: b.refPurchaseId || null,
         warehouseId: b.warehouseId || 'wh_main',
         source: b.source || 'manual',
+        barcode: b.barcode || null,
         createdAt: b.createdAt || new Date().toISOString()
       };
     });
@@ -273,6 +329,8 @@ module.exports = {
   sortBatchesFEFO,
   recomputeBatchStock,
   addBatch,
+  updateBatch,
+  deleteBatch,
   isBatchNoTaken,
   consumeBatchesFEFO,
   restoreBatches,

@@ -12,7 +12,7 @@
 const { logStockMovement, DEFAULT_UNITS, defaultPriceSheets, calculateProductStock, sortPriceSheets, priceSheetsView, globalSheetView } = require('../store');
 const posting = require('../accounting/posting');
 const { setRecipe, removeRecipe, decorateRecipe, recipeFromProductPayload } = require('../modules/recipes');
-const { shapeBatches, writeOffBatch } = require('./batches');
+const { shapeBatches, writeOffBatch, addBatch, updateBatch, deleteBatch } = require('./batches');
 const { shapeSerials, shapeSerialCustomLabels } = require('./serials');
 const { enforceQtyPrecision, isWholeNumberUnit } = require('./unitConversion');
 const { getStoreBarcodeFormat, encodeBarcodeFormat } = require('../modules/barcodeFormat');
@@ -45,7 +45,7 @@ function nextAvailableCode(floor, digits, used, format, maxOverride = null, exha
   throw new Error(`No ${digits}-digit codes left — every value from ${floor} to ${max} is already in use.${exhaustedHint}`);
 }
 
-/** Every barcode/SKU/Product-ID currently on any product, as literal strings — the shared collision set so a generated barcode can never equal an existing SKU (or vice versa) and a generated code never matches a Product ID either. */
+/** Every barcode/SKU/Product-ID currently on any product, as literal strings — the shared collision set so a generated barcode can never equal an existing SKU (or vice versa) and a generated code never matches a Product ID either. Batch barcodes share this same namespace, since a scan has to resolve to exactly one thing. */
 function collectUsedCodes(store, extraUsed) {
   const used = new Set();
   (store.products || []).forEach((p) => {
@@ -55,6 +55,7 @@ function collectUsedCodes(store, extraUsed) {
     if (Array.isArray(p.altUnits)) p.altUnits.forEach((u) => u?.barcode && used.add(String(u.barcode).trim()));
     if (p.sku) used.add(String(p.sku).trim());
     if (p.embeddedId) used.add(String(p.embeddedId).trim());
+    if (Array.isArray(p.batches)) p.batches.forEach((b) => b?.barcode && used.add(String(b.barcode).trim()));
   });
   (extraUsed || []).forEach((x) => x && used.add(String(x).trim()));
   return used;
@@ -123,6 +124,29 @@ function generateSku(store, extraUsed = []) {
   return candidate;
 }
 exports.generateSku = generateSku;
+
+/**
+ * Batch Barcode Generation — its own band (2xxxx… at 5 digits), so a batch's barcode is never
+ * confusable at a glance with a product barcode (0xxxx) or SKU (1xxxx), while still sharing the
+ * one collision set (collectUsedCodes) that makes every scannable code in the store unique.
+ */
+function generateBatchBarcode(store, extraUsed = []) {
+  const cfg = store.settings?.barcode || {};
+  const formatFields = getStoreBarcodeFormat(store);
+  const idField = formatFields.find((f) => f.type === 'id');
+  const digits = Math.max(1, Number(cfg.digits) || Number(idField?.length) || 5);
+
+  const used = collectUsedCodes(store, extraUsed);
+  const floor = 2 * Math.pow(10, digits - 1);
+  const cap = digits >= 2 ? 3 * Math.pow(10, digits - 1) - 1 : null;
+  const candidate = nextAvailableCode(
+    floor, digits, used, (n) => String(n).padStart(digits, '0'), cap,
+    ` Increase the barcode digits in Settings → Barcode to continue.`
+  );
+  store.batchBarcodeSeq = parseInt(candidate, 10);
+  return candidate;
+}
+exports.generateBatchBarcode = generateBatchBarcode;
 
 function validateProductUniqueness(store, product, excludeId = null) {
   const otherProducts = (store.products || []).filter((p) => p.id !== excludeId);
@@ -751,12 +775,22 @@ exports.getProducts = (req, res) => {
 
 exports.lookupProduct = (req, res) => {
   const needle = req.params.barcode;
-  const product = (req.tenantStore.products || []).find(
+  const products = req.tenantStore.products || [];
+
+  const product = products.find(
     (p) => p.barcode === needle || p.id === needle || p.sku === needle || (p.barcodes || []).includes(needle) ||
       p.customSubUnitBarcode === needle || (p.altUnits || []).some((u) => u?.barcode === needle)
   );
-  if (!product) return res.status(404).json({ success: false, message: 'No product matches that barcode, SKU or ID.' });
-  res.json({ success: true, data: product });
+  if (product) return res.json({ success: true, data: product, batchId: null });
+
+  // Not a product-level code — try it as one specific batch's own barcode, so scanning a batch
+  // label resolves straight to that lot instead of falling through to "not found".
+  for (const p of products) {
+    const batch = (p.batches || []).find((b) => b.barcode === needle);
+    if (batch) return res.json({ success: true, data: p, batchId: batch.id });
+  }
+
+  res.status(404).json({ success: false, message: 'No product or batch matches that barcode, SKU or ID.' });
 };
 
 /**
@@ -806,6 +840,21 @@ exports.generateNextSku = (req, res) => {
 
   const sku = generateSku(store, exclude);
   res.json({ success: true, data: { sku } });
+};
+
+/**
+ * On-demand batch barcode generation for the Batch Edit drawer's "Generate" button. Same preview
+ * semantics as generateNextBarcode/generateNextSku — nothing is persisted until the batch itself is
+ * saved, so repeated clicks without saving keep handing back the same free code. Re-generating for a
+ * batch that already has a barcode naturally skips past it too, since that code is already "used" by
+ * the batch itself — no special-casing needed to guarantee a genuinely different one comes back.
+ */
+exports.generateNextBatchBarcode = (req, res) => {
+  const store = req.tenantStore;
+  const exclude = (Array.isArray(req.body?.exclude) ? req.body.exclude : []).filter(Boolean).map((x) => String(x).trim());
+
+  const barcode = generateBatchBarcode(store, exclude);
+  res.json({ success: true, data: { barcode } });
 };
 
 exports.createProduct = (req, res) => {
@@ -1559,6 +1608,138 @@ exports.adjustStock = (req, res) => {
     message: `Stock adjusted from ${previous} to ${product.stock} ${product.unit} in ${targetWh.name}.`,
     data: { product, movement, voucherNo: voucher ? voucher.voucherNo : null }
   });
+};
+
+/** A scan has to resolve to exactly one thing, so a batch barcode is checked against the SAME namespace as product barcodes/SKUs/alt-unit codes, plus every other batch's barcode. `ignoreBatchId` lets a batch's own unchanged value pass through on an edit. */
+function findBatchBarcodeConflict(store, barcode, ignoreBatchId) {
+  const needle = String(barcode).trim();
+  for (const p of store.products || []) {
+    if (
+      p.barcode === needle || p.sku === needle || (p.barcodes || []).includes(needle) ||
+      p.customSubUnitBarcode === needle || (p.altUnits || []).some((u) => u?.barcode === needle)
+    ) {
+      return `Barcode "${needle}" is already assigned to product "${p.name}".`;
+    }
+    for (const b of p.batches || []) {
+      if (b.id !== ignoreBatchId && b.barcode === needle) {
+        return `Barcode "${needle}" is already assigned to batch "${b.batchNo}" of "${p.name}".`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Batch Edit (Inventory → Batch Tracking → Batch Edit): create a manual batch
+ * for a batch-tracked product — opening stock or a correction. Batches minted
+ * by a Purchase are never created through here; they come in via the
+ * purchase-receiving flow with `source: 'purchase'`.
+ */
+exports.createManualBatch = (req, res) => {
+  const store = req.tenantStore;
+  const { productId, batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, mrp, warehouseId, barcode } = req.body;
+
+  const product = (store.products || []).find((p) => p.id === productId);
+  if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+  if (!product.trackBatches) {
+    return res.status(400).json({ success: false, message: 'This product is not batch-tracked. Turn on "Enable Batch" for it first.' });
+  }
+  if (!(Number(qty) >= 0)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid quantity.' });
+  }
+  const cleanBarcode = barcode ? String(barcode).trim() : '';
+  if (cleanBarcode) {
+    const conflict = findBatchBarcodeConflict(store, cleanBarcode);
+    if (conflict) return res.status(400).json({ success: false, message: conflict });
+  }
+
+  let batch;
+  try {
+    batch = addBatch(product, { batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, mrp, warehouseId, barcode: cleanBarcode || null, source: 'manual' });
+  } catch (err) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+
+  if (Number(batch.qty) > 0) {
+    logStockMovement(store, {
+      product,
+      type: 'OPENING',
+      qtyChange: Number(batch.qty),
+      reason: `Batch ${batch.batchNo} added manually via Batch Edit`,
+      user: actor(req)
+    });
+  }
+
+  res.status(201).json({ success: true, message: `Batch ${batch.batchNo} created.`, data: { product, batch } });
+};
+
+/** Batch Edit: edits a manual batch's own fields. Purchase-sourced batches are rejected server-side (see controllers/batches.js) even if the client is bypassed. */
+exports.updateManualBatch = (req, res) => {
+  const store = req.tenantStore;
+  const { productId, batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, mrp, warehouseId, barcode } = req.body;
+
+  const product = (store.products || []).find((p) => p.id === productId);
+  if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+
+  const before = (product.batches || []).find((b) => b.id === req.params.batchId);
+  const beforeQty = before ? Number(before.qty) || 0 : 0;
+
+  const cleanBarcode = barcode !== undefined ? (barcode ? String(barcode).trim() : '') : undefined;
+  if (cleanBarcode) {
+    const conflict = findBatchBarcodeConflict(store, cleanBarcode, req.params.batchId);
+    if (conflict) return res.status(400).json({ success: false, message: conflict });
+  }
+
+  let batch;
+  try {
+    batch = updateBatch(product, req.params.batchId, {
+      batchNo, mfgDate, expiryDate, qty, costPrice, sellPrice, mrp, warehouseId,
+      barcode: cleanBarcode !== undefined ? (cleanBarcode || null) : undefined
+    });
+  } catch (err) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+
+  const delta = (Number(batch.qty) || 0) - beforeQty;
+  if (delta !== 0) {
+    logStockMovement(store, {
+      product,
+      type: 'ADJUSTMENT',
+      qtyChange: delta,
+      reason: `Batch ${batch.batchNo} edited via Batch Edit`,
+      user: actor(req)
+    });
+  }
+
+  res.json({ success: true, message: `Batch ${batch.batchNo} updated.`, data: { product, batch } });
+};
+
+/** Batch Edit: deletes a manual batch entirely (not a partial write-off). Purchase-sourced batches are rejected server-side. */
+exports.deleteManualBatch = (req, res) => {
+  const store = req.tenantStore;
+  const productId = req.query.productId || req.body.productId;
+
+  const product = (store.products || []).find((p) => p.id === productId);
+  if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+
+  let batch;
+  try {
+    batch = deleteBatch(product, req.params.batchId);
+  } catch (err) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+
+  if (Number(batch.qty) > 0) {
+    logStockMovement(store, {
+      product,
+      type: 'ADJUSTMENT',
+      qtyChange: -Number(batch.qty),
+      reason: `Batch ${batch.batchNo} deleted via Batch Edit`,
+      user: actor(req)
+    });
+  }
+
+  res.json({ success: true, message: `Batch ${batch.batchNo} deleted.`, data: { product } });
 };
 
 /** Writes off a quantity from one batch (expired/damaged/etc.) and logs it like any other stock adjustment. */

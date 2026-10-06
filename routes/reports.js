@@ -290,10 +290,13 @@ router.get('/reports/purchases', (req, res) => {
   const store = req.tenantStore;
   const rows = (store.purchases || []).filter((p) => p.status !== 'VOID' && inWindow(p.date, req.query.from, req.query.to));
 
+  // Keyed by vendorId (the ledger's own identity), not vendorName — two vendors sharing a display
+  // name, or one renamed mid-period, would otherwise silently merge or split totals here in a way
+  // that disagrees with the vendorId-keyed ledger balance shown on Parties/Accounts.
   const byVendor = {};
   rows.forEach((p) => {
-    const key = p.vendorName;
-    if (!byVendor[key]) byVendor[key] = { vendor: key, invoices: 0, total: 0, unpaid: 0 };
+    const key = p.vendorId || p.vendorName;
+    if (!byVendor[key]) byVendor[key] = { vendorId: p.vendorId || null, vendor: p.vendorName, invoices: 0, total: 0, unpaid: 0 };
     byVendor[key].invoices += 1;
     byVendor[key].total = r2(byVendor[key].total + p.totalAmount);
     if (p.paymentStatus !== 'PAID') byVendor[key].unpaid = r2(byVendor[key].unpaid + (Number(p.totalAmount) || 0) - (Number(p.paidAmount) || 0));
